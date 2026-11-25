@@ -8,5 +8,8 @@ The goal, scope, phases, tasks and working agreement are in [project-definition.
 
 Licence: MIT (LICENSE).
 
-Status: initialised. First milestone: simulate continuous-wave ODMR and Rabi oscillations for an NV ensemble, plot
+Layout: `glowbox/` (sim, control, learn, dream, experiments, analysis, hw), `tests/`, `docs/`. Setup and the
+GPU-machine workflow: [docs/dev.md](docs/dev.md). Physics spec: [docs/physics.md](docs/physics.md).
+
+Status: scaffolded (pulse representation, simulator interface, physics spec, run logging). First milestone: simulate continuous-wave ODMR and Rabi oscillations for an NV ensemble, plot
 both, and pass tests comparing the fast surrogate with the QuTiP reference.
