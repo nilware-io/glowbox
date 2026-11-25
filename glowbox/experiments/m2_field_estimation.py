@@ -717,7 +717,7 @@ def plot_quantum_test(task: FieldTask, qt: QuantumTestResult) -> Figure:
         prior = np.mean(qt.values["resonant"][f"{kind}_prior_rmse_ut"])
         ax.hlines(prior, x - 2.2, x - 0.3, color=COLORS["prior"], ls=":", lw=1.4)
     ax.set_xticks(ticks, labels, fontsize=8)
-    ax.set_yscale("log")
+    ax.set_ylim(0, None)
     ax.set_ylabel(f"RMS field error at {task.headline} shots (uT)")
     ax.set_title("quantum test: resonant (solid) vs detuned +0.4 GHz (light); dotted = prior only; 95 % CI over seeds")
     ax.title.set_fontsize(9)
