@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from scipy.special import ndtri
+from scipy.special import ndtr, ndtri
 from torch.utils.checkpoint import checkpoint
 
 from glowbox.control.pulse import SequenceArrays
@@ -63,21 +63,35 @@ MIN_CHUNK_BINS = 16
 # --- Static (control-independent) part --------------------------------------------------------------------------
 
 
-def detuning_quadrature(env: EnvParams, m: int) -> tuple[np.ndarray, np.ndarray]:
-    """Static detunings delta (Hz) and weights for the T2* distribution: M equal-probability quantile midpoints.
+def detuning_quadrature(
+    env: EnvParams, m: int, rule: str = "quantile", spacing: float = 0.5
+) -> tuple[np.ndarray, np.ndarray]:
+    """Static detunings delta (Hz) and weights (sum 1) for the T2* distribution (docs/physics.md section 4).
 
-    Lorentzian: HWHM 1/(2 pi T2*); Gaussian: sigma = 1/(sqrt(2) pi T2*) (docs/physics.md section 4).
+    Width unit w: Lorentzian HWHM 1/(2 pi T2*), Gaussian sigma = 1/(sqrt(2) pi T2*). ``"quantile"``: M
+    equal-probability quantile midpoints, weights 1/M (pulsed protocols). ``"uniform"``: M nodes spaced
+    ``spacing`` x w around 0, weight = probability of the node's cell, renormalised over the window (CW
+    lineshapes: no satellite comb while the homogeneous HWHM exceeds the spacing). M = 1 means delta = 0.
     """
     if m < 1:
         raise ValueError("need at least one detuning sample")
-    q = (np.arange(m) + 0.5) / m
-    if env.broadening_shape == "lorentzian":
-        delta = np.tan(np.pi * (q - 0.5)) / (2.0 * np.pi * env.t2_star_s)
-    else:
-        delta = ndtri(q) / (np.sqrt(2.0) * np.pi * env.t2_star_s)
     if m == 1:
-        delta = np.zeros(1)
-    return delta, np.full(m, 1.0 / m)
+        return np.zeros(1), np.ones(1)
+    lor = env.broadening_shape == "lorentzian"
+    w = 1.0 / (2.0 * np.pi * env.t2_star_s) if lor else 1.0 / (np.sqrt(2.0) * np.pi * env.t2_star_s)
+    if rule == "quantile":
+        q = (np.arange(m) + 0.5) / m
+        x = np.tan(np.pi * (q - 0.5)) if lor else ndtri(q)
+        return x * w, np.full(m, 1.0 / m)
+    if rule == "uniform":
+        if not spacing > 0:
+            raise ValueError("detuning spacing must be > 0")
+        x = spacing * (np.arange(m) - (m - 1) / 2)
+        edges = np.concatenate([x - spacing / 2, x[-1:] + spacing / 2])
+        cdf = 0.5 + np.arctan(edges) / np.pi if lor else ndtr(edges)
+        p = np.diff(cdf)
+        return x * w, p / p.sum()
+    raise ValueError(f"unknown detuning rule {rule!r}")
 
 
 def _spin1() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -170,7 +184,14 @@ class Statics:
 
 
 def build_statics(
-    env: EnvParams, fields_t: np.ndarray, n_detuning: int, dtype: torch.dtype, device: torch.device
+    env: EnvParams,
+    fields_t: np.ndarray,
+    n_detuning: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    detuning_rule: str = "quantile",
+    detuning_spacing: float = 0.5,
 ) -> Statics:
     """Diagonalise H0 per (field, orientation, detuning) and assemble the superoperators (docs/physics.md 1-6)."""
     if env.t2_stretch != 1.0:
@@ -180,7 +201,7 @@ def build_statics(
     pops = np.asarray(env.orientation_populations, dtype=np.float64)
     keep = tuple(int(k) for k in np.nonzero(pops > 0)[0])
     frames = nv_local_frames()[list(keep)]  # (K, 3, 3)
-    delta, wq = detuning_quadrature(env, n_detuning)
+    delta, wq = detuning_quadrature(env, n_detuning, detuning_rule, detuning_spacing)
     sx, sy, sz = _spin1()
 
     # H0 in the ms basis, (G, K, M, 3, 3), Hz.
@@ -533,6 +554,10 @@ class ModelOptions:
     #: With gradients, share propagators (plus exact first derivatives) between identical bins when the distinct
     #: bins are at most this fraction of all bins; otherwise every bin gets its own propagator.
     shared_grad_max_fraction: float = 0.25
+    #: Detuning quadrature rule, "quantile" (equal weights; pulsed protocols) or "uniform" (weighted, evenly
+    #: spaced; CW lineshapes), and the "uniform" node spacing in units of the distribution width (section 4).
+    detuning_rule: str = "quantile"
+    detuning_spacing: float = 0.5
 
 
 def emission_per_nv(
@@ -575,7 +600,15 @@ def emission_per_nv(
     # Static fields per sequence -> groups.
     fields = np.asarray(env.b_field_t, dtype=np.float64)[None] + magnet.detach().cpu().numpy().astype(np.float64)
     ufields, ginv = np.unique(fields, axis=0, return_inverse=True)
-    st = build_statics(env, ufields, opt.n_detuning, opt.dtype, dev)
+    st = build_statics(
+        env,
+        ufields,
+        opt.n_detuning,
+        opt.dtype,
+        dev,
+        detuning_rule=opt.detuning_rule,
+        detuning_spacing=opt.detuning_spacing,
+    )
     group = torch.as_tensor(ginv.reshape(-1), device=dev)
     if group.shape[0] == 1 and bsz > 1:
         group = group.expand(bsz)

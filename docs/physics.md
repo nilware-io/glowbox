@@ -79,8 +79,10 @@ terms oscillating at ≈ 2f. Result (Hz):
 
 (the ±̃ ↔ ∓̃ matrix elements oscillate at ≈ f and are dropped as well). The RWA holds when
 
-- f_R ≪ f (here f_R ≲ 20 MHz vs f ≈ 3 GHz; the Bloch–Siegert shift f_R²/(4f) ≈ 10 kHz is below any T2*
-  linewidth);
+- f_R ≪ f (here f_R ≲ 20 MHz vs f ≈ 2.87 GHz). The Bloch–Siegert shift f_R²/(4f) is ≈ 35 kHz at 20 MHz
+  (≈ 9 kHz at the 10 MHz default full scale), below the T2* HWHM 1/(2π T2*) = 0.16 MHz at T2* = 1 µs. At full
+  scale 20 MHz it stays below that HWHM only for T2* ≲ 4.5 µs (≲ 18 µs at 10 MHz); longer T2* with strong drive
+  would resolve the shift;
 - both transition frequencies f± ≫ f_R, i.e. away from the ground-state level anticrossing (B∥ ≈ D/γe ≈ 102 mT,
   where f− → 0);
 - the drive is not near the ±1 ↔ ∓1 splitting (2γe B∥ ≈ f, also only near ~100 mT).
@@ -124,13 +126,36 @@ from
   1/(π T2*). Free-induction (Ramsey) envelope exp(−t/T2*).
 - **Gaussian**: standard deviation σ = 1/(√2 π T2*) (Hz). Envelope exp(−(t/T2*)²).
 
-Implementation: both integrate over δ with the same deterministic quadrature: M equal-probability quantile midpoints
-u_m = (m + ½)/M, δ_m = Γ tan(π(u_m − ½)) (Lorentzian) or σ Φ⁻¹(u_m) (Gaussian), equal weights 1/M; M = 1 means
-δ = 0. Report M. The Lorentzian's heavy tails set the quadrature error: for pulsed Rabi at f_R/Γ ≈ 50 the transfer
-curve on M nodes deviates from the continuous-distribution integral by up to 1.2 % of the contrast at M = 64 and
-0.2 % at M = 256 (reference measurement). M ≥ 32 is fine for comparisons at equal M (identical nodes); use
-M ≥ 128 when sub-percent agreement with the continuous Lorentzian matters. The node set revives after about
-2 M T2\*. Strain-type shifts (moving f+ and f− together) are not modelled separately.
+Implementation: both integrate over δ with the same deterministic quadrature, M nodes δ_m with weights w_m
+(Σ w_m = 1); M = 1 means δ = 0. Report M and the rule. In units of the width w (Γ for the Lorentzian, σ for the
+Gaussian) there are two rules:
+
+- **`quantile`** (default): M equal-probability quantile midpoints u_m = (m + ½)/M, δ_m = Γ tan(π(u_m − ½))
+  (Lorentzian) or σ Φ⁻¹(u_m) (Gaussian), equal weights 1/M. Exact probability mass everywhere, but the
+  Lorentzian tail nodes are sparse: their spacing grows like δ². For pulsed Rabi at f_R/Γ ≈ 50 the transfer curve
+  on M nodes deviates from the continuous-distribution integral by up to 1.2 % of the contrast at M = 64 and
+  0.2 % at M = 256 (reference measurement). For pulsed protocols M ≥ 32 is fine for comparisons at equal M
+  (identical nodes); use M ≥ 128 when sub-percent agreement with the continuous Lorentzian matters. The node set
+  revives after about 2 M T2\*.
+- **`uniform`**: M nodes spaced s·w apart, centred on 0 (spacing parameter s, default 0.5), each weighted with
+  the probability of its cell [δ_m − s w/2, δ_m + s w/2], renormalised over the window |δ| ≤ M s w/2. This is the
+  distribution truncated at K = M s/2 widths: the dropped Lorentzian mass is 1 − (2/π) atan K ≈ 2/(πK), and
+  renormalising raises a CW dip's contrast by about that fraction (measured: +1.8 % at M = 128, s = 0.5).
+
+**Discrete nodes and CW lineshapes.** A node set is a set of discrete homogeneous lines. A CW spectrum is smooth
+only while the homogeneous HWHM (T2, MW power broadening ~ f_R, optical pump coherence loss β k_r/(2π)) exceeds
+the node spacing wherever the weights matter; otherwise each isolated node shows up as its own satellite dip. With
+the quantile rule the outermost spacing is huge (for M = 32 the last node sits at Γ tan(π(31.5/32 − ½)) ≈ 20.4 Γ,
+13.6 Γ beyond its neighbour), so "M ≥ 32 is fine" does **not** hold for CW lineshapes. Measured (surrogate,
+float64, one axis, B ∥ n₁ at 3 mT, T2* = 1 µs, 20 µs CW, amplitude 0.01, β = 0.01, homogeneous HWHM ≈ 0.2 MHz ≈
+1.25 Γ): quantile M = 32 gives satellites at ±3.25 MHz (contrast 0.0035 vs 0.056 at the line) and M = 128 four
+satellites; `find_dips` reports 3 and 5 lines for 1 (tests/sim/test_surrogate.py). Use the `uniform` rule for CW
+spectra, with s below the homogeneous HWHM in units of w and M large enough that the truncation 2/(πK) is
+acceptable (M = 64, s = 1 gave contrast and FWHM within ~1 % / 2 % of a 512-node s = 0.25 run in that case). The
+milestone-1 ODMR (amplitude 0.1, β = 0.1, homogeneous HWHM ≈ 2 MHz ≈ 13 Γ) is broad enough for quantile M = 32:
+one dip per line, FWHM within ~2 % of M = 128.
+
+Strain-type shifts (moving f+ and f− together) are not modelled separately.
 
 ## 5. Relaxation: T1, T2
 

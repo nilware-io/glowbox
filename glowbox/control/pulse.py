@@ -427,7 +427,10 @@ def cw_odmr_point(
     """One point of a CW ODMR sweep: laser and MW on together for ``duration_ns``.
 
     A sweep is ``[cw_odmr_point(f) for f in freqs]``; the steady-state count rate (late bins) dips at resonances.
-    Low default amplitude avoids power broadening.
+    The default amplitude 0.1 (f_R = 0.82 MHz at the 10 MHz full scale) is *not* free of power broadening: with the
+    default optical beta = 0.1 the line is strongly MW- and optically broadened (FWHM about 4.4 MHz vs the
+    T2*-limited 1/(pi T2*) = 0.32 MHz at T2* = 1 us). A near-T2*-limited line needs amplitude <~ 0.01 and
+    beta <~ 0.01 (FWHM about 0.7 MHz), and then the "uniform" detuning quadrature (docs/physics.md section 4).
     """
     b = SequenceBuilder(grid_ns, magnet).laser_with_mw(duration_ns, frequency_hz, laser_power, amplitude)
     return b.build(protocol="cw_odmr", frequency_hz=frequency_hz)

@@ -5,8 +5,8 @@ Implements docs/physics.md as literally as possible:
 * per NV axis, a 7x7 density matrix (ground triplet in the eigenbasis of H0, excited triplet, singlet) under a
   Lindblad master equation in the MW rotating frame (RWA), with optical pumping / emission / ISC / singlet decay
   (Tetienne 2012 rates), T1 and T2 as jump operators;
-* the ensemble is the population-weighted sum over the four <111> axes and, per axis, an equal-weight quadrature
-  over the static detuning delta (quantile midpoints of the Lorentzian or Gaussian, spec section 4);
+* the ensemble is the population-weighted sum over the four <111> axes and, per axis, a quadrature over the static
+  detuning delta (equal-weight quantile midpoints, or uniform nodes with cell-probability weights; spec section 4);
 * controls are piecewise constant per bin, so each bin's Liouvillian L is constant and the bin is propagated
   *exactly* with a matrix exponential. The photons emitted in the bin come from the same exponential (Van Loan
   augmentation): exp([[L, 0], [w, 0]] dt) has bottom-left row w int_0^dt exp(L s) ds. No sub-stepping or ODE
@@ -24,7 +24,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import qutip as qt
@@ -44,7 +44,14 @@ from glowbox.sim.reference.model import (
     initial_state_vec,
 )
 
-__all__ = ["BinControls", "ReferenceSimulator", "bin_controls", "detuning_samples_hz"]
+__all__ = [
+    "BinControls",
+    "DetuningRule",
+    "ReferenceSimulator",
+    "bin_controls",
+    "detuning_quadrature_hz",
+    "detuning_samples_hz",
+]
 
 VERSION = "1"
 
@@ -53,20 +60,53 @@ B_PERP_WARN_T = 5e-3  # excited-state mixing by B_perp is not modelled ("B_perp 
 B_PAR_ESLAC_WARN_T = 40e-3  # approaching the excited-state anticrossing at ~51 mT
 
 
-def detuning_samples_hz(env: EnvParams, n: int) -> np.ndarray:
-    """Equal-weight quadrature nodes of the static detuning delta, Hz (spec section 4): quantile midpoints.
+DetuningRule = Literal["quantile", "uniform"]
 
-    Lorentzian: HWHM Gamma = 1/(2 pi T2*), delta = Gamma tan(pi (u - 1/2)). Gaussian: sigma = 1/(sqrt2 pi T2*),
-    delta = sigma Phi^-1(u). u_m = (m + 1/2)/n. n = 1 gives delta = 0 (no broadening).
+
+def _width_and_cdf(env: EnvParams) -> tuple[float, Any]:
+    """Width unit of the T2* distribution (Lorentzian HWHM Gamma or Gaussian sigma, Hz) and its CDF of delta/width."""
+    if env.broadening_shape == "lorentzian":
+        return 1.0 / (2.0 * math.pi * env.t2_star_s), lambda x: 0.5 + np.arctan(x) / math.pi
+    return 1.0 / (math.sqrt(2.0) * math.pi * env.t2_star_s), scipy.stats.norm.cdf
+
+
+def detuning_quadrature_hz(
+    env: EnvParams, n: int, rule: DetuningRule = "quantile", spacing: float = 0.5
+) -> tuple[np.ndarray, np.ndarray]:
+    """Quadrature nodes (Hz) and weights (sum 1) of the static detuning delta (spec section 4).
+
+    Lorentzian: HWHM Gamma = 1/(2 pi T2*); Gaussian: sigma = 1/(sqrt2 pi T2*). n = 1 gives delta = 0.
+
+    * ``"quantile"``: equal weights 1/n at the quantile midpoints u_m = (m + 1/2)/n, delta = Gamma tan(pi (u - 1/2))
+      or sigma Phi^-1(u). Tail nodes are sparse (spacing grows like delta^2), so a CW spectrum whose homogeneous
+      width is below the tail spacing shows each tail node as a satellite line.
+    * ``"uniform"``: n nodes evenly spaced by ``spacing`` x Gamma (or sigma), centred on 0; each weight is the
+      distribution's probability in the node's cell, renormalised over the window (the distribution truncated at
+      +-n spacing/2 widths; for the Lorentzian the dropped tail mass is about 4/(pi n spacing)). No comb while the
+      homogeneous HWHM exceeds the spacing.
     """
     if n < 1:
         raise ValueError("n_detuning must be >= 1")
-    u = (np.arange(n) + 0.5) / n
-    if env.broadening_shape == "lorentzian":
-        gamma = 1.0 / (2.0 * math.pi * env.t2_star_s)
-        return np.asarray(gamma * np.tan(math.pi * (u - 0.5)))
-    sigma = 1.0 / (math.sqrt(2.0) * math.pi * env.t2_star_s)
-    return np.asarray(sigma * scipy.stats.norm.ppf(u))
+    if n == 1:
+        return np.zeros(1), np.ones(1)
+    width, cdf = _width_and_cdf(env)
+    if rule == "quantile":
+        u = (np.arange(n) + 0.5) / n
+        if env.broadening_shape == "lorentzian":
+            return np.asarray(width * np.tan(math.pi * (u - 0.5))), np.full(n, 1.0 / n)
+        return np.asarray(width * scipy.stats.norm.ppf(u)), np.full(n, 1.0 / n)
+    if rule == "uniform":
+        if not spacing > 0:
+            raise ValueError("detuning spacing must be > 0")
+        x = spacing * (np.arange(n) + 0.5 - n / 2)  # node positions in widths
+        p = np.asarray(cdf(x + spacing / 2) - cdf(x - spacing / 2), dtype=np.float64)
+        return width * x, p / p.sum()
+    raise ValueError(f"unknown detuning rule {rule!r}")
+
+
+def detuning_samples_hz(env: EnvParams, n: int) -> np.ndarray:
+    """Nodes of the equal-weight ``"quantile"`` rule (see ``detuning_quadrature_hz``), Hz."""
+    return detuning_quadrature_hz(env, n, "quantile")[0]
 
 
 @dataclass(frozen=True)
@@ -108,17 +148,28 @@ class _Group:
 class ReferenceSimulator:
     """Seven-level Lindblad NV-ensemble simulator (QuTiP operators, exact piecewise-constant propagation).
 
-    ``n_detuning``: number of quadrature nodes M over the T2* detuning distribution (spec: M >= 32; use more when
-    sequences are long compared with T2*). ``dedupe_axes``: simulate symmetry-equivalent axes once (exact; only
+    ``n_detuning``: number of quadrature nodes M over the T2* detuning distribution; ``detuning_rule`` and
+    ``detuning_spacing`` choose the rule (``detuning_quadrature_hz``; spec section 4: "quantile" for pulsed
+    protocols, "uniform" for CW lineshapes). ``dedupe_axes``: simulate symmetry-equivalent axes once (exact; only
     used when E = 0).
     """
 
     name = "qutip-reference"
 
-    def __init__(self, n_detuning: int = 64, dedupe_axes: bool = True) -> None:
+    def __init__(
+        self,
+        n_detuning: int = 64,
+        dedupe_axes: bool = True,
+        detuning_rule: DetuningRule = "quantile",
+        detuning_spacing: float = 0.5,
+    ) -> None:
         if n_detuning < 1:
             raise ValueError("n_detuning must be >= 1")
+        if detuning_rule not in ("quantile", "uniform"):
+            raise ValueError(f"unknown detuning rule {detuning_rule!r}")
         self.n_detuning = n_detuning
+        self.detuning_rule: DetuningRule = detuning_rule
+        self.detuning_spacing = detuning_spacing
         self.dedupe_axes = dedupe_axes
 
     # --- public API ------------------------------------------------------------------------------------------
@@ -156,6 +207,8 @@ class ReferenceSimulator:
             "version": VERSION,
             "model": "seven-level Lindblad, RWA, exact piecewise-constant propagation",
             "n_detuning": self.n_detuning,
+            "detuning_rule": self.detuning_rule,
+            "detuning_spacing": self.detuning_spacing,
             "broadening_shape": env.broadening_shape,
             "qutip_version": qt.__version__,
             "label": dict(sequence.label),
@@ -185,7 +238,8 @@ class ReferenceSimulator:
         """Debug/test access: per group (axis models, axes), and the column-stacked rho after every bin.
 
         Returns (models, axes per model, states) with states of shape (n_groups, M, n_bins, 49) in each model's
-        eigenbasis and the rotating frame current at the end of each bin.
+        eigenbasis and the rotating frame current at the end of each bin. Node m carries the weight
+        ``detuning_quadrature_hz(...)[1][m]`` (1/M for the default "quantile" rule).
         """
         ctrl = bin_controls(sequence)
         groups = self._groups(sequence, env)
@@ -259,7 +313,7 @@ class ReferenceSimulator:
         Returns the detuning-averaged emission rate per NV (n_groups, n_bins) in 1/s, and optionally the states.
         """
         n, g = sequence.n_bins, sequence.grid_ns
-        deltas = detuning_samples_hz(env, self.n_detuning)
+        deltas, wq = detuning_quadrature_hz(env, self.n_detuning, self.detuning_rule, self.detuning_spacing)
         n_g, m = len(groups), deltas.size
         d2 = N_LEVELS * N_LEVELS
         # Stacked building blocks, (n_g, 49, 49).
@@ -319,7 +373,7 @@ class ReferenceSimulator:
                 phase = 0.0
             beta = beta_full * float(ctrl.laser[j]) * float(power[j])
             prop, photons = propagator(beta, f_cur, amp, phase)
-            emitted[:, j] = (photons * rho).sum(axis=(1, 2)).real / m
+            emitted[:, j] = ((photons * rho).sum(axis=2).real * wq).sum(axis=1)
             rho = np.matmul(prop, rho[..., None])[..., 0]
             if states is not None:
                 states[:, :, j] = rho

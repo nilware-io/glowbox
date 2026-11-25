@@ -87,6 +87,8 @@ class SurrogateSimulator:
                 "source": self.name,
                 "surrogate_version": SURROGATE_VERSION,
                 "n_detuning": self.options.n_detuning,
+                "detuning_rule": self.options.detuning_rule,
+                "detuning_spacing": self.options.detuning_spacing,
                 "dtype": str(self.options.dtype).removeprefix("torch."),
                 "device": self.device.type,
                 "label": dict(seq.label),

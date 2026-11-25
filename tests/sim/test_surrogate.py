@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 import torch
 from scipy.optimize import curve_fit
 
+from glowbox.analysis.protocols import find_dips, late_mean
 from glowbox.control.pulse import (
     MagnetSetting,
     PulseSequence,
@@ -20,6 +22,7 @@ from glowbox.control.pulse import (
 )
 from glowbox.sim import constants as c
 from glowbox.sim.interface import EnvParams, Simulator
+from glowbox.sim.reference import transition_frequencies_hz
 from glowbox.sim.surrogate import (
     ModelOptions,
     SurrogateSimulator,
@@ -393,3 +396,30 @@ def test_cuda_matches_cpu_and_differentiates():
     assert amp.grad is not None and torch.isfinite(amp.grad).all()
     tr = SurrogateSimulator("cuda", FAST).run(seqs[1], env, shots=100, rng=np.random.default_rng(0))
     tr.check(seqs[1], shots=100)
+
+
+def test_low_power_cw_odmr_one_dip_per_line() -> None:
+    """Low MW power and low beta (spec 9.1 regime): the homogeneous HWHM (~0.2 MHz) is below the quantile rule's
+    tail node spacing, so equal-weight quantile nodes turn the line into a comb (satellite dips at single tail
+    nodes, e.g. Gamma tan(pi (31.5/32 - 1/2)) = 20.3 Gamma = 3.2 MHz for M = 32). The "uniform" rule
+    (docs/physics.md section 4) gives exactly one dip. Measured 2026-11-25: quantile 3 dips, uniform 1."""
+    env = EnvParams(
+        b_field_t=tuple(3e-3 * np.ones(3) / math.sqrt(3)),
+        orientation_populations=(1.0, 0.0, 0.0, 0.0),
+        optical_beta_full_scale=0.01,
+    )
+    line = float(transition_frequencies_hz(env.d_hz, 0, np.array(env.b_field_t))[0, 0])
+    freqs = line + np.arange(-6e6, 6e6 + 1, 0.1e6)
+    seqs = [cw_odmr_point(float(f), duration_ns=20_000, amplitude=0.01) for f in freqs]
+    off = dataclasses.replace(seqs[0], microwave=())
+
+    def dips(rule: str) -> list:
+        sim = SurrogateSimulator(CPU, ModelOptions(n_detuning=32, dtype=torch.float64, detuning_rule=rule))
+        r = [late_mean(x, seqs[0].grid_ns, 2000) for x in sim.expected_rates([*seqs, off], env)]
+        return find_dips(freqs, np.array(r[:-1]), r[-1], min_contrast=1e-3, fit_half_width_hz=3e6)
+
+    assert len(dips("quantile")) == 3  # the documented artefact
+    (d,) = dips("uniform")
+    assert abs(d.grid_frequency_hz - line) <= 0.05e6 + 1
+    # T2*-limited FWHM 1/(pi T2*) = 0.32 MHz plus residual MW / pump broadening: measured 0.70 MHz.
+    assert 0.5e6 < d.fwhm_hz < 0.9e6

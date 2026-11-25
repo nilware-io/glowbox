@@ -34,19 +34,21 @@ shots of one call (each shot is then propagated with its own pump rates).
 ## Public API
 
 ```python
-from glowbox.sim.reference import ReferenceSimulator, bin_controls, detuning_samples_hz
+from glowbox.sim.reference import ReferenceSimulator, bin_controls, detuning_quadrature_hz, detuning_samples_hz
 
-sim = ReferenceSimulator(n_detuning: int = 64, dedupe_axes: bool = True)
+sim = ReferenceSimulator(n_detuning: int = 64, dedupe_axes: bool = True,
+                         detuning_rule: "quantile" | "uniform" = "quantile", detuning_spacing: float = 0.5)
 sim.name == "qutip-reference"
 sim.run(sequence, env, *, shots=1, rng=None) -> FluorescenceTrace      # Simulator protocol
 sim.expected_rate_cps(sequence, env) -> np.ndarray                     # (n_bins,), noiseless, no drift
 sim.emission_per_nv(sequence, env, power_factor=None) -> np.ndarray    # (4, n_bins) photons/s per NV per axis
 sim.states(sequence, env) -> (models, axes_per_model, states)          # states: (groups, M, n_bins, 49), debug
-detuning_samples_hz(env, n) -> np.ndarray                              # the quadrature nodes, Hz
+detuning_quadrature_hz(env, n, rule="quantile", spacing=0.5) -> (nodes_hz, weights)
+detuning_samples_hz(env, n) -> np.ndarray                              # the quantile rule's nodes, Hz
 bin_controls(sequence) -> BinControls                                  # float64 per-bin controls
 ```
 
-`trace.metadata`: `source`, `version`, `model`, `n_detuning`, `broadening_shape`, `qutip_version`, `label`.
+`trace.metadata`: `source`, `version`, `model`, `n_detuning`, `detuning_rule`, `detuning_spacing`, `broadening_shape`, `qutip_version`, `label`.
 
 ## Interpretations and approximations (where the spec is silent)
 
@@ -79,12 +81,17 @@ bin_controls(sequence) -> BinControls                                  # float64
 
 ## Quadrature (spec section 4)
 
-Equal-weight quantile midpoints; the default is M = 64. The Lorentzian's heavy tails are the weak spot. For pulsed
+Default rule: equal-weight quantile midpoints, M = 64. The Lorentzian's heavy tails are the weak spot. For pulsed
 Rabi at f_R/Γ ≈ 50 (T2\* = 1 µs, a = 1), the M = 64 transfer curve deviates from the continuous-distribution
 integral by up to 1.2 % of the contrast; at M = 256 the deviation is 0.2 %. The dynamics on the nodes themselves match the
 two-level formula to 0.16 %. Use M ≥ 128 when sub-percent agreement with the continuous Lorentzian matters
 (long Ramsey or echo times, strong drive). The revival time of the node set is about 2 M T2\*, far beyond any test
 sequence.
+
+The quantile rule is **not** fit for CW lineshapes at low MW power and low β: its sparse tail nodes become
+satellite dips whenever the homogeneous HWHM is below the tail spacing. `detuning_rule="uniform"` (evenly spaced
+nodes with cell-probability weights, truncated at ±M·s/2 widths and renormalised) avoids that; see
+docs/physics.md section 4 for the criterion and the truncation bias.
 
 ## Validation results (CPU, this repo's tests)
 

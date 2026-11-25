@@ -22,8 +22,8 @@ import torch
 from glowbox.analysis.protocols import find_dips, fit_rabi, late_mean, readout_mean
 from glowbox.control.pulse import PulseSequence, cw_odmr_point, pulsed_rabi
 from glowbox.sim.interface import EnvParams
-from glowbox.sim.reference import ReferenceSimulator, transition_frequencies_hz
-from glowbox.sim.surrogate import ModelOptions, SurrogateSimulator
+from glowbox.sim.reference import ReferenceSimulator, detuning_quadrature_hz, transition_frequencies_hz
+from glowbox.sim.surrogate import ModelOptions, SurrogateSimulator, detuning_quadrature
 
 M = 32  # quadrature nodes, the same for both simulators (identical nodes)
 GRID_HZ = 0.25e6  # ODMR sweep step
@@ -136,6 +136,32 @@ def test_cw_odmr_dips_contrast_linewidth(odmr: dict) -> None:
         assert abs(a.contrast - b.contrast) / a.contrast < 2e-3
         assert abs(a.fwhm_hz - b.fwhm_hz) / a.fwhm_hz < 2e-3
         assert 0.05 < a.contrast < 0.4  # sanity: a real dip, not noise
+
+
+@pytest.mark.parametrize("shape", ["lorentzian", "gaussian"])
+@pytest.mark.parametrize("rule", ["quantile", "uniform"])
+def test_detuning_quadrature_identical(shape: str, rule: str) -> None:
+    """Both simulators build the same nodes and weights (independent code, docs/physics.md section 4)."""
+    env = EnvParams(broadening_shape=shape)  # type: ignore[arg-type]
+    for m in (1, 2, 7, 32):
+        dr, wr = detuning_quadrature_hz(env, m, rule, 0.75)  # type: ignore[arg-type]
+        ds, ws = detuning_quadrature(env, m, rule, 0.75)
+        np.testing.assert_allclose(dr, ds, rtol=1e-12, atol=1e-6)
+        np.testing.assert_allclose(wr, ws, rtol=1e-12)
+        assert abs(wr.sum() - 1) < 1e-12
+
+
+def test_cw_odmr_uniform_rule_agrees() -> None:
+    """The weighted "uniform" rule gives the same rates in both simulators (float64; a few points over one line)."""
+    env = dataclasses.replace(ENV_ODMR, orientation_populations=(1.0, 0.0, 0.0, 0.0))
+    line = float(transition_frequencies_hz(env.d_hz, 0, np.array(env.b_field_t))[0, 0])
+    seqs = [cw_odmr_point(line + d, duration_ns=2000, amplitude=0.05) for d in (-3e6, -0.5e6, 0.0, 1e6)]
+    ref = ReferenceSimulator(n_detuning=12, detuning_rule="uniform", detuning_spacing=0.75)
+    opts = ModelOptions(n_detuning=12, dtype=torch.float64, detuning_rule="uniform", detuning_spacing=0.75)
+    a = np.array([ref.expected_rate_cps(s, env) for s in seqs])
+    b = np.array(SurrogateSimulator("cpu", opts).expected_rates(seqs, env))
+    # Same equations, nodes and weights: float64 agreement like the quantile rule (~1e-9 of the peak rate).
+    assert np.abs(a - b).max() / a.max() < 1e-7
 
 
 # --- pulsed Rabi --------------------------------------------------------------------------------------------------

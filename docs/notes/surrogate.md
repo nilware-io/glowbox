@@ -23,8 +23,10 @@ and cast to the working dtype (float32 by default).
 1. **Static detuning is `delta * Sz` added to H0 before diagonalisation** (a field shift along the NV axis,
    section 4's mechanism). This gives f+- -> f+- +- delta whenever gamma_e B_par >> E, gamma_e B_perp, and is well
    defined at zero field (degenerate ms=+-1). It differs from a literal "shift the two eigenvalues by +-delta" when
-   E or B_perp dominate (there delta enters quadratically). Samples: M equal-probability quantile midpoints
-   (default M = 32, `ModelOptions.n_detuning`), same as the reference's quadrature rule.
+   E or B_perp dominate (there delta enters quadratically). Samples: M nodes (default M = 32,
+   `ModelOptions.n_detuning`) by the same rule as the reference (`ModelOptions.detuning_rule`): equal-weight
+   quantile midpoints by default, or the weighted `"uniform"` rule (spacing `detuning_spacing` widths) for CW
+   lineshapes, which the quantile rule turns into a comb at low power (docs/physics.md section 4).
 2. **Dissipators in the rotating frame: secular approximation.** Jump operators are defined in the ms basis (lab).
    In the frame rotating at f on the two upper eigenstates, superoperator elements that couple coherences of
    different frame order (0~-+~ vs populations / -~+~) oscillate at ~f and are dropped (the dissipative half of the
