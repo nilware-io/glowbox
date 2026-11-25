@@ -1,0 +1,88 @@
+# Milestone 2: Task 1 (estimate a hidden magnetic field from the glow) with fixed sensor protocols, a CNN decoder,
+# a linear time-bin-weighting baseline, a physics-fit baseline and the quantum test (resonant vs detuned MW).
+# Run: uv run python -m glowbox.experiments.m2_field_estimation  (add --quick for a few-minute smoke run)
+name: m2-field-estimation
+seed: 20261126
+# Quantum-test seeds (>= 5). Each seed draws its own fields, nuisance parameters, model initialisation and noise;
+# both conditions of a seed share them (paired design).
+seeds: [0, 1, 2, 3, 4]
+detuned_offset_hz: 4.0e+8     # every MW frequency + 400 MHz: >= 200 MHz from every line of the prior
+
+prior:                        # glowbox.learn.field_data.FieldPrior (assumptions; see its docstring)
+  b_min_t: 0.5e-3
+  b_max_t: 3.0e-3
+  t2_star_s: [0.5e-6, 2.0e-6]
+  rabi_full_scale_hz: [8.0e+6, 12.0e+6]
+  optical_beta_full_scale: [0.07, 0.13]
+  collection_efficiency: [2.0e-3, 4.0e-3]
+  background_cps: [5.0e+3, 2.0e+4]
+  e_hz: [0.0, 3.0e+5]
+
+bank:
+  n_train: 5000
+  n_val: 512
+  n_test: 1000
+  fields_per_env: 8           # fields per nuisance draw (one surrogate call)
+  n_detuning: 32              # T2* quadrature: weighted uniform rule (CW lineshapes, docs/physics.md section 4)
+  detuning_rule: uniform
+  detuning_spacing: 2.0       # node spacing 2 widths: below the CW homogeneous HWHM (~13 widths at T2* = 1 us)
+  workers: 4                  # threads per bank (NumPy statics overlap the GPU)
+
+sweep:                        # glowbox.learn.field_data.SweepProtocol
+  f_start_hz: 2.77e+9
+  f_stop_hz: 2.97e+9
+  step_hz: 1.0e+6
+  cw_amplitude: 0.1           # f_R = 0.82 MHz at the nominal full scale
+  cw_shot_ns: 3000            # CW dwell per shot (= pulsed shot length, equal time budgets)
+  pulsed_amplitude: 0.2       # f_R = 1.63 MHz -> pi pulse 306 ns
+  pi_ns: 310
+  init_ns: 1500
+  settle_ns: 1000
+  readout_ns: 600
+
+train:
+  steps: 6000
+  batch: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  eval_every: 250
+  shots_min: 10
+  shots_max: 10000
+linear_train:
+  steps: 4000
+  lr: 3.0e-3
+decoder:                      # glowbox.learn.decoder.DecoderConfig
+  mix_channels: 8
+  channels: [32, 64, 128]
+  kernel: 7
+  hidden: 256
+
+eval:
+  shots: [10, 30, 100, 300, 1000, 3000, 10000]
+  headline_shots: 1000        # the quantum test's operating point
+
+fit:                          # physics-fit baseline, seed 0, on a test subset
+  n_fields: 300
+  workers: 32
+
+timing:                       # timing-structure probe, seed 0, pulsed protocol
+  n_fields: 200
+  pi_shifts_ns: [-200, -100, -50, 0, 50, 100, 200]
+  noise_repeats: 4
+
+reference:                    # QuTiP check of the trained decoders, seed 0 resonant
+  n_fields: 3
+  cw_ns: 20000                # CW points long enough for the steady state the surrogate path solves for
+  workers: 32
+
+quick:
+  seeds: [0, 1, 2, 3, 4]
+  bank: {n_train: 128, n_val: 32, n_test: 32, n_detuning: 16}
+  sweep: {step_hz: 2.0e+6}
+  train: {steps: 150, eval_every: 50, batch: 64}
+  linear_train: {steps: 100}
+  decoder: {channels: [16, 32], hidden: 64}
+  eval: {shots: [100, 1000, 10000]}
+  fit: {n_fields: 16, workers: 4}
+  timing: {n_fields: 16, pi_shifts_ns: [-100, 0, 100], noise_repeats: 1}
+  reference: {n_fields: 1, cw_ns: 6000, workers: 4}
