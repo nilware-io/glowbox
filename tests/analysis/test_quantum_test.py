@@ -1,4 +1,4 @@
-"""Quantum-test harness: conditions, detuning helpers, bootstrap CIs, paired gaps, timing probes. CPU, < 5 s."""
+"""Quantum-test harness: conditions, detuning helpers, t and bootstrap CIs, paired gaps, timing probes. CPU, < 5 s."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from glowbox.analysis.quantum_test import (
     mw_timing_structure,
     rabi_band_fraction,
     run_quantum_test,
+    t_ci,
     time_saliency,
     timing_sensitivity,
 )
@@ -62,6 +63,20 @@ def test_bootstrap_ci_covers_and_orders():
     assert bootstrap_ci([2.0, 2.0, 2.0, 2.0, 2.0]) == (2.0, 2.0, 2.0)
     med = bootstrap_ci([1.0, 2.0, 100.0], stat=np.median)
     assert med[0] == 2.0
+
+
+def test_t_ci_covers_at_five_seeds_and_bootstrap_does_not():
+    # 2000 draws of 5 N(0, 1) values: the t interval of the mean covers the true 0 in ~95 % of draws, the percentile
+    # bootstrap only in ~83 % (why the quantum test reports t intervals over seeds).
+    rng = np.random.default_rng(42)
+    draws = rng.normal(size=(2000, 5))
+    t_cov = np.mean([lo < 0.0 < hi for _, lo, hi in (t_ci(d) for d in draws)])
+    b_cov = np.mean([lo < 0.0 < hi for _, lo, hi in (bootstrap_ci(d, n_boot=500, rng=rng) for d in draws[:500])])
+    assert 0.935 < t_cov < 0.965
+    assert b_cov < 0.88
+    m, lo, hi = t_ci([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert m == 3.0 and m - lo == pytest.approx(hi - m)
+    assert hi - m == pytest.approx(2.776445 * np.std([1, 2, 3, 4, 5], ddof=1) / np.sqrt(5), rel=1e-5)
 
 
 def test_run_quantum_test_pairs_seeds_and_signs_gaps():

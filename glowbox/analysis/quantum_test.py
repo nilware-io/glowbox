@@ -3,8 +3,9 @@
 Every task runs twice, once with its microwaves as designed and once with every MW frequency shifted far off
 resonance, so that no spin transition is driven: the spins then do not respond to the MW at all and whatever the
 learner still achieves comes from MW-independent fluorescence (brightness, laser-only transients, B_perp level
-mixing). The test reports, over at least five seeds, the performance in each condition, the gap and its bootstrap
-confidence interval, and whether the learned strategy uses microsecond-scale timing (Rabi or echo structure).
+mixing). The test reports, over at least five seeds, the performance in each condition, the gap and its Student-t
+confidence interval over seeds, and whether the learned strategy uses microsecond-scale timing (Rabi or echo
+structure).
 
 Pieces:
 
@@ -12,8 +13,10 @@ Pieces:
   MW; :func:`min_line_distance_hz` / :func:`check_no_line_driven` verify the detuned condition drives nothing.
 * :func:`run_quantum_test` calls a task function ``task(condition, seed) -> {metric: value}`` for every condition
   and seed (paired: the same seed draws the same fields, initialisation and noise in both conditions) and returns
-  a :class:`QuantumTestResult` with bootstrap CIs (:func:`bootstrap_ci`) of each condition's mean and of the paired
-  gap.
+  a :class:`QuantumTestResult` with Student-t CIs over seeds (:func:`t_ci`) of each condition's mean and of the
+  paired gap. With n = 5 seeds a percentile bootstrap of the mean (:func:`bootstrap_ci`, kept for statistics over
+  many samples, e.g. fields) covers only ~83 % at a nominal 95 %: it uses the plug-in sd and normal-like quantiles,
+  where the t interval uses t_4 = 2.776.
 * Timing probes: :func:`timing_sensitivity` (a metric as a function of timing perturbations of the protocol),
   :func:`mw_timing_structure` (pulse areas in units of pi, free-evolution gaps vs T2*) and
   :func:`mw_envelope_spectrum` / :func:`rabi_band_fraction` (spectral content of a MW envelope at the Rabi
@@ -94,6 +97,25 @@ def sequence_mw_freqs(seq: PulseSequence) -> np.ndarray:
 # --- Statistics ---------------------------------------------------------------------------------------------------
 
 
+def t_ci(values: Sequence[float] | np.ndarray, level: float = 0.95) -> tuple[float, float, float]:
+    """(mean, lower, upper): Student-t interval mean +- t_{n-1} s / sqrt(n) (s the sample sd, ddof 1).
+
+    The primary interval over seeds. Exact for normal per-seed values and close for any reasonably symmetric spread;
+    with n = 5 the percentile bootstrap is ~0.63x as wide and covers ~83 % at a nominal 95 %
+    (tests/analysis/test_quantum_test.py checks both coverages).
+    """
+    from scipy.stats import t as student_t
+
+    v = np.asarray(values, dtype=np.float64)
+    if v.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    m = float(v.mean())
+    if v.size == 1:
+        return m, float("nan"), float("nan")
+    half = float(student_t.ppf((1 + level) / 2, v.size - 1)) * float(v.std(ddof=1)) / math.sqrt(v.size)
+    return m, m - half, m + half
+
+
 def bootstrap_ci(
     values: Sequence[float] | np.ndarray,
     stat: Callable[[np.ndarray], float] = np.mean,
@@ -101,10 +123,10 @@ def bootstrap_ci(
     level: float = 0.95,
     rng: np.random.Generator | None = None,
 ) -> tuple[float, float, float]:
-    """(statistic, lower, upper): percentile bootstrap over the values (e.g. one per seed).
+    """(statistic, lower, upper): percentile bootstrap over the values.
 
-    With few seeds (5) a percentile bootstrap is coarse and slightly narrow; the per-seed values are reported next
-    to it so the reader can judge.
+    For many samples (fields, shots). Not for a handful of seeds: with n = 5 the interval of the mean covers ~83 %
+    at a nominal 95 %; use :func:`t_ci` there.
     """
     v = np.asarray(values, dtype=np.float64)
     if v.size == 0:
@@ -139,17 +161,12 @@ class QuantumTestResult:
         va, vb = np.asarray(self.values[a][metric]), np.asarray(self.values[b][metric])
         return va - vb if self.higher_is_better.get(metric, False) else vb - va
 
-    def summary(
-        self, metric: str, n_boot: int = 10_000, level: float = 0.95, seed: int = 0
-    ) -> dict[str, tuple[float, float, float]]:
-        """{condition: (mean, lo, hi), "gap": (mean, lo, hi)} with paired-bootstrap CIs over seeds."""
-        rng = np.random.default_rng(seed)
-        out = {
-            c.name: bootstrap_ci(self.values[c.name][metric], n_boot=n_boot, level=level, rng=rng)
-            for c in self.conditions
-        }
+    def summary(self, metric: str, level: float = 0.95) -> dict[str, tuple[float, float, float]]:
+        """{condition: (mean, lo, hi), "gap": (mean, lo, hi)}: Student-t CIs over seeds (:func:`t_ci`), the gap
+        paired per seed."""
+        out = {c.name: t_ci(self.values[c.name][metric], level=level) for c in self.conditions}
         if {"resonant", "detuned"} <= set(self.values):
-            out["gap"] = bootstrap_ci(self.gap_per_seed(metric), n_boot=n_boot, level=level, rng=rng)
+            out["gap"] = t_ci(self.gap_per_seed(metric), level=level)
         return out
 
     def gap_significant(self, metric: str, level: float = 0.95) -> bool:
@@ -158,7 +175,7 @@ class QuantumTestResult:
         return lo > 0
 
     def to_markdown(self, metrics: Sequence[str] | None = None, fmt: str = "{:.4g}") -> str:
-        """A table: metric, each condition's mean [95 % CI], gap [95 % CI], per-seed values."""
+        """A table: metric, each condition's mean [95 % t CI over seeds], gap [95 % t CI], per-seed values."""
         ms = list(metrics or self.metrics())
         names = [c.name for c in self.conditions]
         head = ["metric", *names, "gap (better on resonance > 0)", "per seed (" + " / ".join(names) + ")"]
