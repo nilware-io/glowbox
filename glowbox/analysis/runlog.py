@@ -244,8 +244,10 @@ def write_report(
     summary_md: str,
     figures: Sequence[Path | str] = (),
     report_dir: Path | str = DEFAULT_REPORT_DIR,
+    name: str | None = None,
 ) -> Path:
-    """Write ``<report_dir>/<run-id>.md`` for a finished run and copy ``figures`` to ``<report_dir>/figures/``.
+    """Write ``<report_dir>/<name>.md`` (default name: the run id) for a finished run and copy ``figures`` to
+    ``<report_dir>/figures/<name>-<figure>.png``.
 
     The report holds the title, the caller's summary (results, conclusions), provenance (git, seed, environment),
     the config and the final metrics. Figures are referenced by relative path so the report renders in the repo.
@@ -255,11 +257,12 @@ def write_report(
     fig_dir = out_dir / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)
     run_id = info["run_id"]
+    stem = name or run_id
     lines = [f"# {title}", "", summary_md.strip(), ""]
     for fpath in figures:
         src = Path(fpath)
         fig_dir.mkdir(exist_ok=True)
-        dst = fig_dir / f"{run_id}-{src.name}"
+        dst = fig_dir / f"{stem}-{src.name}"
         shutil.copyfile(src, dst)
         lines += [f"![{src.stem}](figures/{dst.name})", ""]
     env = info["environment"]
@@ -288,6 +291,6 @@ def write_report(
         lines += ["## Final metrics", "", "| metric | value |", "| --- | --- |"]
         lines += [f"| {k} | {last[k]:.6g} |" for k in metrics.columns if k != "step"]
         lines.append("")
-    path = out_dir / f"{run_id}.md"
+    path = out_dir / f"{stem}.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path

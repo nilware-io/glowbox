@@ -59,7 +59,8 @@ def find_dips(
     fit_half_width_hz: float = 4e6,
 ) -> list[Dip]:
     """Local minima of a CW ODMR spectrum deeper than ``min_contrast`` (relative to ``baseline``), each refined by
-    a Lorentzian fit over +-``fit_half_width_hz`` with the baseline fixed. Sorted by frequency.
+    a Lorentzian fit over +-``fit_half_width_hz`` with the baseline fixed (NaN fit values when fewer than four points
+    or the fit fails). Sorted by frequency.
 
     The CW line of a Lorentzian T2* ensemble, power-broadened by the MW and the optical pumping, is a Lorentzian
     (a convolution of Lorentzians), so the fit's FWHM is the line's FWHM; overlapping lines bias it.
@@ -76,7 +77,12 @@ def find_dips(
             return lorentzian_dip(x, 1.0, contrast, center, hwhm)
 
         p0 = (float(c[p]), float(f[p]), max(step, 0.5e6))
-        (con, cen, hw), _ = scipy.optimize.curve_fit(model, f[sel], 1.0 - c[sel], p0=p0, maxfev=10_000)
+        try:
+            if np.count_nonzero(sel) < 4:
+                raise RuntimeError("too few points around the dip to fit")
+            (con, cen, hw), _ = scipy.optimize.curve_fit(model, f[sel], 1.0 - c[sel], p0=p0, maxfev=10_000)
+        except RuntimeError:  # coarse sweep or failed fit: keep the grid minimum, NaN fit values
+            con = cen = hw = float("nan")
         dips.append(Dip(float(f[p]), float(c[p]), float(cen), float(con), 2.0 * abs(float(hw))))
     return dips
 

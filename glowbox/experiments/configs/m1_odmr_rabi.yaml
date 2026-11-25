@@ -1,0 +1,45 @@
+# Milestone 1: CW ODMR and pulsed Rabi for an NV ensemble, QuTiP reference vs fast surrogate.
+# Run: uv run python -m glowbox.experiments.m1_odmr_rabi  (add --quick for a ~1 min smoke run)
+name: m1-odmr-rabi
+seed: 20261125
+
+# EnvParams overrides (docs/physics.md; everything else stays at the constants.py defaults: T2* 1 us, T2 10 us,
+# beta 0.1, 1000 NVs, collection 3e-3, background 1e4 counts/s, MW along [100]).
+env:
+  # A generic field (|B| = 2.9 mT): four inequivalent NV axes, eight ODMR lines, B_perp 1.3-2.8 mT per axis.
+  b_field_t: [1.2e-3, 0.7e-3, 2.5e-3]
+
+# Detuning quadrature nodes, the same for both simulators (identical nodes, docs/physics.md section 4).
+n_detuning: 32
+
+odmr:
+  margin_hz: 10.0e+6      # sweep from the lowest line - margin to the highest line + margin
+  step_hz: 0.5e+6
+  duration_ns: 4000        # laser + MW together
+  late_ns: 1500            # steady-state window at the end
+  amplitude: 0.1           # MW amplitude (f_R = 0.82 MHz per axis)
+  shots: 2000
+
+rabi:
+  line: [0, 0]             # [NV axis, 0 = f- / 1 = f+]: the lowest, most isolated line
+  amplitude: 0.5           # f_R = 4.08 MHz
+  max_ns: 1000
+  step_ns: 10
+  init_ns: 2000
+  settle_ns: 3000
+  readout_ns: 600
+  window_ns: 300           # readout window (docs/physics.md section 8)
+  shots: 20000
+
+throughput:
+  devices: [cuda, cpu]     # unavailable devices are skipped
+  n_sequences: 256         # Rabi sequences per batch
+  shots: 1000
+  repeat: 2                # best of
+
+# --quick overrides (smoke test: coarse grids, few shots).
+quick:
+  n_detuning: 8
+  odmr: {step_hz: 2.0e+6, shots: 200}
+  rabi: {max_ns: 300, step_ns: 30, shots: 2000}
+  throughput: {devices: [cpu], n_sequences: 16, shots: 200, repeat: 1}
