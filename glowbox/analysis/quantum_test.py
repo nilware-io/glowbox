@@ -77,10 +77,11 @@ def min_line_distance_hz(freqs_hz: np.ndarray, field_t: np.ndarray, env: EnvPara
 
 
 def check_no_line_driven(
-    freqs_hz: np.ndarray, field_t: np.ndarray, env: EnvParams, n_widths: float = 20.0
+    freqs_hz: np.ndarray, field_t: np.ndarray, env: EnvParams, n_widths: float = 10.0
 ) -> tuple[bool, float]:
-    """True when every MW frequency is more than ``n_widths`` x (Rabi full scale + T2* FWHM) from every line, and
-    the margin in Hz. A conservative "the spins do not respond" criterion (off-resonant transfer ~ (f_R/delta)^2)."""
+    """True when every MW frequency is more than ``n_widths`` x (full-scale Rabi frequency + T2* FWHM) from every
+    line, and the margin in Hz. At that distance the off-resonant transfer, ~(f_R / delta)^2, is below 1e-2 even
+    at full MW amplitude (4e-4 at amplitude 0.2): the spins do not respond."""
     width = env.rabi_full_scale_hz + 1.0 / (math.pi * env.t2_star_s)
     d = min_line_distance_hz(freqs_hz, field_t, env)
     return d > n_widths * width, d
