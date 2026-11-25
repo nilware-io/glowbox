@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 import torch
@@ -38,16 +40,18 @@ def test_detuned_sequence_is_dark_to_the_spins():
     """Physics check of the condition: a detuned pi pulse gives the MW-off trace (docs/physics.md section 9.5)."""
     env = EnvParams(b_field_t=(0.0, 0.0, 3e-3))
     f_line = 2.87e9 - 2.803e10 * 3e-3 / np.sqrt(3.0)
-    sim = SurrogateSimulator("cpu", ModelOptions(n_detuning=4))
+    # float64: in float32 a frame 400 MHz from the lines costs ~3e-4 relative round-off over 9 us
+    sim = SurrogateSimulator("cpu", ModelOptions(n_detuning=4, dtype=torch.float64))
+    seq = pulsed_rabi(60, f_line, 1.0)
     on, det, off = (
-        sim.expected_rates([pulsed_rabi(60, f_line, 1.0)], env)[0],
-        sim.expected_rates([detune_sequence(pulsed_rabi(60, f_line, 1.0), 4e8)], env)[0],
-        sim.expected_rates([pulsed_rabi(0, f_line, 1.0)], env)[0],
+        sim.expected_rates([seq], env)[0],
+        sim.expected_rates([detune_sequence(seq, 4e8)], env)[0],
+        sim.expected_rates([dataclasses.replace(seq, microwave=())], env)[0],
     )
     assert np.max(np.abs(on - off)) / off.max() > 0.01
     assert np.max(np.abs(det - off)) / off.max() < 1e-4
     ok, margin = check_no_line_driven(np.array([f_line + 4e8]), np.array(env.b_field_t), env)
-    assert ok and margin > 3.9e8
+    assert ok and margin > 2.9e8  # nearest is the f+ line, 97 MHz above f-
     assert not check_no_line_driven(np.array([f_line + 1e6]), np.array(env.b_field_t), env)[0]
 
 

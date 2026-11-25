@@ -12,7 +12,8 @@ e.g. RTX 50-series), which also runs on machines without a GPU. All code is devi
    dependencies (pytest, ruff, mypy). The first sync downloads the CUDA build of torch (a few GB) even on a CPU box.
 3. Check:
 
-       uv run pytest              # GPU tests are skipped without CUDA
+       uv run pytest              # GPU tests are skipped without CUDA; slow tests deselected
+       uv run pytest -m slow      # the slow ones (milestone smoke runs, minutes on a CPU)
        uv run ruff check . && uv run ruff format --check .
        uv run mypy
 
