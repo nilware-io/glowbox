@@ -63,7 +63,7 @@ eval:
 
 fit:                          # physics-fit baseline, seed 0, on a test subset
   n_fields: 300
-  workers: 32
+  workers: 16                 # spawn workers import torch: 32 exhausted the page file on the GPU machine
 
 timing:                       # timing-structure probe, seed 0, pulsed protocol
   n_fields: 200
@@ -73,7 +73,7 @@ timing:                       # timing-structure probe, seed 0, pulsed protocol
 reference:                    # QuTiP check of the trained decoders, seed 0 resonant
   n_fields: 3
   cw_ns: 20000                # CW points long enough for the steady state the surrogate path solves for
-  workers: 32
+  workers: 16                 # spawn workers import torch: 32 exhausted the page file on the GPU machine
 
 quick:
   seeds: [0, 1, 2, 3, 4]
