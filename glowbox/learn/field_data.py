@@ -5,8 +5,12 @@ sensor protocol (docs/results/m2-field-estimation.md, "Task and data"). Training
 at every step (for any number of shots), so the bank fixes the physics and the noise stays on the fly.
 
 **Target and its symmetry.** A spin-1 NV axis is blind to the sign of B along it, and an ODMR spectrum does not say
-which line belongs to which of the four axes. The spectrum is therefore invariant under the 48 signed permutations
-of the crystal axes (they permute the four <111> axes up to sign), and B is only identifiable modulo that group.
+which line belongs to which of the four axes. The line *positions* are therefore invariant under the 48 signed
+permutations of the crystal axes (they permute the four <111> axes up to sign). The line *amplitudes* are only
+approximately invariant: the MW drive along [100] sets each axis's transverse coupling, so only the 16-element
+subgroup that fixes +-x leaves them exactly unchanged (a signed permutation moving x changes the features by ~0.3 %
+of peak against ~4 % dips in a surrogate check). B is treated as identifiable only modulo the 48-element group: a
+deliberate, conservative (coarser) target that discards the weak amplitude cue.
 The task's target is the canonical representative: B folded into the wedge Bx >= By >= Bz >= 0 (:func:`fold_to_wedge`).
 Generically the fold is unique: the three largest projections a >= b >= c of |B . n_k| (times sqrt 3) give
 z = (a - b)/2, y = (a - c)/2, x = (b + c)/2.
