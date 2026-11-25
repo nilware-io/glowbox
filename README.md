@@ -6,6 +6,16 @@ Simulation first; hardware later.
 
 The goal, scope, phases, tasks and working agreement are in [project-definition.md](project-definition.md).
 
+![CW ODMR of an NV ensemble: eight dips, two per crystal axis, simulated by the QuTiP reference and the GPU surrogate](docs/results/figures/m1-odmr-rabi-odmr.png)
+
+*Continuous-wave ODMR of an NV ensemble in a generic magnetic field: four crystal axes, two lines each. The exact
+QuTiP reference and the fast GPU surrogate agree to within 50 ppm (bottom panel).*
+
+![Pulsed Rabi oscillations on one NV line, reference and surrogate](docs/results/figures/m1-odmr-rabi-rabi.png)
+
+*Pulsed Rabi oscillations on the 2.7995 GHz line, with T2\* decay: both simulators fit 4.094 MHz and differ by under
+10 ppm.*
+
 Licence: MIT (LICENSE).
 
 Layout: `glowbox/` (sim, control, learn, dream, experiments, analysis, hw), `tests/`, `docs/`. Setup and the
