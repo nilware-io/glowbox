@@ -568,6 +568,7 @@ def emission_per_nv(
     mw_fill: torch.Tensor | None = None,
     laser_factor: torch.Tensor | None = None,
     device: torch.device | str | None = None,
+    initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Mean photon emission rate per NV, averaged over orientations and detunings, per bin (1/s), (B, nb).
 
@@ -575,6 +576,39 @@ def emission_per_nv(
     differentiated through (laser power, MW amplitude, frequency, phase). ``mw_fill`` (same shape, in [0, 1]) is the
     fraction of each MW bin during which the MW is actually on (at the start of the bin): continuous pulse durations
     for gradients. ``laser_factor`` multiplies the pump rate per bin (laser drift, max(0, 1 + x)).
+    ``initial_state`` (see :func:`emission_and_state`) continues from a given state instead of the thermal one.
+    """
+    return emission_and_state(
+        arrays,
+        env,
+        options=options,
+        mw_fill=mw_fill,
+        laser_factor=laser_factor,
+        device=device,
+        initial_state=initial_state,
+    )[0]
+
+
+def emission_and_state(
+    arrays: SequenceArrays,
+    env: EnvParams,
+    *,
+    options: ModelOptions | None = None,
+    mw_fill: torch.Tensor | None = None,
+    laser_factor: torch.Tensor | None = None,
+    device: torch.device | str | None = None,
+    initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`emission_per_nv` plus the final per-NV state, shape (B, K, M, 14) (orientation, detuning node, real
+    state layout of this module; the accumulator entry is that of the last bin).
+
+    ``initial_state`` (B, K, M, 14) replaces the thermal start state: a sequence can then be simulated in two
+    pieces (``prefix`` then ``suffix``) with the suffix's bin 0 continuing where the prefix stopped. It must come
+    from a run with the same ``env``, options and per-sequence static field. The suffix's frame starts at its own
+    first MW frequency at time 0. This is exact when the state carries no 0~/+-~ spin coherence at the cut (true
+    after any MW-free prefix: populations never create it, docs/physics.md section 3), because then neither the
+    frame frequency nor the absolute-time origin of the frame is observable. With coherence present the caller
+    must make the suffix's absolute times and frame match the full sequence itself.
     """
     opt = options or ModelOptions()
     dev = torch.device(device) if device is not None else _device_of(arrays)
@@ -625,11 +659,18 @@ def emission_per_nv(
     ukeys: torch.Tensor | None = None
     if opt.dedup:
         ukeys, inv = _unique_bins([g2, *controls])
+    if initial_state is not None:
+        r0 = torch.as_tensor(initial_state, device=dev).to(opt.dtype)
+        k, m = st.weights.shape
+        if r0.shape != (bsz, k, m, N_AUG):
+            raise ValueError(f"initial_state must have shape {(bsz, k, m, N_AUG)}, got {tuple(r0.shape)}")
+    else:
+        r0 = _initial_state(bsz, st)
     if ukeys is not None and not need_grad and ukeys.shape[0] <= 0.5 * bsz * nb:
         with torch.no_grad():
-            em = _run_dedup(st, ukeys, inv, theta, fill is not None, dt_s)
+            em, r_end = _run_dedup(st, ukeys, inv, theta, fill is not None, dt_s, r0)
     elif ukeys is not None and ukeys.shape[0] <= opt.shared_grad_max_fraction * bsz * nb:
-        em = _run_shared_grad(st, ukeys, inv, controls, theta, dt_s, opt)
+        em, r_end = _run_shared_grad(st, ukeys, inv, controls, theta, dt_s, opt, r0)
     else:
         taylor = opt.expm == "taylor" or (opt.expm == "auto" and need_grad)
         cb = _chunk_bins(opt.chunk_bins, bsz, st, 2 if fill is not None else 1)
@@ -638,9 +679,9 @@ def emission_per_nv(
             fl = None if fill is None else fill[:, sl]
             return _propagator(st, g2[:, sl], beta[:, sl], ac[:, sl], as_[:, sl], frame[:, sl], fl, dt_s, taylor)
 
-        em = _run_chunks(st, bsz, nb, make_p, theta, cb, opt.checkpoint)
+        em, r_end = _run_chunks(st, bsz, nb, make_p, theta, cb, opt.checkpoint, r0)
     rate = torch.einsum("bnkm,km->bn", em, st.weights) / dt_s
-    return rate[0] if single else rate
+    return (rate[0], r_end[0]) if single else (rate, r_end)
 
 
 def expected_rate_cps(
@@ -682,9 +723,10 @@ def _run_dedup(
     theta: torch.Tensor,
     has_fill: bool,
     dt_s: float,
-) -> torch.Tensor:
-    """Forward only: one propagator per distinct (field, beta, ac, as, frame, fill) bin."""
-    bsz, nb = inv.shape
+    r0: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward only: one propagator per distinct (field, beta, ac, as, frame, fill) bin; (emission, final state)."""
+    nb = inv.shape[1]
     dtype = st.l0.dtype
     fill = ukeys[:, 5].to(dtype) if has_fill else None
     p_u = _propagator(
@@ -700,7 +742,7 @@ def _run_dedup(
     cos_t, sin_t = torch.cos(theta).to(dtype), torch.sin(theta).to(dtype)
     rot = (theta != 0).any(0).tolist()
     same = (inv == inv[:1]).all(0).tolist()
-    r = _initial_state(bsz, st)
+    r = r0
     out = []
     for b in range(nb):
         if rot[b]:
@@ -708,7 +750,7 @@ def _run_dedup(
         p = p_u[inv[0, b]] if same[b] else p_u[inv[:, b]]
         r = _step(r, p)
         out.append(r[..., ACC])
-    return torch.stack(out, dim=1)
+    return torch.stack(out, dim=1), r
 
 
 def _run_chunks(
@@ -719,7 +761,8 @@ def _run_chunks(
     theta: torch.Tensor,
     chunk_bins: int,
     use_checkpoint: bool,
-) -> torch.Tensor:
+    r0: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Step through the bins chunk by chunk; ``make_p(slice)`` gives the chunk's propagators (B, c, K, M, 14, 14).
 
     The frame switch of each bin is folded into its propagator. With gradients, each chunk is checkpointed:
@@ -739,7 +782,7 @@ def _run_chunks(
         return r, torch.stack(states, dim=1)[..., ACC]
 
     fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] = chunk
-    r = _initial_state(bsz, st)
+    r = r0
     out = []
     for s in range(0, nb, chunk_bins):
         e = min(nb, s + chunk_bins)
@@ -748,7 +791,7 @@ def _run_chunks(
         else:
             r, acc = fn(r, s, e)
         out.append(acc)
-    return torch.cat(out, dim=1)
+    return torch.cat(out, dim=1), r
 
 
 def _chunk_bins(opt_chunk: int, bsz: int, st: Statics, per_bin: int) -> int:
@@ -766,7 +809,8 @@ def _run_shared_grad(
     theta: torch.Tensor,
     dt_s: float,
     opt: ModelOptions,
-) -> torch.Tensor:
+    r0: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Differentiable with shared propagators: P_b = P_u + sum_i (c_bi - c_bi.detach()) dP_u/dc_i.
 
     The added term is exactly zero in value, and its gradient with respect to each bin's own controls c_b is the
@@ -797,7 +841,7 @@ def _run_shared_grad(
                 p = p + dlt[:, sl, None, None, None, None] * d[idx]
         return p
 
-    return _run_chunks(st, bsz, nb, make_p, theta, cb, opt.checkpoint)
+    return _run_chunks(st, bsz, nb, make_p, theta, cb, opt.checkpoint, r0)
 
 
 def mw_fill_for_duration(start_ns: int, duration_ns: torch.Tensor, n_bins: int, grid_ns: int) -> torch.Tensor:

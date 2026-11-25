@@ -49,6 +49,20 @@ and cast to the working dtype (float32 by default).
   needed; until then it stays a separate argument of `expected_rate_cps`.
 - `FluorescenceTrace.rate_cps` may be a read-only view; the interface docstring says to copy before writing.
 
+## Sweep fast paths (`glowbox/sim/surrogate/sweeps.py`, milestone 2)
+
+Exact reformulations for frequency sweeps, used to generate Task 1 datasets (tests/sim/test_sweeps.py):
+
+- `cw_steady_rate_cps`: a CW ODMR point has one constant generator; its steady state solves L x = 0 with unit
+  total population (float64, 13x13 per orientation and detuning node). It is the infinite-duration limit of the
+  time-stepped point: a 20 us point's late window agrees to 1e-9, 6 us to ~5e-4, 3 us to ~2 % (the spin
+  population keeps settling for several microseconds at beta = 0.1). Thousands of CW spectra per second.
+- `branched_rate_cps` (built on `emission_and_state(..., initial_state=...)`, which also returns the final
+  state): a pulsed sweep's sequences share their MW-free init + settle; simulate it once per static field and
+  continue each sweep point from its final state. Exact (1e-14 in float64), because without MW the state carries
+  no 0~/+-~ coherence, so the frame frequency and the absolute-time origin of the frame are unobservable at the
+  cut. A 200-point pulsed ODMR sweep then costs its 91 suffix bins instead of 341 bins per point.
+
 ## Differentiability
 
 `expected_rate_cps(arrays, env, options=..., mw_fill=..., laser_factor=...)` takes torch tensors that require grad
