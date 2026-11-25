@@ -742,12 +742,17 @@ def _run_dedup(
     cos_t, sin_t = torch.cos(theta).to(dtype), torch.sin(theta).to(dtype)
     rot = (theta != 0).any(0).tolist()
     same = (inv == inv[:1]).all(0).tolist()
+    # A bin whose key column equals the previous bin's reuses the gathered propagators: the per-bin gather of
+    # (B, K, M, 14, 14) matrices costs more than the step itself, and protocols are long runs of identical bins.
+    changed = [True, *(inv[:, 1:] != inv[:, :-1]).any(0).tolist()]
     r = r0
     out = []
+    p = p_u[:0]
     for b in range(nb):
         if rot[b]:
             r = _rotate(r, cos_t[:, b, None, None], sin_t[:, b, None, None])
-        p = p_u[inv[0, b]] if same[b] else p_u[inv[:, b]]
+        if changed[b]:
+            p = p_u[inv[0, b]] if same[b] else p_u[inv[:, b]]
         r = _step(r, p)
         out.append(r[..., ACC])
     return torch.stack(out, dim=1), r
