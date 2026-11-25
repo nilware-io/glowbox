@@ -11,8 +11,9 @@ re-checked on the QuTiP reference.
 
 The quantum test (glowbox.analysis.quantum_test) trains and evaluates the learned estimators for every seed twice:
 MW on the sweep as designed, and every MW frequency shifted by ``detuned_offset_hz`` so that no line is driven. It
-reports the gap with bootstrap CIs over seeds and probes whether the pulsed decoder relies on the Rabi timing of
-its protocol (pi-pulse length perturbations, readout-bin saliency).
+reports the gap with Student-t CIs over seeds. Timing is logged as two verdicts: whether the fixed (hand-designed)
+pulsed protocol relies on Rabi timing (pi-pulse length perturbations), and what the decoder learned about time
+(readout-bin saliency vs the spin contrast per bin); no timing is learned in Task 1.
 
 Outputs: ``outputs/<run-id>/`` (run.yaml, raw example traces, metrics, results.parquet with every per-shot-level
 number, seed-0 test banks, models, plots) and a report (``outputs/<run-id>/report/`` unless ``--report-dir``).
@@ -50,6 +51,7 @@ from glowbox.analysis.quantum_test import (
     mw_timing_structure,
     rabi_band_fraction,
     run_quantum_test,
+    t_ci,
     time_saliency,
 )
 from glowbox.analysis.runlog import RunLog, write_report
@@ -353,8 +355,28 @@ def _fit_one(item: tuple[str, np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.n
     return r.b_t, r.sigma_t, r.ok
 
 
-def run_physics_fit(task: FieldTask, workers: int, n_fields: int) -> list[dict[str, Any]]:
-    """Physics-fit baseline on the first ``n_fields`` seed-0 test fields, every condition / protocol / shot level."""
+def paired_field_ci(
+    e_a: np.ndarray, e_b: np.ndarray, rng: np.random.Generator, n_boot: int = 2000, level: float = 0.95
+) -> dict[str, tuple[float, float, float]]:
+    """Paired bootstrap over fields of RMSE(a) - RMSE(b) and median(a) - median(b); ``e_*`` per-field vector errors
+    (same fields, same order). Many fields, so the percentile bootstrap is fine here."""
+    idx = rng.integers(0, e_a.size, size=(n_boot, e_a.size))
+    a, b = e_a[idx], e_b[idx]
+    q = [(1 - level) / 2, (1 + level) / 2]
+    d_rmse = np.sqrt(np.mean(a**2, axis=1)) - np.sqrt(np.mean(b**2, axis=1))
+    d_med = np.median(a, axis=1) - np.median(b, axis=1)
+    p_rmse = float(np.sqrt(np.mean(e_a**2)) - np.sqrt(np.mean(e_b**2)))
+    p_med = float(np.median(e_a) - np.median(e_b))
+    lo_r, hi_r = np.quantile(d_rmse, q)
+    lo_m, hi_m = np.quantile(d_med, q)
+    return {"rmse_diff": (p_rmse, float(lo_r), float(hi_r)), "median_diff": (p_med, float(lo_m), float(hi_m))}
+
+
+def run_physics_fit(task: FieldTask, workers: int, n_fields: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Physics-fit baseline on the first ``n_fields`` seed-0 test fields, every condition / protocol / shot level.
+
+    Returns (summary rows, per-field rows). Each summary row also has the seed-0 CNN on the same fields at the same
+    shot level (its own noise draw) and paired-bootstrap CIs over the fields of fit - CNN in RMSE and median."""
     scaler = task.scalers[0]
     freqs = {
         f"{c}_{k}": protocol_for(task.cfg, k, condition_for(task.cfg, c).mw_offset_hz).mw_freqs_hz()
@@ -375,7 +397,8 @@ def run_physics_fit(task: FieldTask, workers: int, n_fields: int) -> list[dict[s
     with ctx.Pool(workers, initializer=_fit_init, initargs=(freqs, scaler.mean_t, scaler.std_t)) as pool:
         res = pool.map(_fit_one, items, chunksize=8)
     seconds = time.perf_counter() - t0
-    rows = []
+    rows, per_field = [], []
+    brng = np.random.default_rng([task.base_seed, 98])
     grouped: dict[tuple[str, str, int], list[int]] = {}
     for j, (cname, kind, level, _) in enumerate(keys):
         grouped.setdefault((cname, kind, level), []).append(j)
@@ -389,6 +412,9 @@ def run_physics_fit(task: FieldTask, workers: int, n_fields: int) -> list[dict[s
         # the CNN on the same fields and level (seed 0), for a like-for-like comparison
         cb, cs = task.preds[(cname, kind, "cnn", level)]
         cnn = field_metrics(cb[: len(js)], cs[: len(js)], t)
+        e_fit = np.linalg.norm(b - t, axis=1) * 1e6
+        e_cnn = np.linalg.norm(cb[: len(js)] - t, axis=1) * 1e6
+        d = paired_field_ci(e_fit, e_cnn, brng)
         rows.append(
             {
                 "condition": cname,
@@ -397,24 +423,56 @@ def run_physics_fit(task: FieldTask, workers: int, n_fields: int) -> list[dict[s
                 **met,
                 "ok_fraction": float(ok.mean()),
                 "cnn_rmse_ut_same_fields": cnn["rmse_ut"],
+                "cnn_median_ut_same_fields": cnn["median_ut"],
+                **{f"{k}_{n}": v for k, ci in d.items() for n, v in zip(("ut", "lo_ut", "hi_ut"), ci, strict=True)},
                 "n_fields": len(js),
                 "seconds_total": seconds,
             }
         )
-    return rows
+        per_field += [
+            {
+                "condition": cname,
+                "protocol": kind,
+                "shots": level,
+                "field": i,
+                "fit_err_ut": ef,
+                "cnn_err_ut": ec,
+                "fit_ok": bool(o),
+            }
+            for i, (ef, ec, o) in enumerate(zip(e_fit, e_cnn, ok, strict=True))
+        ]
+    return rows, per_field
 
 
 # --- timing probe -----------------------------------------------------------------------------------------------------
 
 
-def rmse_ci(b: np.ndarray, t: np.ndarray, rng: np.random.Generator) -> tuple[float, float, float]:
-    se = np.sum((b - t) ** 2, axis=1) * 1e12
+def rmse_ci(b: np.ndarray, t: np.ndarray, rng: np.random.Generator, repeats: int = 1) -> tuple[float, float, float]:
+    """RMS error (uT) with a bootstrap CI over fields. ``b``, ``t`` stack ``repeats`` noise draws of the same fields
+    (as :meth:`FieldTask.evaluate` returns them): the squared errors are averaged over the draws of each field first,
+    so the resampled units are the (independent) fields, not the correlated rows."""
+    se = (np.sum((b - t) ** 2, axis=1) * 1e12).reshape(repeats, -1).mean(axis=0)
     v, lo, hi = bootstrap_ci(se, rng=rng, n_boot=4000)
     return math.sqrt(v), math.sqrt(lo), math.sqrt(hi)
 
 
+def line_contrast(means: np.ndarray) -> float:
+    """Mean over fields of the deepest dip of the readout-summed pulsed spectrum, 1 - min / median."""
+    tot = means.astype(np.float64).sum(axis=1)  # (n, F)
+    return float(np.mean(1.0 - tot.min(axis=1) / np.median(tot, axis=1)))
+
+
 def run_timing_probe(task: FieldTask) -> dict[str, Any]:
-    """Pulsed protocol, seed-0 decoders frozen: error vs pi-pulse length, readout-bin saliency, sequence timing."""
+    """Pulsed protocol, seed-0 decoders frozen: error vs pi-pulse length, readout-bin saliency, sequence timing.
+
+    What this can and cannot show. In Task 1 nothing learned chooses timing: the 310 ns pi pulse is hand-designed.
+    So the log separates (a) ``protocol_uses_rabi_timing``: the fixed protocol relies on Rabi timing (its pulse is a
+    pi pulse and the resonant error rises when the pulse area changes; the detuned arm sits at the prior and cannot
+    fail, so it is not evidence), from (b) what the decoder learned about time: a weighting of the readout bins,
+    measured by the correlation of its saliency (and of the linear model's weights) with the physical spin contrast
+    per bin. ``strategy_learns_timing`` is False by construction. A frozen decoder's error at a shifted pulse mixes
+    the physical loss of contrast (logged per length) with distribution shift; no retrained-per-length reference is
+    run here."""
     tc = task.cfg["timing"]
     n = int(tc["n_fields"])
     fpe = task.spec.fields_per_env
@@ -425,18 +483,24 @@ def run_timing_probe(task: FieldTask) -> dict[str, Any]:
     scaler = task.scalers[0]
     rng = np.random.default_rng([task.base_seed, 7])
     base = protocol_for(task.cfg, "pulsed")
-    out: dict[str, Any] = {"shifts_ns": [int(s) for s in tc["pi_shifts_ns"]], "curves": {}}
+    reps = int(tc["noise_repeats"])
+    out: dict[str, Any] = {"shifts_ns": [int(s) for s in tc["pi_shifts_ns"]], "curves": {}, "medians": {}}
+    out["contrast_per_length"] = {}
     for cname in ("resonant", "detuned"):
         cond = condition_for(task.cfg, cname)
+        out["contrast_per_length"][cname] = []
         for mname in MODELS:
             out["curves"][f"{cname}_{mname}"] = []
+            out["medians"][f"{cname}_{mname}"] = []
         for shift in out["shifts_ns"]:
             prot = base.detuned(cond.mw_offset_hz).with_pi_ns(base.pi_ns + shift)
             bank = task.simulate(prot, fields, envs)
+            out["contrast_per_length"][cname].append(line_contrast(bank.means))
             for mname in MODELS:
                 model = task.models[(cname, "pulsed", mname)]
-                b, _, t = task.evaluate(model, bank, scaler, 0, task.headline, repeats=int(tc["noise_repeats"]))
-                out["curves"][f"{cname}_{mname}"].append(rmse_ci(b, t, rng))
+                b, _, t = task.evaluate(model, bank, scaler, 0, task.headline, repeats=reps)
+                out["curves"][f"{cname}_{mname}"].append(rmse_ci(b, t, rng, repeats=reps))
+                out["medians"][f"{cname}_{mname}"].append(float(np.median(np.linalg.norm(b - t, axis=1)) * 1e6))
     # saliency of the readout bins (resonant and detuned CNN), and the physical spin contrast per bin
     m_res = task.test_banks[("resonant", "pulsed")]
     k = min(256, len(m_res))
@@ -476,15 +540,23 @@ def run_timing_probe(task: FieldTask) -> dict[str, Any]:
     out["cw_structure"] = mw_timing_structure(seq_c, env)
     out["pulsed_rabi_band_fraction"] = rabi_band_fraction(seq_p, f_r)
     out["cw_rabi_band_fraction"] = rabi_band_fraction(seq_c, env.rabi_full_scale_hz * 0.1 * math.sqrt(2.0 / 3.0))
-    # verdict: does the resonant CNN degrade when the pulse is no longer a pi pulse (beyond its CI)?
+    area0 = float(out["pulsed_structure"]["segments"][0]["area_pi"])
+    out["pulse_area_pi_per_length"] = [area0 * (base.pi_ns + s) / base.pi_ns for s in out["shifts_ns"]]
+    # (a) the fixed protocol: is it a pi pulse, and does the resonant error rise beyond its CI when the area changes?
     shifts = np.array(out["shifts_ns"])
     res = np.array(out["curves"]["resonant_cnn"])
     det = np.array(out["curves"]["detuned_cnn"])
     i0 = int(np.argmin(np.abs(shifts)))
     big = np.abs(shifts) >= 100
     out["resonant_degrades"] = bool(np.any(res[big, 1] > res[i0, 2])) if big.any() else False
-    out["detuned_degrades"] = bool(np.any(det[big, 1] > det[i0, 2])) if big.any() else False
-    out["uses_us_timing"] = out["resonant_degrades"] and not out["detuned_degrades"]
+    out["detuned_degrades"] = bool(np.any(det[big, 1] > det[i0, 2])) if big.any() else False  # cannot fail: prior
+    out["protocol_uses_rabi_timing"] = bool(abs(area0 - 1.0) < 0.25 and out["resonant_degrades"])
+    # (b) what was learned: a readout time-bin weighting that follows the spin-contrast transient
+    c = np.asarray(contrast)
+    out["saliency_contrast_corr"] = float(np.corrcoef(sal["resonant"], c)[0, 1])
+    out["linear_weights_contrast_corr"] = float(np.corrcoef(np.asarray(out["linear_time_weights"]), c)[0, 1])
+    out["decoder_weighting_follows_contrast"] = bool(out["saliency_contrast_corr"] >= 0.8)
+    out["strategy_learns_timing"] = False  # no timing parameter is learned in Task 1 (fixed protocols)
     return out
 
 
@@ -630,14 +702,13 @@ def plot_error_vs_shots(task: FieldTask, fit_rows: list[dict[str, Any]]) -> Figu
     df = pd.DataFrame(task.rows)
     fdf = pd.DataFrame(fit_rows)
     fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
-    rng = np.random.default_rng(0)
     for ax, kind in zip(axes, KINDS, strict=True):
         for mname in MODELS:
             for cname, ls in (("resonant", "-"), ("detuned", "--")):
                 d = df[(df.protocol == kind) & (df.model == mname) & (df.condition == cname)]
                 xs, mu, lo, hi = [], [], [], []
                 for level, g in d.groupby("shots"):
-                    v, a, b = bootstrap_ci(g.rmse_ut.to_numpy(), rng=rng, n_boot=2000)
+                    v, a, b = t_ci(g.rmse_ut.to_numpy())
                     xs.append(level)
                     mu.append(v)
                     lo.append(a)
@@ -646,7 +717,17 @@ def plot_error_vs_shots(task: FieldTask, fit_rows: list[dict[str, Any]]) -> Figu
                 ax.fill_between(xs, lo, hi, color=COLORS[mname], alpha=0.15, lw=0)
         for cname, ls in (("resonant", "-"), ("detuned", "--")):
             d = fdf[(fdf.protocol == kind) & (fdf.condition == cname)].sort_values("shots")
-            ax.plot(d.shots, d.rmse_ut, ls, color=COLORS["fit"], lw=2, marker="s", ms=4, label=f"physics fit, {cname}")
+            n_fit = int(d.n_fields.iloc[0]) if len(d) else 0
+            ax.plot(
+                d.shots,
+                d.rmse_ut,
+                ls,
+                color=COLORS["fit"],
+                lw=2,
+                marker="s",
+                ms=4,
+                label=f"physics fit, {cname} (seed 0, {n_fit} fields)",
+            )
         prior = df[df.protocol == kind].prior_rmse_ut.mean()
         ax.axhline(prior, color=COLORS["prior"], lw=1.2, ls=":", label="prior only")
         ax.set_xscale("log")
@@ -719,7 +800,9 @@ def plot_quantum_test(task: FieldTask, qt: QuantumTestResult) -> Figure:
     ax.set_xticks(ticks, labels, fontsize=8)
     ax.set_ylim(0, None)
     ax.set_ylabel(f"RMS field error at {task.headline} shots (uT)")
-    ax.set_title("quantum test: resonant (solid) vs detuned +0.4 GHz (light); dotted = prior only; 95 % CI over seeds")
+    ax.set_title(
+        "quantum test: resonant (solid) vs detuned +0.4 GHz (light); dotted = prior only; 95 % t CI over seeds"
+    )
     ax.title.set_fontsize(9)
     _style(ax)
     fig.tight_layout()
@@ -789,7 +872,6 @@ def report_body(
     cfg = task.cfg
     df = pd.DataFrame(task.rows)
     fdf = pd.DataFrame(fit_rows)
-    rng = np.random.default_rng(1)
     pr = protocol_for(cfg, "pulsed")
     out = [
         "Task 1 of the brief: estimate a hidden magnetic field from the glow. Two fixed sensor protocols, three "
@@ -844,39 +926,53 @@ def report_body(
         "",
         "## Error vs shots",
         "",
-        "RMS field error (µT), mean over seeds with 95 % bootstrap CI, resonant condition:",
+        f"RMS field error (µT), resonant: mean over the {len(qt.seeds)} seeds with a 95 % Student-t CI over seeds "
+        f"(mean ± t_(n-1) s / √n; each seed has its own fields, nuisance, initialisation and noise, {task.n_test} "
+        "test fields):",
         "",
-        "| shots | " + " | ".join(f"{k} {LABELS[m]}" for k in KINDS for m in MODELS) + " | cw physics fit | "
-        "pulsed physics fit |",
-        "|" + " --- |" * (1 + 2 * len(MODELS) + 2),
+        "| shots | " + " | ".join(f"{k} {LABELS[m]}" for k in KINDS for m in MODELS) + " |",
+        "|" + " --- |" * (1 + 2 * len(MODELS)),
     ]
     for level in task.levels:
         cells = [str(level)]
         for kind in KINDS:
             for mname in MODELS:
                 d = df[(df.protocol == kind) & (df.model == mname) & (df.condition == "resonant") & (df.shots == level)]
-                cells.append(_ci(bootstrap_ci(d.rmse_ut.to_numpy(), rng=rng, n_boot=4000)))
-        for kind in KINDS:
-            d = fdf[(fdf.protocol == kind) & (fdf.condition == "resonant") & (fdf.shots == level)]
-            cells.append(f"{float(d.rmse_ut.iloc[0]):.3g}" if len(d) else "")
+                cells.append(_ci(t_ci(d.rmse_ut.to_numpy())))
         out.append("| " + " | ".join(cells) + " |")
     prior = {k: float(df[df.protocol == k].prior_rmse_ut.mean()) for k in KINDS}
+    n_fit = int(cfg["fit"]["n_fields"])
     out += [
         "",
-        f"Prior only (predicting the training mean): {prior['cw']:.0f} µT. Physics fit vs CNN on the *same* "
-        "fields and noise level (seed 0): "
-        + "; ".join(
-            f"{r['protocol']} {r['shots']} shots: fit {r['rmse_ut']:.3g} vs CNN {r['cnn_rmse_ut_same_fields']:.3g} µT "
-            f"(fit found dips in {100 * r['ok_fraction']:.0f} %)"
-            for r in fit_rows
-            if r["condition"] == "resonant" and r["shots"] in (task.levels[0], task.headline, task.levels[-1])
-        )
-        + ".",
+        f"Prior only (predicting the training mean): {prior['cw']:.0f} µT.",
         "",
+        "### Physics fit vs CNN on the same fields",
+        "",
+        f"Seed 0 only, the first {n_fit} test fields, every shot level; fit and CNN each see their own Poisson draw "
+        "at the same number of shots. Differences are fit - CNN (negative: the fit is better) with 95 % paired-"
+        "bootstrap CIs over the fields; median = typical-case error; ok = fraction of fits that found significant "
+        "dips (the rest return the prior).",
+        "",
+        "| protocol | shots | fit RMSE | CNN RMSE | RMSE fit - CNN | fit median | CNN median | median fit - CNN "
+        "| fit ok |",
+        "|" + " --- |" * 9,
+    ]
+    res_fit = [r for r in fit_rows if r["condition"] == "resonant"]
+    for r in sorted(res_fit, key=lambda r: (KINDS.index(r["protocol"]), r["shots"])):
+        out.append(
+            f"| {r['protocol']} | {r['shots']} | {r['rmse_ut']:.3g} | {r['cnn_rmse_ut_same_fields']:.3g} "
+            f"| {_ci((r['rmse_diff_ut'], r['rmse_diff_lo_ut'], r['rmse_diff_hi_ut']))} | {r['median_ut']:.3g} "
+            f"| {r['cnn_median_ut_same_fields']:.3g} "
+            f"| {_ci((r['median_diff_ut'], r['median_diff_lo_ut'], r['median_diff_hi_ut']))} "
+            f"| {100 * r['ok_fraction']:.0f} % |"
+        )
+    out += ["", fit_vs_cnn_conclusion(res_fit), ""]
+    out += [
         "## Calibration",
         "",
         "Calibration of the predicted per-component sigma, resonant, mean over seeds: RMS of error / sigma "
-        "(1 = calibrated) and coverage of the 68 % / 95 % intervals.",
+        "(1 = calibrated) and coverage of the 68 % / 95 % intervals. Fit columns: seed 0, "
+        f"{n_fit} fields.",
         "",
         "| shots | " + " | ".join(f"{k} {LABELS[m]}" for k in KINDS for m in MODELS) + " | cw fit | pulsed fit |",
         "|" + " --- |" * (1 + 2 * len(MODELS) + 2),
@@ -896,15 +992,16 @@ def report_body(
                 else ""
             )
         out.append("| " + " | ".join(cells) + " |")
+    out += ["", calibration_summary(df, fdf, task.headline), ""]
     out += [
-        "",
         "## Quantum test",
         "",
         f"Every learned estimator was retrained from scratch and evaluated with every MW frequency shifted by "
         f"+{cfg['detuned_offset_hz'] / 1e6:.0f} MHz (no line within {task.no_line_margin_hz / 1e6:.0f} MHz of any "
         "MW frequency in the spot checks; `check_no_line_driven`), same fields, nuisance, initialisation and noise "
         f"seeds per seed (paired). Headline: RMS field error at {task.headline} shots; skill = 1 - error / "
-        "prior-only error. 95 % percentile-bootstrap CIs over the seeds; gap > 0 means better on resonance.",
+        f"prior-only error. 95 % Student-t CIs over the {len(qt.seeds)} seeds (the gap paired per seed); gap > 0 "
+        "means better on resonance.",
         "",
         qt.to_markdown(
             [f"{k}_{m}_rmse_ut" for k in KINDS for m in MODELS] + [f"{k}_{m}_skill" for k in KINDS for m in MODELS],
@@ -923,7 +1020,9 @@ def report_body(
         + ". Detuned, the CNN's skill is "
         + ", ".join(f"{k} {_ci(s)}" for k, s in zip(KINDS, det_skill, strict=True))
         + ": with no line driven the spectrum carries (almost) no field information and the decoders fall back "
-        "to the prior. The physics fit on the detuned spectra found dips in "
+        "to the prior (a skill slightly below 0 is expected: the training mean they fall back to differs slightly "
+        "from the test mean; the B_perp level-mixing signal that would survive detuning is far below the shot noise "
+        "and is masked by the per-sample normalisation). The physics fit on the detuned spectra found dips in "
         + ", ".join(
             f"{r['protocol']} {100 * r['ok_fraction']:.0f} %"
             for r in fit_rows
@@ -931,42 +1030,9 @@ def report_body(
         )
         + f" of the cases at {task.headline} shots.",
         "",
-        "### Does the learned strategy use microsecond-scale timing?",
-        "",
-        "Task 1 uses fixed protocols, so the strategy is the protocol plus the learned decoder. The CW protocol has "
-        "no timing structure by construction (MW and laser on together, steady state; Rabi-band fraction of its MW "
-        f"envelope {tp['cw_rabi_band_fraction']:.2f}). The pulsed protocol's MW pulse has area "
-        f"{tp['pulsed_structure']['segments'][0]['area_pi']:.2f} pi at the nominal Rabi frequency (Rabi-band "
-        f"fraction {tp['pulsed_rabi_band_fraction']:.2f}). Probe: the seed-0 pulsed decoders, frozen, on test fields "
-        "re-simulated with the MW pulse lengthened or shortened (RMS error at "
-        f"{task.headline} shots, 95 % bootstrap CI over {cfg['timing']['n_fields']} fields x "
-        f"{cfg['timing']['noise_repeats']} noise draws):",
-        "",
-        "| pulse length (ns) | "
-        + " | ".join(f"{LABELS[m]}, {c}" for c in ("resonant", "detuned") for m in MODELS)
-        + " |",
-        "|" + " --- |" * (1 + 2 * len(MODELS)),
     ]
-    for j, sh in enumerate(tp["shifts_ns"]):
-        cells = [str(pr.pi_ns + sh)]
-        for c in ("resonant", "detuned"):
-            for m in MODELS:
-                cells.append(_ci(tuple(tp["curves"][f"{c}_{m}"][j])))
-        out.append("| " + " | ".join(cells) + " |")
-    sal = tp["saliency_first_300ns_fraction"]
+    out += timing_section(task, tp)
     out += [
-        "",
-        f"Readout saliency of the resonant CNN: {100 * sal['resonant']:.0f} % of |d|B_hat|/d input| falls in the "
-        f"first 300 ns of the readout (uniform would be {100 * tp['uniform_first_300ns_fraction']:.0f} %); the "
-        "physical spin contrast per readout bin and the linear model's learned time weights are in the timing "
-        "figure. Logged verdict `uses_us_timing` (resonant error rises beyond its CI for |shift| >= 100 ns while "
-        f"the detuned one does not): **{tp['uses_us_timing']}**"
-        + (
-            ": the resonant decoder depends on the MW pulse being a pi pulse, i.e. on Rabi timing at the ~100 ns scale."
-            if tp["uses_us_timing"]
-            else "."
-        ),
-        "",
         "## Reference check (QuTiP)",
         "",
         f"{cfg['reference']['n_fields']} seed-0 test fields re-simulated with the QuTiP reference (same detuning "
@@ -990,11 +1056,177 @@ def report_body(
         "- Field priors and nuisance ranges are assumptions (`FieldPrior`), not a characterised sample; the model "
         "excludes hyperfine structure and excited-state mixing (docs/physics.md section 10), which a real spectrum "
         "has. No claim of quantum advantage: the gap only shows the estimate needs the driven spin resonance.",
+        "- The 48-fold target (`fold_to_wedge`) is exact for the line positions but only approximate for the line "
+        "amplitudes: the MW drive along [100] keeps only the 16 signed permutations that fix ±x. Folding by all 48 "
+        "is a deliberate, conservative (coarser) target.",
         "- The physics fit assumes E = 0 and a Lorentzian lineshape (the pulsed line is not exactly Lorentzian); "
         "it is evaluated for seed 0 only.",
-        "- Five seeds make the bootstrap CIs coarse; per-seed values are in the table.",
+        "- Five seeds: the over-seed CIs are Student-t intervals (a percentile bootstrap over 5 values covers ~83 % "
+        "at a nominal 95 %); per-seed values are in the quantum-test table.",
+        "- Process pools: each spawn worker imports torch; with 32 workers some worker starts on the GPU machine "
+        "failed for lack of page-file commit (the pools replaced them and every item completed), so the config "
+        "uses 16.",
     ]
     return "\n".join(out)
+
+
+def _levels(xs: list[int]) -> str:
+    return ", ".join(str(x) for x in xs) if xs else "none"
+
+
+def fit_vs_cnn_conclusion(rows: list[dict[str, Any]]) -> str:
+    """Per protocol: at which shot levels the fit or the CNN is better (paired CI excludes 0), by RMSE and median."""
+    parts = []
+    for kind in KINDS:
+        rs = sorted((r for r in rows if r["protocol"] == kind), key=lambda r: r["shots"])
+        if not rs:
+            continue
+        verdict: dict[str, dict[str, list[int]]] = {}
+        for m in ("rmse_diff", "median_diff"):
+            v: dict[str, list[int]] = {"fit": [], "cnn": [], "tie": []}
+            for r in rs:
+                lo, hi = r[f"{m}_lo_ut"], r[f"{m}_hi_ut"]
+                v["fit" if hi < 0 else "cnn" if lo > 0 else "tie"].append(int(r["shots"]))
+            verdict[m] = v
+        tails = [
+            f"{r['shots']} ({100 * (1 - r['ok_fraction']):.0f} % failed fits)"
+            for r in rs
+            if int(r["shots"]) in verdict["rmse_diff"]["cnn"] and int(r["shots"]) in verdict["median_diff"]["fit"]
+        ]
+        s = (
+            f"**{kind}**: by RMSE the fit is better at {_levels(verdict['rmse_diff']['fit'])} shots, the CNN at "
+            f"{_levels(verdict['rmse_diff']['cnn'])}, no significant difference at "
+            f"{_levels(verdict['rmse_diff']['tie'])}; by median (typical case) the fit is better at "
+            f"{_levels(verdict['median_diff']['fit'])}, the CNN at {_levels(verdict['median_diff']['cnn'])}"
+        )
+        if tails:
+            s += "; where the CNN wins on RMSE but the fit on median, the fit's RMSE comes from its tail: " + ", ".join(
+                tails
+            )
+        parts.append(s + ".")
+    return (
+        "Comparison against the classical baseline: "
+        + " ".join(parts)
+        + " Failed fits (no significant dip, or mis-assigned lines) dominate the fit's RMSE at low shots; its E = 0 / "
+        "Lorentzian-shape bias sets its floor at high shots. Uncertainty calibration of both is in the next section."
+    )
+
+
+def calibration_summary(df: pd.DataFrame, fdf: pd.DataFrame, headline: int) -> str:
+    """One sentence on the CNN's calibration below / at-and-above the headline shots, one on the fit's."""
+    d = df[(df.model == "cnn") & (df.condition == "resonant")].groupby(["protocol", "shots"])[["z_rms", "cov68"]]
+    g = d.mean().reset_index()
+    lo, hi = g[g.shots < headline], g[g.shots >= headline]
+
+    def rng_(x: pd.Series, f: str = "{:.2f}") -> str:
+        return f"{f.format(x.min())}-{f.format(x.max())}" if len(x) else "n/a"
+
+    def verdict(x: pd.DataFrame) -> str:
+        z = x.z_rms
+        if z.max() <= 1.05 and z.min() >= 0.95:
+            return "well calibrated"
+        if z.min() > 1.0:
+            return (
+                f"mildly over-confident (sigma about {100 * (z.min() - 1):.0f}-{100 * (z.max() - 1):.0f} % too small)"
+            )
+        return "calibrated to within the spread shown"
+
+    s = (
+        f"The CNN is {verdict(lo)} below {headline} shots (z RMS {rng_(lo.z_rms)}, 68 % coverage "
+        f"{rng_(100 * lo.cov68, '{:.0f}')} %) and {verdict(hi)} at >= {headline} shots (z RMS {rng_(hi.z_rms)}; 68 % "
+        f"coverage {rng_(100 * hi.cov68, '{:.0f}')} %)."
+    )
+    f = fdf[fdf.condition == "resonant"]
+    if len(f):
+        top = f[f.shots == f.shots.max()]
+        s += (
+            f" The physics fit's Jacobian sigma: z RMS up to {f.z_rms.max():.1f} over the shot levels (failed or "
+            f"mis-assigned fits at low shots) and {rng_(top.z_rms)} at {int(f.shots.max())} shots, where its error "
+            f"({rng_(top.rmse_ut, '{:.0f}')} µT) includes the E = 0 and Lorentzian-shape bias that the Jacobian does "
+            "not know about."
+        )
+    return s
+
+
+def timing_section(task: FieldTask, tp: dict[str, Any]) -> list[str]:
+    cfg = task.cfg
+    pr = protocol_for(cfg, "pulsed")
+    out = [
+        "### Does the learned strategy use microsecond-scale timing?",
+        "",
+        "No timing is learned in M2: both protocols are fixed and hand-designed, and what is learned is the "
+        "decoder. The log therefore keeps two verdicts apart.",
+        "",
+        "**(a) The fixed protocol** (`protocol_uses_rabi_timing`). The CW protocol has no timing structure by "
+        "construction (MW and laser on together, steady state; Rabi-band fraction of its MW envelope "
+        f"{tp['cw_rabi_band_fraction']:.2f}). The pulsed protocol's MW pulse is a hand-designed pi pulse, area "
+        f"{tp['pulsed_structure']['segments'][0]['area_pi']:.2f} pi at the nominal Rabi frequency (Rabi-band "
+        f"fraction {tp['pulsed_rabi_band_fraction']:.2f}). Pulse-area sensitivity: the seed-0 pulsed decoders, "
+        "frozen, on test fields re-simulated with the MW pulse lengthened or shortened (RMS error at "
+        f"{task.headline} shots with a 95 % bootstrap CI over {cfg['timing']['n_fields']} fields, squared errors "
+        f"averaged over the {cfg['timing']['noise_repeats']} noise draws of each field first; line contrast = mean "
+        "deepest dip of the readout-summed spectrum):",
+        "",
+        "| pulse length (ns) | area (pi) | line contrast | CNN, resonant | CNN median, resonant | "
+        "linear, resonant | CNN, detuned | linear, detuned |",
+        "|" + " --- |" * 8,
+    ]
+    for j, sh in enumerate(tp["shifts_ns"]):
+        cells = [
+            str(pr.pi_ns + sh),
+            f"{tp['pulse_area_pi_per_length'][j]:.2f}",
+            f"{100 * tp['contrast_per_length']['resonant'][j]:.1f} %",
+            _ci(tuple(tp["curves"]["resonant_cnn"][j])),
+            f"{tp['medians']['resonant_cnn'][j]:.3g}",
+            _ci(tuple(tp["curves"]["resonant_linear"][j])),
+            _ci(tuple(tp["curves"]["detuned_cnn"][j])),
+            _ci(tuple(tp["curves"]["detuned_linear"][j])),
+        ]
+        out.append("| " + " | ".join(cells) + " |")
+    shifts = np.array(tp["shifts_ns"])
+    i0 = int(np.argmin(np.abs(shifts)))
+    rc = np.array(tp["curves"]["resonant_cnn"])
+    ib = int(np.argmin(rc[:, 0]))
+    tail_ratio = float(rc[i0, 0] / max(tp["medians"]["resonant_cnn"][i0], 1e-12))
+    corr_ok = bool(tp["decoder_weighting_follows_contrast"])
+    out += [
+        "",
+        f"Verdict `protocol_uses_rabi_timing` = **{tp['protocol_uses_rabi_timing']}** (criterion: the protocol's "
+        "pulse is a pi pulse and the resonant error rises beyond its CI for some |shift| >= 100 ns). Caveats: this "
+        "is a property of the hand-designed protocol, not of anything learned; the detuned arm sits at the prior at "
+        "every length, so 'the detuned error does not rise' cannot fail and is no evidence; and a frozen decoder's "
+        "degradation mixes "
+        "the physical loss of contrast (column) with distribution shift, since no decoder retrained at each length "
+        f"is run. At the trained {pr.pi_ns} ns the CNN's RMSE is {_ci(tuple(rc[i0]))} µT against a median of "
+        f"{tp['medians']['resonant_cnn'][i0]:.3g} µT"
+        + (
+            f" (RMSE / median {tail_ratio:.1f}: heavy-tailed, a few fields with overlapping lines dominate the RMSE)"
+            if tail_ratio > 1.3
+            else ""
+        )
+        + (
+            f", and {pr.pi_ns + int(shifts[ib])} ns does about as well or slightly better "
+            f"({rc[ib, 0]:.3g} µT): the decoder was trained across Rabi full scales of 8-12 MHz, so the nominal pi "
+            "pulse is right only on average."
+            if ib != i0
+            else "."
+        ),
+        "",
+        "**(b) What the decoder learned about time** (`decoder_weighting_follows_contrast`). The CNN's saliency per "
+        "readout bin correlates with the physical spin contrast per bin at r = "
+        f"{tp['saliency_contrast_corr']:.2f} (the linear model's learned time weights at r = "
+        f"{tp['linear_weights_contrast_corr']:.2f}); {100 * tp['saliency_first_300ns_fraction']['resonant']:.0f} % "
+        "of the saliency falls in the first 300 ns of the readout (uniform: "
+        f"{100 * tp['uniform_first_300ns_fraction']:.0f} %). Verdict **{corr_ok}** (criterion r >= 0.8)"
+        + (
+            ": the decoder learned a 10-ns time-bin weighting of the readout that follows the spin-contrast transient."
+            if corr_ok
+            else ": no clear learned weighting that follows the spin-contrast transient."
+        )
+        + " It chose no pulse timing: `strategy_learns_timing` = **False** for Task 1.",
+        "",
+    ]
+    return out
 
 
 # --- main -------------------------------------------------------------------------------------------------------------
@@ -1013,7 +1245,7 @@ def main(
         hib = {f"{k}_{m}_skill": True for k in KINDS for m in MODELS}
         qt = run_quantum_test(task, [int(s) for s in cfg["seeds"]], conds, higher_is_better=hib)
         print("[m2] physics fit", flush=True)
-        fit_rows = run_physics_fit(task, int(cfg["fit"]["workers"]), int(cfg["fit"]["n_fields"]))
+        fit_rows, fit_fields = run_physics_fit(task, int(cfg["fit"]["workers"]), int(cfg["fit"]["n_fields"]))
         print("[m2] timing probe", flush=True)
         tp = run_timing_probe(task)
         print("[m2] reference check", flush=True)
@@ -1022,6 +1254,7 @@ def main(
 
         pd.DataFrame(task.rows).to_parquet(run.dir / "results.parquet")
         pd.DataFrame(fit_rows).to_parquet(run.dir / "fit_results.parquet")
+        pd.DataFrame(fit_fields).to_parquet(run.dir / "fit_fields.parquet")
         (run.dir / "train_history.json").write_text(json.dumps(task.histories), encoding="utf-8")
         (run.dir / "timing_probe.json").write_text(json.dumps(tp, default=float), encoding="utf-8")
         (run.dir / "reference_check.json").write_text(json.dumps(ref), encoding="utf-8")
@@ -1058,8 +1291,13 @@ def main(
                 if r["protocol"] == k and r["condition"] == "resonant" and r["shots"] == task.headline
             ]
             summary[f"{k}_fit_rmse_ut_resonant"] = fr[0]["rmse_ut"] if fr else float("nan")
+            summary[f"{k}_fit_median_ut_resonant"] = fr[0]["median_ut"] if fr else float("nan")
+            summary[f"{k}_cnn_median_ut_same_fields"] = fr[0]["cnn_median_ut_same_fields"] if fr else float("nan")
             summary[f"{k}_ref_max_rel_feature_diff"] = ref[k]["max_rel_feature_diff"]
-        summary["uses_us_timing_pulsed"] = float(tp["uses_us_timing"])
+        summary["protocol_uses_rabi_timing_pulsed"] = float(tp["protocol_uses_rabi_timing"])
+        summary["decoder_weighting_follows_contrast_pulsed"] = float(tp["decoder_weighting_follows_contrast"])
+        summary["saliency_contrast_corr_pulsed"] = tp["saliency_contrast_corr"]
+        summary["strategy_learns_timing"] = float(tp["strategy_learns_timing"])
         summary["no_line_margin_mhz"] = task.no_line_margin_hz / 1e6
         summary["wall_seconds"] = time.perf_counter() - t_start
         run.log_metrics(step=0, **{k: v for k, v in summary.items() if isinstance(v, int | float)})

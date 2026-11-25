@@ -29,7 +29,14 @@ def test_m2_runs_end_to_end(tmp_path):
     report, summary = main(cfg, output_root=tmp_path / "out", report_dir=tmp_path / "results")
     text = report.read_text(encoding="utf-8")
     assert report.name == "m2-field-estimation.md"
-    for section in ("## Quantum test", "## Calibration", "## Reference check", "uses_us_timing"):
+    for section in (
+        "## Quantum test",
+        "## Calibration",
+        "## Reference check",
+        "protocol_uses_rabi_timing",
+        "### Physics fit vs CNN on the same fields",
+        "strategy_learns_timing",
+    ):
         assert section in text
     for fig in ("inputs", "error-vs-shots", "calibration", "quantum-test", "timing"):
         assert (tmp_path / "results" / "figures" / f"m2-field-estimation-{fig}.png").exists()
@@ -39,3 +46,4 @@ def test_m2_runs_end_to_end(tmp_path):
     info = load_run(run_dir)
     assert info["seed"] == cfg["seed"] and len(info["traces"]) == 2 * 2 * 2 * 10  # cond x protocol x point x shots
     assert (run_dir / "results.parquet").exists() and (run_dir / "quantum_test.json").exists()
+    assert (run_dir / "fit_fields.parquet").exists() and summary["strategy_learns_timing"] == 0.0

@@ -1,6 +1,6 @@
 # Milestone 2: Task 1 (estimate a hidden magnetic field from the glow) with fixed sensor protocols, a CNN decoder,
 # a linear time-bin-weighting baseline, a physics-fit baseline and the quantum test (resonant vs detuned MW).
-# Run: uv run python -m glowbox.experiments.m2_field_estimation  (add --quick for a few-minute smoke run)
+# Run: uv run python -m glowbox.experiments.m2_field_estimation  (add --quick for a ~8 min CPU smoke run)
 name: m2-field-estimation
 seed: 20261126
 # Quantum-test seeds (>= 5). Each seed draws its own fields, nuisance parameters, model initialisation and noise;
