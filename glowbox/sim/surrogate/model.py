@@ -560,6 +560,24 @@ class ModelOptions:
     detuning_spacing: float = 0.5
 
 
+def statics_for(
+    arrays: SequenceArrays, env: EnvParams, options: ModelOptions, device: torch.device | str | None = None
+) -> Statics:
+    """The :class:`Statics` that :func:`emission_and_state` would build for ``arrays`` (to share between calls)."""
+    dev = torch.device(device) if device is not None else _device_of(arrays)
+    magnet = np.asarray(arrays.to_numpy().magnet_t, dtype=np.float64).reshape(-1, 3)
+    ufields = np.unique(np.asarray(env.b_field_t, dtype=np.float64)[None] + magnet, axis=0)
+    return build_statics(
+        env,
+        ufields,
+        options.n_detuning,
+        options.dtype,
+        dev,
+        detuning_rule=options.detuning_rule,
+        detuning_spacing=options.detuning_spacing,
+    )
+
+
 def emission_per_nv(
     arrays: SequenceArrays,
     env: EnvParams,
@@ -598,6 +616,7 @@ def emission_and_state(
     laser_factor: torch.Tensor | None = None,
     device: torch.device | str | None = None,
     initial_state: torch.Tensor | None = None,
+    statics: Statics | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """:func:`emission_per_nv` plus the final per-NV state, shape (B, K, M, 14) (orientation, detuning node, real
     state layout of this module; the accumulator entry is that of the last bin).
@@ -609,6 +628,10 @@ def emission_and_state(
     after any MW-free prefix: populations never create it, docs/physics.md section 3), because then neither the
     frame frequency nor the absolute-time origin of the frame is observable. With coherence present the caller
     must make the suffix's absolute times and frame match the full sequence itself.
+
+    ``statics`` skips :func:`build_statics` (NumPy, the dominant cost of short batches): it must have been built
+    for this ``env`` and options and for exactly ``np.unique(fields, axis=0)`` of this batch's total fields (as
+    :func:`statics_for` does).
     """
     opt = options or ModelOptions()
     dev = torch.device(device) if device is not None else _device_of(arrays)
@@ -634,15 +657,20 @@ def emission_and_state(
     # Static fields per sequence -> groups.
     fields = np.asarray(env.b_field_t, dtype=np.float64)[None] + magnet.detach().cpu().numpy().astype(np.float64)
     ufields, ginv = np.unique(fields, axis=0, return_inverse=True)
-    st = build_statics(
-        env,
-        ufields,
-        opt.n_detuning,
-        opt.dtype,
-        dev,
-        detuning_rule=opt.detuning_rule,
-        detuning_spacing=opt.detuning_spacing,
-    )
+    if statics is not None:
+        st = statics
+        if st.l0.shape[0] != ufields.shape[0]:
+            raise ValueError(f"statics has {st.l0.shape[0]} field groups, the batch {ufields.shape[0]}")
+    else:
+        st = build_statics(
+            env,
+            ufields,
+            opt.n_detuning,
+            opt.dtype,
+            dev,
+            detuning_rule=opt.detuning_rule,
+            detuning_spacing=opt.detuning_spacing,
+        )
     group = torch.as_tensor(ginv.reshape(-1), device=dev)
     if group.shape[0] == 1 and bsz > 1:
         group = group.expand(bsz)

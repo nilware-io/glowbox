@@ -29,6 +29,7 @@ from glowbox.sim.surrogate.model import (
     _generator,
     build_statics,
     emission_and_state,
+    statics_for,
 )
 
 #: Indices of populations in the real state layout (ground 0~, -~, +~; excited ms=0, -1, +1; singlet).
@@ -139,8 +140,14 @@ def branched_rate_cps(
     idx = np.asarray(branch, dtype=np.int64)
     if not np.array_equal(np.asarray(pre.magnet_t).reshape(-1, 3)[idx], np.asarray(suf.magnet_t).reshape(-1, 3)):
         raise ValueError("each suffix must have the static field (magnet) of its prefix")
-    _, state = emission_and_state(pre, env, options=opt, device=dev)
+    # The suffix fields are a subset of the prefix fields (checked above); when they are the same set (every
+    # prefix row is used), one Statics serves both calls.
+    st = statics_for(pre, env, opt, dev)
+    n_pre = np.unique(np.asarray(pre.magnet_t).reshape(-1, 3), axis=0).shape[0]
+    n_suf = np.unique(np.asarray(suf.magnet_t).reshape(-1, 3), axis=0).shape[0]
+    _, state = emission_and_state(pre, env, options=opt, device=dev, statics=st)
     r0 = state[torch.as_tensor(idx, device=state.device)]
-    em, _ = emission_and_state(suf, env, options=opt, device=dev, initial_state=r0)
+    st_suf = st if n_suf == n_pre else None
+    em, _ = emission_and_state(suf, env, options=opt, device=dev, initial_state=r0, statics=st_suf)
     laser = torch.as_tensor(np.asarray(suf.laser), device=em.device).to(em.dtype).reshape(em.shape)
     return env.collection_efficiency * env.n_nv * em + env.background_cps * laser + env.dark_cps
