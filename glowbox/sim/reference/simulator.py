@@ -272,9 +272,10 @@ class ReferenceSimulator:
         fm = np.array([gr.model.f_minus_hz for gr in groups])
         fp = np.array([gr.model.f_plus_hz for gr in groups])
         fr_per_amp = env.rabi_full_scale_hz * np.array([gr.model.mperp for gr in groups])
+        hd = np.stack([gr.model.ham_delta for gr in groups])
         w = np.stack([gr.model.emission for gr in groups])  # (n_g, 49)
-        # delta enters as delta * (ham_plus - ham_minus): (n_g, m, 49, 49)
-        dpart = deltas[None, :, None, None] * (hp - hm)[:, None]
+        # delta enters as delta * Sz (spec section 4): (n_g, m, 49, 49)
+        dpart = deltas[None, :, None, None] * hd[:, None]
 
         cache: dict[tuple[float, float, float, float], tuple[np.ndarray, np.ndarray]] = {}
 

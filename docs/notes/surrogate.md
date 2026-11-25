@@ -38,16 +38,14 @@ and cast to the working dtype (float32 by default).
 5. **`t2_stretch != 1` is refused** (ValueError), like the reference, rather than faked with a non-Markovian rate.
 6. **Drift with `run_batch`:** one OU chain per sequence (each sequence is its own `run()` call).
 
-## Requested spec / interface changes (not made: shared files)
+## Requested spec / interface changes (resolved at integration)
 
-- docs/physics.md section 4: state that the detuning is `delta * Sz` in H0 (point 1) and section 3/6 the secular
-  rule for dissipators (point 2) and the 0~ rule (point 3), so both implementations are pinned.
-- `SequenceArrays`: allow an optional `mw_fill` per-bin array (fraction of the bin the MW is on, the on-part at the
-  start of the bin). The surrogate takes it as a separate argument for now; it is what makes pulse durations
-  differentiable (`mw_fill_for_duration`). Also document that `mw_frequency_hz == 0` means "inherit the previous
-  frequency" (the surrogate's rule; it keeps gradients with respect to amplitude consistent at amplitude 0).
-- `FluorescenceTrace.rate_cps`: without drift the surrogate returns a read-only broadcast view (shots x n_bins of
-  one row) to avoid copying; say in the interface that consumers must not write to it, or the surrogate copies.
+- docs/physics.md now states the delta * Sz detuning (section 4), the secular dissipator rule, the 0~ rule and the
+  frame bookkeeping (section 3); the reference was changed to delta * Sz.
+- `SequenceArrays` documents that `mw_frequency_hz == 0` inherits the previous frequency. An optional per-bin
+  `mw_fill` in `SequenceArrays` is deferred to the encoder work (phase 2), where differentiable durations are first
+  needed; until then it stays a separate argument of `expected_rate_cps`.
+- `FluorescenceTrace.rate_cps` may be a read-only view; the interface docstring says to copy before writing.
 
 ## Differentiability
 
@@ -72,8 +70,7 @@ ODMR dip positions within 0.3 MHz of an independent diagonalisation (2 lines for
 field); Rabi frequency = rabi_full_scale * a * |m_perp| within 2 % at a = 1 and 0.5; detuned 200 MHz = MW off within
 1e-3; Ramsey fringe frequency within 2 % of the detuning and envelope of order T2*; Hahn echo decay exp(-2 tau/T2)
 within 0.05 and refocusing a 0.5 MHz detuning; frame switch sign and exactness; float32 vs float64, dedup vs dense,
-Taylor vs `matrix_exp`; Poisson mean; drift seeding; CUDA vs CPU (gpu-marked). Surrogate-vs-reference agreement is
-for the integration step (the reference was written in parallel; no code is shared).
+Taylor vs `matrix_exp`; Poisson mean; drift seeding; CUDA vs CPU (gpu-marked). Surrogate-vs-reference agreement: tests/sim/test_surrogate_vs_reference.py.
 
 ## Throughput (2026-11-25)
 

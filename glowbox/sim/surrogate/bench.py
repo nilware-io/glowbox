@@ -63,7 +63,7 @@ def main() -> None:
     opts = ModelOptions(n_detuning=32)
     sim = SurrogateSimulator(dev, opts)
 
-    # 1. Rabi sweep (init 3 us, settle 1 us, MW 0..T, readout 3 us), 1000 shots each, full Simulator path.
+    # 1. Rabi sweep (init 3 us, settle 3 us, MW 0..T, readout 3 us), 1000 shots each, full Simulator path.
     n_rabi = 64 if q else 256
     rabi = [pulsed_rabi(10 * i, F_RES_HZ) for i in range(n_rabi)]
     shots = 1000

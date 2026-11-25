@@ -71,7 +71,8 @@ P(ms=0) = cos²(π f_R t). (⟨±1|S⊥|0⟩ = 1/√2, and the RWA keeps half of
 is neglected (it only phase-modulates at the MW frequency).
 
 **Rotating frame / RWA.** In the eigenbasis {|0̃⟩, |−̃⟩, |+̃⟩} of H0 (energies 0, f−, f+ after subtracting the
-|0̃⟩ energy), go to the frame rotating at f on both upper states, U = exp(i 2π f t (|−̃⟩⟨−̃| + |+̃⟩⟨+̃|)), and drop
+|0̃⟩ energy; |0̃⟩ is the eigenvector with the largest ms = 0 weight, |−̃⟩ and |+̃⟩ are the other two in ascending
+energy), go to the frame rotating at f on both upper states, U = exp(i 2π f t (|−̃⟩⟨−̃| + |+̃⟩⟨+̃|)), and drop
 terms oscillating at ≈ 2f. Result (Hz):
 
     H_rot/h = Δ− |−̃⟩⟨−̃| + Δ+ |+̃⟩⟨+̃| + Σ_± (√2/2) f_R,k [e^{−iφ} ⟨±̃|u_k·S|0̃⟩ |±̃⟩⟨0̃| + h.c.],   Δ± = f± − f
@@ -95,18 +96,41 @@ frame at one reference frequency f_ref (each segment then carries a detuning-dep
 2π (f₂ − f₁) t_s on the upper states). A test with two segments at different frequencies pins the sign. MW is not applied to the excited state (its zero-field splitting 1.42 GHz is far from the ~2.87 GHz drive;
 valid unless f approaches D_ES ± γe B).
 
+**Frame bookkeeping (both implementations).** In MW-on bins the frame frequency is that bin's MW frequency. In
+MW-off bins it is held at the last MW frequency; before the first MW bin it already sits at the first MW frequency,
+and with no MW at all it is D. A frequency change at bin start t_s multiplies ρ_{0̃,±̃} by exp(−i 2π (f₂ − f₁) t_s).
+The frame choice is exact (it changes no observable); only the sign of the phase matters and is pinned by tests.
+
+**Dissipators in the rotating frame (secular rule).** The jump operators of §5 and §6 are defined in the ms basis,
+the frame rotates the eigenstates |±̃⟩. When the eigenbasis differs from the ms basis (B⊥ ≠ 0 or E ≠ 0) a jump
+operator that connects |0̃⟩ with |±̃⟩ acquires parts oscillating at ±f ≈ 3 GHz in the rotating frame. Both
+implementations drop the oscillating cross terms: with L = Σ_ω L_ω split by frame frequency ω ∈ {−f, 0, +f}, the
+dissipator is Σ_ω D[L_ω] (equivalently: superoperator elements that couple coherences of different frame order are
+zeroed). This is the dissipative half of the RWA, exact for B ∥ **n** and E = 0, with an error of order
+(γe B⊥ / D)² otherwise (the reference checks it against a lab-frame `mesolve` without RWA at B⊥ ≈ 2.5 mT: 2e-3 in
+populations).
+
 ## 4. Inhomogeneous broadening (T2*)
 
 Each NV sees a static random shift δ of its local field along its axis (dominant ensemble mechanism: magnetic
-noise from P1 centres and ¹³C, Barry et al. 2020): f± → f± ± δ. δ is drawn from
+noise from P1 centres and ¹³C, Barry et al. 2020): a term **δ·Sz (Hz) added to H0**. When γe B∥ ≫ E, γe B⊥ this
+is f± → f± ± δ; at zero field it is well defined (degenerate ms = ±1), and at E ≠ 0 with γe B∥ ≲ E it gives the
+strain-protected (quadratic) response a magnetic shift really has. The surrogate diagonalises H0 + δ Sz per sample;
+the reference writes δ Sz in the eigenbasis of H0 and drops its |0̃⟩ ↔ |±̃⟩ part (it rotates at the frame
+frequency, RWA). The two differ by a level shift of order δ² (γe B⊥/D)²/D, far below any linewidth. δ is drawn
+from
 
 - **Lorentzian** (default, `broadening_shape="lorentzian"`): half width at half maximum Γ = 1/(2π T2*) (Hz), FWHM
   1/(π T2*). Free-induction (Ramsey) envelope exp(−t/T2*).
 - **Gaussian**: standard deviation σ = 1/(√2 π T2*) (Hz). Envelope exp(−(t/T2*)²).
 
-Implementation: the reference integrates over δ with a deterministic quadrature (for example M equal-probability
-quantile midpoints, M ≥ 32, more when the linewidth is narrow compared with f_R; report M). The surrogate may use
-closed forms. Strain-type shifts (moving f+ and f− together) are not modelled separately.
+Implementation: both integrate over δ with the same deterministic quadrature: M equal-probability quantile midpoints
+u_m = (m + ½)/M, δ_m = Γ tan(π(u_m − ½)) (Lorentzian) or σ Φ⁻¹(u_m) (Gaussian), equal weights 1/M; M = 1 means
+δ = 0. Report M. The Lorentzian's heavy tails set the quadrature error: for pulsed Rabi at f_R/Γ ≈ 50 the transfer
+curve on M nodes deviates from the continuous-distribution integral by up to 1.2 % of the contrast at M = 64 and
+0.2 % at M = 256 (reference measurement). M ≥ 32 is fine for comparisons at equal M (identical nodes); use
+M ≥ 128 when sub-percent agreement with the continuous Lorentzian matters. The node set revives after about
+2 M T2\*. Strain-type shifts (moving f+ and f− together) are not modelled separately.
 
 ## 5. Relaxation: T1, T2
 
@@ -188,6 +212,12 @@ Spin-state contrast is read from the first ~300 ns of a readout laser pulse, nor
 same pulse (after ~2 µs the spins are re-polarised and the rate is spin-independent). Analysis code defines its
 windows explicitly; the simulator only returns per-bin counts.
 
+**Dark time after the initialisation pulse.** The singlet empties with lifetime 1/(k71 + 2 k72) ≈ 0.41 µs and feeds
+ms = 0 preferentially. After 1 µs of dark about 9 % of the end-of-laser singlet population is still there (≈ 3 % of
+all NVs at β = 0.1); in sweeps whose free time varies it keeps relaxing into the ground state and adds a baseline
+drift (≈ 2–3 % of the Rabi contrast, ≈ 10 % of a Ramsey fringe). The protocol default is therefore a 3 µs settle
+(`SETTLE_DEFAULT_NS`, ≈ 7 lifetimes, residue < 0.1 %).
+
 ## 9. Validation suite (what both implementations must reproduce)
 
 With the defaults of `EnvParams`:
@@ -200,8 +230,8 @@ With the defaults of `EnvParams`:
 5. **Detuned control:** MW detuned far off resonance (|Δ| ≫ f_R and linewidth, e.g. 200 MHz) gives a trace
    identical to MW off within shot noise.
 
-Surrogate-vs-reference agreement is judged on noiseless `rate_cps` (relative error per bin; the tolerance is set
-by the tests that introduce the surrogate).
+Surrogate-vs-reference agreement is judged on noiseless `rate_cps` (relative error per bin) and on the protocol
+features above; tolerances and their justification are in `tests/sim/test_surrogate_vs_reference.py`.
 
 ## 10. Assumptions summary
 

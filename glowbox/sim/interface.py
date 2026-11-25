@@ -136,6 +136,7 @@ class FluorescenceTrace:
     * ``rate_cps``: expected detected count rate before shot noise (signal + background + dark, including that
       shot's laser drift), float64, same shape, or ``None`` (hardware). Simulators should fill it: it is the
       noiseless target for surrogates and tests.
+      It may be a read-only view (without drift every shot shares one row): copy before writing to it.
     * ``metadata``: at least ``"source"`` (e.g. ``"qutip-reference"``, ``"surrogate"``, ``"hardware"``); simulators
       add their version, seed and anything useful. Must be JSON/YAML-serialisable.
     """

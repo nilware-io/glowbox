@@ -191,8 +191,10 @@ class SequenceArrays:
     """Per-bin array form of one sequence or (with a leading batch axis) a batch.
 
     Shapes: per-bin arrays ``(..., n_bins)``, ``magnet_t`` ``(..., 3)``. ``mw_amplitude == 0`` means MW off (frequency
-    and phase are then 0 and meaningless). Frequencies are float64 because a float32 GHz carrier only resolves
-    ~250 Hz, too coarse to integrate phase over microseconds. Phases are wrapped to [-pi, pi].
+    and phase are then 0 and meaningless). ``mw_frequency_hz == 0`` means "the previous bin's frequency": a consumer
+    that drives an amplitude in such a bin (e.g. a gradient through the surrogate) uses the last set frequency.
+    Frequencies are float64 because a float32 GHz carrier only resolves ~250 Hz, too coarse to integrate phase over
+    microseconds. Phases are wrapped to [-pi, pi].
     Arrays are NumPy or torch tensors (see :meth:`to_torch`), never mixed.
     """
 
@@ -392,12 +394,13 @@ class SequenceBuilder:
 
 
 # --- Standard protocols -----------------------------------------------------------------------------------------
-# Default timings are typical for NV ensembles: ~1-3 us of laser re-polarises into ms=0; ~1 us dark time lets the
-# singlet (lifetime ~ 1/(k71 + 2 k72) ~ 0.4 us with the Tetienne rates) empty before the MW; spin contrast lives in
-# the first ~300 ns of the readout pulse (docs/physics.md, "Readout").
+# Default timings are typical for NV ensembles: ~1-3 us of laser re-polarises into ms=0; 3 us of dark time lets the
+# singlet (lifetime ~ 1/(k71 + 2 k72) ~ 0.41 us with the Tetienne rates) empty before the MW (1 us would leave ~9 %
+# of it, which drifts the baseline of sweeps with varying free time; docs/physics.md section 8); spin contrast lives
+# in the first ~300 ns of the readout pulse (docs/physics.md, "Readout").
 
 INIT_DEFAULT_NS = 3000
-SETTLE_DEFAULT_NS = 1000
+SETTLE_DEFAULT_NS = 3000
 READOUT_DEFAULT_NS = 3000
 
 

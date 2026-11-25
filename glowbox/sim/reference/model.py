@@ -110,11 +110,12 @@ class AxisModel:
     """Liouvillian building blocks for one axis. All superoperators are dense (49, 49) complex arrays, 1/ns.
 
     L(bin) = diss_fixed + beta * diss_pump
-             + (Delta_minus - delta) * ham_minus + (Delta_plus + delta) * ham_plus
+             + Delta_minus * ham_minus + Delta_plus * ham_plus + delta * ham_delta
              + f_R * (e^{-i phi} ham_k + e^{+i phi} ham_kdag)
 
-    with Delta_pm = E_pm - f_frame in Hz, delta the static broadening shift in Hz (spec section 4: f+ -> f+ + delta,
-    f- -> f- - delta), f_R = rabi_full_scale_hz * a * |m_perp| in Hz.
+    with Delta_pm = E_pm - f_frame in Hz, delta the static broadening shift in Hz (spec section 4: a term
+    delta * Sz in H0, which gives f+- -> f+- +- delta when gamma_e B_par >> E, gamma_e B_perp), f_R =
+    rabi_full_scale_hz * a * |m_perp| in Hz.
     """
 
     #: Eigenvectors of H0 (columns, ms basis (0, -1, +1)) ordered |0~>, |-~>, |+~>.
@@ -128,6 +129,9 @@ class AxisModel:
     diss_pump: np.ndarray
     ham_minus: np.ndarray
     ham_plus: np.ndarray
+    #: -i [Sz, .] per Hz of static detuning delta, Sz written in the H0 eigenbasis and rotating frame (RWA: its
+    #: 0~ <-> +-~ elements oscillate at the frame frequency and are dropped, spec section 4).
+    ham_delta: np.ndarray
     ham_k: np.ndarray
     ham_kdag: np.ndarray
     #: Row vector w with w . vec(rho) = photon emission rate, photons per ns (k_r * excited population).
@@ -236,6 +240,13 @@ def build_axis_model(
     p_minus[1, 1] = HZ_TO_RAD_PER_NS
     p_plus = np.zeros((N_LEVELS, N_LEVELS), dtype=np.complex128)
     p_plus[2, 2] = HZ_TO_RAD_PER_NS
+    # Static detuning delta * Sz (spec section 4) in the eigenbasis. Its part that connects |0~> with |+-~> (non-zero
+    # only when B_perp or E mix the ms states) rotates at the frame frequency and is dropped like the RWA drops the
+    # counter-rotating drive; the -~/+~ block is kept whole. With V = 1 this is diag(0, -1, +1): f+- -> f+- +- delta.
+    # The surrogate diagonalises H0 + delta Sz instead; the two differ only by the dropped 0~/+-~ part, a level shift
+    # of order delta^2 (gamma_e B_perp / D)^2 / D, far below any linewidth.
+    same_class = ROTATING[:, None] == ROTATING[None, :]
+    p_delta = np.where(same_class, _embed_ground(vh @ sz @ v), 0.0) * HZ_TO_RAD_PER_NS
 
     # MW drive in the RWA (spec section 3): (sqrt2/2) f_R e^{-i phi} <j~|u.S|0~> |j~><0~| + h.c., j = -~, +~,
     # with u the unit perpendicular direction. The f_R factor (incl. |m_perp|) is applied at run time.
@@ -260,6 +271,7 @@ def build_axis_model(
         diss_pump=_dissipator(pump),
         ham_minus=_commutator(p_minus),
         ham_plus=_commutator(p_plus),
+        ham_delta=_commutator(p_delta),
         ham_k=_commutator(k_op),
         ham_kdag=_commutator(k_op.conj().T),
         emission=emission,
@@ -281,3 +293,15 @@ def frame_phase_vec(cycles: float) -> np.ndarray:
     theta = 2.0 * math.pi * (cycles % 1.0)
     ph = np.exp(1j * theta * ROTATING)
     return np.outer(ph, ph.conj()).reshape(-1, order="F")
+
+
+def transition_frequencies_hz(d_hz: float, e_hz: float, b_field_t: np.ndarray) -> np.ndarray:
+    """ODMR line positions (f-, f+) of each of the four NV axes, Hz, shape (4, 2), from the numerical
+    diagonalisation of H0 (spec section 1; includes the second-order shift by B_perp, no T2* detuning).
+    ``b_field_t`` is the total crystal-frame field in tesla."""
+    out = np.empty((4, 2))
+    for k, axis in enumerate(c.NV_AXES):
+        geom = axis_geometry(axis, np.asarray(b_field_t, dtype=np.float64), np.array([1.0, 0.0, 0.0]), False)
+        energies, _ = diagonalise(d_hz, e_hz, geom.b_local_hz)
+        out[k] = energies[1], energies[2]
+    return out

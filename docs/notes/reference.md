@@ -14,7 +14,7 @@ rotating frame:
 
 - levels: ground triplet in the eigenbasis of H0 (|0̃⟩ = most ms=0 weight, |−̃⟩/|+̃⟩ = lower/upper of the other two),
   excited ms = 0, −1, +1 of the axis, singlet;
-- H_rot = (f− − f − δ)|−̃⟩⟨−̃| + (f+ − f + δ)|+̃⟩⟨+̃| + the RWA drive of spec section 3 (matrix elements
+- H_rot = (f− − f)|−̃⟩⟨−̃| + (f+ − f)|+̃⟩⟨+̃| + δ·Sz (RWA part, item 2 below) + the RWA drive of spec section 3 (matrix elements
   ⟨±̃|u·S|0̃⟩ from the numerical eigenvectors);
 - jump operators exactly as in the spec table (pump β k_r, radiative k_r, ISC, singlet returns), T1 (all six ground
   pairs at 1/(3 T1)) and T2 (√(2/T2) Sz), all defined in the ms basis of the axis and transformed to the eigenbasis;
@@ -56,10 +56,11 @@ bin_controls(sequence) -> BinControls                                  # float64
    averaged (Σ_ω D[L_ω] for ω ∈ {−f, 0, +f}), the same order of approximation as the RWA. With B along the axis
    and E = 0 every operator is a single component and nothing is dropped. Validated against a lab-frame
    `qutip.mesolve` without RWA or secular approximation, with B⊥ ≈ 2.4–2.8 mT: populations agree to 2e-3.
-2. **Detuning shift f± → f± ± δ** is applied to the eigenenergies as the spec states (δ on the upper, −δ on the
-   lower level). At B = 0 and E = 0 this is exactly a magnetic shift δ·Sz. At E ≠ 0 and γe B∥ ≲ E a true
-   magnetic shift would be suppressed by the strain mixing (E protection), which this model does not capture. That
-   only matters for non-zero E at near-zero field.
+2. **Detuning δ·Sz** (spec section 4, reconciled with the surrogate at integration): δ Sz is written in the H0
+   eigenbasis and its |0̃⟩ ↔ |±̃⟩ part (rotating at the frame frequency) is dropped, the −̃/+̃ block kept whole.
+   With B along the axis and E = 0 this is f± → f± ± δ exactly. (The first version shifted the eigenenergies
+   directly, which misses the strain protection at E ≠ 0 and low field.) The surrogate diagonalises H0 + δ Sz per
+   node; the per-bin rates of the two agree to 2e-9 at a generic 8-line field (float64).
 3. **Frame bookkeeping.** The integration frame starts at the sequence's first MW frequency (D if there is no MW),
    is kept through MW-off bins, and switches at the start of a MW bin with a different frequency by multiplying the
    upper-state coherences by exp(i 2π (f₂ − f₁) t_s) (spec section 3). Validated against an independent mesolve
@@ -129,18 +130,10 @@ The full reference test set takes about 60 s locally under load, and 98 s on the
 used a scratch copy outside its clone, via `uv run --project <clone>` with `PYTHONPATH` pointing at the copy; the
 clone stayed clean.
 
-## Requested spec / interface changes (not made here)
+## Requested spec / interface changes (resolved at integration)
 
-1. **docs/physics.md section 6 / 3:** add the secular split of the jump operators (item 1 above) as the
-   prescribed treatment when the eigenbasis differs from the ms basis, so the surrogate does the same.
-2. **docs/physics.md section 4:** state that f± ± δ is a shift of the eigenenergies, and that the model is not
-   valid for E-protected lines (E ≠ 0 at γe B∥ ≲ E). Or redefine δ as δ·Sz added to H0 before diagonalisation
-   (identical at E = 0) if strain is ever used at low field.
-3. **docs/physics.md section 4:** quantify "M ≥ 32" for Lorentzian tails: 1.2 % (M = 64) / 0.2 % (M = 256)
-   transfer error at f_R/Γ ≈ 50.
-4. **`glowbox/control/pulse.py` `SETTLE_DEFAULT_NS = 1000`:** its comment says 1 µs lets the singlet empty, but
-   with the spec's rates (lifetime 0.41 µs) about 9 % of the end-of-laser singlet population (about 3 % of all NVs
-   at β = 0.1) remains. In sweeps whose free time varies (Rabi via `pulsed_rabi`, Ramsey, echo) it keeps decaying
-   into the ground state. This adds a slow baseline drift of about 10 % of the Ramsey fringe amplitude and about
-   2 % of the Rabi contrast. The reference tests use a 3 µs settle (and, for Rabi, a fixed dark time). Suggest
-   3000 ns as the default, or a note in spec section 8.
+1. Secular split of the jump operators: now prescribed in docs/physics.md section 3 (the surrogate's element mask
+   is the same rule).
+2. Detuning: docs/physics.md section 4 now defines δ as δ·Sz in H0; the reference was changed accordingly (item 2).
+3. Quadrature numbers (1.2 % at M = 64, 0.2 % at M = 256 for f_R/Γ ≈ 50): in docs/physics.md section 4.
+4. `SETTLE_DEFAULT_NS` is now 3000 ns, with the reason in docs/physics.md section 8.
