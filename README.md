@@ -23,6 +23,32 @@ GPU-machine workflow: [docs/dev.md](docs/dev.md). Physics spec: [docs/physics.md
 
 ## Status
 
+**Milestone 2 done** (Task 1, estimate a hidden magnetic field from the glow; decoders, baselines and the quantum
+test). Report: [docs/results/m2-field-estimation.md](docs/results/m2-field-estimation.md).
+
+![Field error vs shots for the CNN decoder, the linear time-bin baseline and the physics fit, resonant and detuned](docs/results/figures/m2-field-estimation-error-vs-shots.png)
+
+*RMS error of the estimated field (|B| 0.5-3 mT, any direction, folded into the identifiable wedge) vs shots per
+sweep point, CW and pulsed ODMR, mean over 5 seeds with 95 % CIs. Detuned (dashed): every estimator falls to the
+prior.*
+
+- At 1000 shots per point the CNN decoder reaches 11.9 [11.4, 12.4] µT (CW) and 26.3 [23.5, 29.1] µT (pulsed); the
+  physics fit (Lorentzian dips at the H0 transitions of a trial field) 13.5 / 18.6 µT; the linear time-bin
+  baseline ~400 µT; prior only 830 µT. The CNN's uncertainty is calibrated (error/sigma RMS 1.0-1.15).
+- Quantum test: with the microwaves 400 MHz off resonance every learned estimator drops to the prior (skill
+  ~0); gap 819 [817, 820] µT (CW CNN), 804 [801, 807] µT (pulsed CNN). The pulsed decoder relies on its pulse
+  being a pi pulse (error 8-14x higher at 110 / 510 ns instead of 310 ns, flat when detuned): it uses Rabi
+  timing. The decoders agree on QuTiP-reference inputs to < 0.02 µT.
+- Code: `glowbox/learn/field_data.py` (priors, protocols, surrogate datasets), `glowbox/learn/decoder.py`
+  (1D CNN + Gaussian NLL, linear time-bin baseline), `glowbox/analysis/field_fit.py` (physics fit),
+  `glowbox/analysis/quantum_test.py` (the reusable quantum-test harness), surrogate fast paths for sweeps
+  (`glowbox/sim/surrogate/sweeps.py`).
+
+Run (the full config trains 20 decoders: ~100 min on an RTX 5070 Ti; `--quick` ~8 min on a CPU):
+
+    uv run python -m glowbox.experiments.m2_field_estimation --quick
+    uv run python -m glowbox.experiments.m2_field_estimation --report-dir docs/results
+
 **Milestone 1 done** (simulate CW ODMR and Rabi oscillations for an NV ensemble, plot both, test the fast surrogate
 against the QuTiP reference). Report with plots and numbers: [docs/results/m1-odmr-rabi.md](docs/results/m1-odmr-rabi.md).
 
@@ -37,12 +63,12 @@ What works:
   validation suite of [docs/physics.md](docs/physics.md) section 9 (ODMR, Rabi, Ramsey, Hahn echo, detuned control).
 - `glowbox/analysis/runlog.py`: per-run config, seed, git hash, Parquet traces and metrics, Markdown reports.
 
-Run the milestone (CPU works; the surrogate uses CUDA when present; the full config takes a few minutes, mostly the
-reference):
+Run milestone 1:
 
     uv run python -m glowbox.experiments.m1_odmr_rabi --quick                      # ~30 s smoke run
     uv run python -m glowbox.experiments.m1_odmr_rabi --report-dir docs/results    # full run, committed report
 
-Tests: `uv run pytest` (about 2-3 minutes; CUDA tests are skipped without a GPU).
+Tests: `uv run pytest` (about 2-3 minutes; CUDA tests are skipped without a GPU, slow ones need `-m slow`).
 
-Next: phase 2 learners (decoder, reservoir baseline, encoder through the differentiable surrogate).
+Next: the remaining phase-2 learners and tasks (reservoir baseline, encoder through the differentiable surrogate,
+RL agent; tasks 2-4), each with the quantum test.
