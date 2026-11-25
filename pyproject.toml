@@ -59,8 +59,11 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
-markers = ["gpu: needs a CUDA device (skipped when none is present)"]
+addopts = "-ra -m 'not slow'"
+markers = [
+    "gpu: needs a CUDA device (skipped when none is present)",
+    "slow: minutes on a CPU; deselected by default, run with -m slow",
+]
 
 [tool.mypy]
 python_version = "3.12"
