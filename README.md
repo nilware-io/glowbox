@@ -23,6 +23,53 @@ GPU-machine workflow: [docs/dev.md](docs/dev.md). Physics spec: [docs/physics.md
 
 ## Status
 
+**Milestone 3 done** (reservoir baseline; Task 2, store a bit pattern in the pulse response and recall it; Task 3,
+predict the next fluorescence reading; the quantum test for both). Reports:
+[docs/results/m3-bit-memory.md](docs/results/m3-bit-memory.md),
+[docs/results/m3-forecast.md](docs/results/m3-forecast.md).
+
+![Task 2: bit accuracy and recalled bits vs pattern length, resonant and detuned](docs/results/figures/m3-bit-memory-recall-vs-bits.png)
+
+*Task 2: L bits written into a block of MW segments by a fixed random pulse encoder, held through a 1 µs dark
+delay, recalled from one time-resolved readout at 10^4 shots; mean over 5 seeds with 95 % t CIs. The CNN (blue)
+lies on top of the Bayes-optimal oracle; detuned (dashed) every readout is at chance.*
+
+- Task 2, headline L = 4, 1 µs delay, 10^4 shots: bit accuracy 0.759 [0.733, 0.785] for the Bayes-optimal oracle,
+  0.757 [0.731, 0.783] for the CNN decoder and 0.609 [0.567, 0.651] for the reservoir's linear readout (ridge);
+  detuned 0.497-0.509. Gaps: CNN 0.260 [0.236, 0.285], ridge 0.107 [0.067, 0.147]. One readout returns at most
+  ~1.4 recalled bits at 10^4 shots (L = 2) and ~1.9 at 10^5 (L = 4): it sees nearly one number (the total
+  ms = 0 population), so longer patterns crowd it. Recall is flat in the delay from 0.1 to 10 µs with or without a
+  pi/2 read pulse: nothing readable is lost to dephasing on the T2* scale, consistent with storage in spin
+  populations (T1 = 5 ms).
+
+![Task 3 quantum test: skill of each predictor, resonant vs detuned](docs/results/figures/m3-forecast-quantum-test.png)
+
+*Task 3: skill (1 - MSE / Var) of one-step predictions of the next reading of an NV ensemble driven by a hidden,
+correlated MW amplitude (10^4 shots per reading), mean over 5 seeds with 95 % t CIs; light bars: detuned.*
+
+- Task 3, resonant: CNN decoder 0.212 [0.181, 0.243], linear AR 0.202 [0.171, 0.233] (CNN better by 0.009
+  [0.005, 0.014], paired), NV reservoir (fixed random encoding of the past readings, 8 time-multiplexed readouts,
+  ridge) 0.076 [0.038, 0.114], reservoir + direct input 0.171 [0.136, 0.205]. The hidden-state oracle
+  (Bayes-optimal given the true drive history and spin state) bounds what is predictable at 0.296 [0.230, 0.361]:
+  most of the next reading is the drive's unpredictable innovation. Detuned, every predictor is at ~0
+  (|skill| < 0.001); the gaps are significant for all of them. With only its own encoding detuned the reservoir
+  drops to 0.000 [-0.001, 0.000]: its skill comes from its spins.
+- Timing: nothing in M3 learns timing (fixed protocols, fixed random encoders). Frozen readouts rely on the exact
+  pulse areas of the encoding (Task 2 CNN: bit accuracy falls by 0.24 [0.20, 0.29] when every write pulse is 30 ns
+  shorter; Task 3 reservoir ridge: skill falls by 0.04-0.08 for ±20 ns), while readouts retrained on the shifted
+  encoding do as well as before: the information needs Rabi-scale pulses, not one exact timing. The CNNs' readout
+  weighting follows the spin-contrast transient (r = 0.81 Task 2, 0.91 Task 3).
+- Code: `glowbox/learn/reservoir.py` (fixed random pulse encoder, time multiplexing, ridge readout),
+  `glowbox/learn/bit_memory.py` (Task 2 protocol, codebooks, Bayes-optimal readout), `glowbox/learn/forecast.py`
+  (driven series, cycle-wise simulation, hidden-state oracle). Key results re-checked on the QuTiP reference
+  (templates and features within 3e-4 of the peak; readout decisions unchanged, predictions within 2.5 % of the
+  signal sd).
+
+Run (RTX 5070 Ti: Task 2 ~90 min, Task 3 ~27 min; `--quick` a few minutes):
+
+    uv run python -m glowbox.experiments.m3_bit_memory --quick
+    uv run python -m glowbox.experiments.m3_forecast --quick
+
 **Milestone 2 done** (Task 1, estimate a hidden magnetic field from the glow; decoders, baselines and the quantum
 test). Report: [docs/results/m2-field-estimation.md](docs/results/m2-field-estimation.md).
 
@@ -75,5 +122,5 @@ Run milestone 1:
 
 Tests: `uv run pytest` (about 2-3 minutes; CUDA tests are skipped without a GPU, slow ones need `-m slow`).
 
-Next: the remaining phase-2 learners and tasks (reservoir baseline, encoder through the differentiable surrogate,
-RL agent; tasks 2-4), each with the quantum test.
+Next: the remaining phase-2 learners and tasks (an encoder trained through the differentiable surrogate, the RL
+agent; Task 4, and Tasks 2-3 with learned encodings), each with the quantum test.
