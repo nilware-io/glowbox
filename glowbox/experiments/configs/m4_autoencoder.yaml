@@ -2,11 +2,12 @@
 # the NV ensemble's gated readouts are the bottleneck, a decoder reconstructs the patch; trained end to end through
 # the differentiable surrogate. Baseline: the same encoder parametrisation fixed at random (reservoir). Quantum
 # test: every MW frequency + 400 MHz, trained and evaluated the same way.
-# Run: uv run python -m glowbox.experiments.m4_autoencoder  (add --quick for a few-minute smoke run)
+# Run: uv run python -m glowbox.experiments.m4_autoencoder  (add --quick for a smoke run: ~6 min on a 32-core CPU)
 name: m4-autoencoder
 seed: 20261128
 seeds: [0, 1, 2, 3, 4]        # each seed: its own device (nuisance draw), data, initialisation and noise
 detuned_offset_hz: 4.0e+8
+far_detuned_factor: 2.0       # check: the detuned learned encoders again at 2x the offset (off-resonant residual)
 
 device:
   bias_field_t: [1.2e-3, 0.7e-3, 2.5e-3]   # known static field: eight distinct lines (as milestones 1 and 3)
@@ -17,7 +18,8 @@ device:
     collection_efficiency: [2.0e-3, 4.0e-3]
     background_cps: [5.0e+3, 2.0e+4]
     e_hz: [0.0, 3.0e+5]
-  n_detuning: 8               # T2* quadrature (quantile rule) for training and evaluation; checked at 32 below
+  n_detuning: 8               # T2* quadrature (quantile rule) for phase-1 training (cheap gradients)
+  eval_n_detuning: 32         # every bank, decoder, evaluation, probe and the QuTiP check (converged; checked at 64)
 system: {init_ns: 1500, settle_ns: 1000}
 
 layout:                       # glowbox.learn.encoder.Layout; n_blocks = the number of readouts K (grid below)
@@ -67,10 +69,10 @@ timing:                       # resonant, headline K, every seed, learned and ra
 reference:                    # QuTiP check: seed 0 resonant, headline K
   n_patterns: 16
   workers: 16
-quadrature_check: {n_detuning: 32}
+quadrature_check: {n_detuning: 64}
 
 quick:
-  device: {n_detuning: 4}
+  device: {n_detuning: 4, eval_n_detuning: 8}
   data: {n_train: 512, n_val: 128, n_test: 256}
   encoder: {hidden: [32]}
   decoder: {hidden: [32]}
@@ -80,4 +82,4 @@ quick:
   grid: {blocks: [1, 2]}
   timing: {duration_shifts_ns: [-20, 0, 20], retrain_shifts_ns: [20]}
   reference: {n_patterns: 2, workers: 2}
-  quadrature_check: {n_detuning: 8}
+  quadrature_check: {n_detuning: 16}

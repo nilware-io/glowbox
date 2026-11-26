@@ -68,7 +68,15 @@ from glowbox.learn.autoencoder import (
     train_ideal_bottleneck,
 )
 from glowbox.learn.bit_memory import device_lines_hz
-from glowbox.learn.encoder import BlockParams, Layout, PulseEncoder, preactivations_for, pulse_areas_pi, suffix_to_numpy
+from glowbox.learn.encoder import (
+    BlockParams,
+    Layout,
+    PulseEncoder,
+    area_matched_amplitude,
+    preactivations_for,
+    pulse_areas_pi,
+    suffix_to_numpy,
+)
 from glowbox.learn.field_data import FieldPrior
 from glowbox.learn.reservoir import full_sequence
 from glowbox.sim.interface import EnvParams
@@ -124,10 +132,17 @@ class AutoencoderTask:
     def __init__(self, cfg: dict[str, Any], run: RunLog, device: torch.device) -> None:
         self.cfg, self.run, self.device = cfg, run, device
         self.base_seed = int(cfg["seed"])
+        # Phase 1 (end-to-end training through the surrogate) runs at ``device.n_detuning`` T2* quadrature nodes
+        # (cheap gradients); phase 2 (the banks every decoder is trained and evaluated on), the timing probes and the
+        # QuTiP check run at the converged ``device.eval_n_detuning`` (checked against more nodes below).
         self.sys = SystemSpec(
             init_ns=int(cfg["system"]["init_ns"]),
             settle_ns=int(cfg["system"]["settle_ns"]),
             options=ModelOptions(n_detuning=int(cfg["device"]["n_detuning"])),
+        )
+        self.sys_eval = dataclasses.replace(
+            self.sys,
+            options=ModelOptions(n_detuning=int(cfg["device"].get("eval_n_detuning", cfg["device"]["n_detuning"]))),
         )
         self.blocks = [int(k) for k in cfg["grid"]["blocks"]]
         self.levels = [int(s) for s in cfg["grid"]["shots"]]
@@ -278,7 +293,8 @@ class AutoencoderTask:
             self.references(seed, sd, var)
         for k in blocks:
             ly = self.layout(k)
-            ch = DiamondChannel(env, ly, self.sys, self.device, offset_hz=cond.mw_offset_hz)
+            ch = DiamondChannel(env, ly, self.sys, self.device, offset_hz=cond.mw_offset_hz)  # phase 1 numerics
+            ch_eval = DiamondChannel(env, ly, self.sys_eval, self.device, offset_hz=cond.mw_offset_hz)
             res: dict[str, Trained] = {}
             for ei, name in enumerate(ENCODERS):
                 torch.manual_seed(int(np.random.default_rng([self.base_seed, seed, k, ei]).integers(2**31)))
@@ -316,7 +332,7 @@ class AutoencoderTask:
                     p.requires_grad_(False)
                 if cond.detuned:
                     self.check_detuned(ly, enc, env, cond.mw_offset_hz, sd)
-                tr = self.bank_decoder(ch, enc, sd, gen)
+                tr = self.bank_decoder(ch_eval, enc, sd, gen)
                 tr.history.update(hist)
                 self.histories[f"s{seed}_{cond.name}_K{k}_{name}"] = tr.history
                 res[name] = tr
@@ -329,6 +345,14 @@ class AutoencoderTask:
                         out[f"{name}_nmse"] = v
                         out[f"{name}_skill"] = 1.0 - v
                 self.record_areas(cond.name, seed, k, name, enc, env, sd)
+                if k == self.h_blocks and self.sys_eval.options.n_detuning != self.sys.options.n_detuning:
+                    # training-numerics note: the same frozen encoder, banked and decoded at the phase-1 node count
+                    g8 = _tgen(self.device, self.base_seed, seed, k, ei, 8)
+                    tr8 = self.bank_decoder(ch, enc, sd, g8)
+                    out[f"{name}_nmse_train_quad"] = self.evaluate(tr8, sd, var, seed, self.h_shots)
+                    del tr8
+                if k == self.h_blocks and cond.detuned and name == "learned":
+                    self.far_detuned(env, ly, enc, sd, var, seed, cond)
                 if seed == 0 and k == self.h_blocks:
                     self.seed0[(cond.name, name)] = tr
                     torch.save(
@@ -351,6 +375,31 @@ class AutoencoderTask:
             flush=True,
         )
         return out
+
+    def far_detuned(
+        self, env: EnvParams, ly: Layout, enc: PulseEncoder, sd: SeedData, var: float, seed: int, cond: Condition
+    ) -> None:
+        """The frozen detuned-arm encoder with every MW frequency shifted ``far_detuned_factor`` times as far (fresh
+        decoder): a residual skill that shrinks with the offset is off-resonant spin excitation, (Omega/Delta)^2."""
+        f = float(self.cfg.get("far_detuned_factor", 0.0))
+        if f <= 1.0:
+            return
+        off = f * cond.mw_offset_hz
+        self.check_detuned(ly, enc, env, off, sd)
+        ch = DiamondChannel(env, ly, self.sys_eval, self.device, offset_hz=off)
+        tr = self.bank_decoder(ch, enc, sd, _tgen(self.device, self.base_seed, seed, 600))
+        for level in self.levels:
+            v = self.evaluate(tr, sd, var, seed, level)
+            self.rows.append(
+                {
+                    "seed": seed,
+                    "condition": "detuned_far",
+                    "encoder": "learned",
+                    "blocks": ly.n_blocks,
+                    "shots": level,
+                    "nmse": v,
+                }
+            )
 
     def references(self, seed: int, sd: SeedData, var: float) -> None:
         ic = self.cfg["ideal"]
@@ -377,6 +426,19 @@ class AutoencoderTask:
         for s, v in zip(ts.shifts_ns, ts.metric, strict=True):
             self.timing_rows.append(
                 {"seed": seed, "encoder": name, "probe": "frozen", "shift_ns": int(s), "nmse": float(v)}
+            )
+        # equal-area control (frozen decoder): durations kept, every amplitude scaled so that each pulse's area
+        # changes as under the duration shift; separates "exact timing" from "exact pulse area" (Rabi rotation)
+        ly = tr.channel.layout
+        for s in tcfg["retrain_shifts_ns"]:
+            mus = []
+            with torch.no_grad():
+                for i in range(0, sd.tte.shape[0], tr.channel.chunk):
+                    p = area_matched_amplitude(tr.encoder(sd.tte[i : i + tr.channel.chunk]), ly, float(s))
+                    mus.append(tr.channel.counts(p).double())
+            v = self.nmse_of_counts(tr, torch.cat(mus), sd, var, seed, shots)
+            self.timing_rows.append(
+                {"seed": seed, "encoder": name, "probe": "equal_area", "shift_ns": int(s), "nmse": v}
             )
         for s in tcfg["retrain_shifts_ns"]:
             shifted = _Shifted(tr.encoder, float(s))
@@ -454,7 +516,7 @@ def run_reference_check(task: AutoencoderTask) -> dict[str, Any]:
     seqs = [full_sequence(pre, row) for row in sfx.unbatch()]
     items = [(s.to_dict(), env.to_dict()) for s in seqs]
     ctx = mp.get_context("spawn")
-    with ctx.Pool(int(rc["workers"]), initializer=_ref_init, initargs=(task.sys.options.n_detuning,)) as pool:
+    with ctx.Pool(int(rc["workers"]), initializer=_ref_init, initargs=(task.sys_eval.options.n_detuning,)) as pool:
         rates = pool.map(_ref_one, items)
     ref = np.stack([gated_from_rate(r, ly, pre.n_bins) for r in rates])
     sur = tr.mu_te[:n].cpu().numpy()
@@ -483,11 +545,11 @@ def run_reference_check(task: AutoencoderTask) -> dict[str, Any]:
 
 
 def run_quadrature_check(task: AutoencoderTask) -> dict[str, Any]:
-    """Seed 0 resonant headline: the frozen system's counts at more quadrature nodes, decoded by the decoder trained
-    at the working node count."""
+    """Seed 0 resonant headline: the frozen system's counts at more quadrature nodes than the evaluation numerics,
+    decoded by the decoder trained at the evaluation node count (convergence of the reported numbers)."""
     tr = task.seed0[("resonant", "learned")]
     m = int(task.cfg["quadrature_check"]["n_detuning"])
-    spec = dataclasses.replace(task.sys, options=ModelOptions(n_detuning=m))
+    spec = dataclasses.replace(task.sys_eval, options=ModelOptions(n_detuning=m))
     ch = DiamondChannel(task.env(0), tr.channel.layout, spec, task.device)
     sd = task.data(0)
     mu = ch.counts_for(tr.encoder, sd.tte)
@@ -736,7 +798,7 @@ def timing_verdicts(task: AutoencoderTask) -> dict[str, Any]:
     for name in ENCODERS:
         base = _sel(df, encoder=name, probe="frozen", shift_ns=0).sort_values("seed").nmse.to_numpy()
         rel: dict[str, tuple[float, float, float]] = {}
-        for probe, shifts in (("frozen", (-20, 20)), ("retrained", (-20, 20))):
+        for probe, shifts in (("frozen", (-20, 20)), ("retrained", (-20, 20)), ("equal_area", (-20, 20))):
             per = []
             for s in shifts:
                 d = _sel(df, encoder=name, probe=probe, shift_ns=s).sort_values("seed").nmse.to_numpy()
@@ -760,6 +822,10 @@ def timing_verdicts(task: AutoencoderTask) -> dict[str, Any]:
         o["relies_on_pulse_timing"] = bool("frozen" in rel and rel["frozen"][1] > 0.1)
         o["information_needs_exact_timing"] = bool("retrained" in rel and rel["retrained"][1] > 0.1)
         o["uses_phase_coherence"] = bool("phase_scramble" in rel and rel["phase_scramble"][1] > 0.1)
+        # the same loss with the area changed by amplitude instead (timing kept): the probe measures pulse area
+        o["area_explains_shift"] = bool(
+            "equal_area" in rel and "frozen" in rel and rel["equal_area"][0] >= 0.5 * rel["frozen"][0]
+        )
         o["rabi_scale_areas"] = bool(0.25 <= o["area_median_pi"][0] <= 4.0)
     lv = out["learned"]
     out["strategy_learns_timing"] = bool(lv["relies_on_pulse_timing"] and lv["rabi_scale_areas"])
@@ -780,6 +846,27 @@ def report_body(
     ly = task.layout(hk)
     s_l, s_r = qt.summary("learned_nmse"), qt.summary("random_nmse")
     sel = {"condition": "resonant", "blocks": hk, "shots": hs}
+    far_lines: list[str] = []
+    far = _sel(df, condition="detuned_far", blocks=hk)
+    if len(far):
+        f = float(cfg.get("far_detuned_factor", 0.0))
+        cells = []
+        for lv in sorted(far.shots.unique()):
+            a = _sel(df, condition="detuned", encoder="learned", blocks=hk, shots=lv).nmse.to_numpy()
+            b = _sel(far, shots=lv).nmse.to_numpy()
+            cells.append(f"{lv} shots {_ci(t_ci(a))} -> {_ci(t_ci(b))}")
+        far_lines.append(
+            f"- Detuned residual: the frozen detuned learned encoders with every MW frequency {f:g}x as far off "
+            f"({f * float(cfg['detuned_offset_hz']) / 1e6:.0f} MHz), fresh decoder: NMSE " + "; ".join(cells) + "."
+        )
+    quad_lines: list[str] = []
+    if "learned_nmse_train_quad" in qt.metrics():
+        q_l, q_r = qt.summary("learned_nmse_train_quad"), qt.summary("random_nmse_train_quad")
+        quad_lines.append(
+            f"- Training numerics note: the same frozen encoders banked and decoded at the phase-1 node count "
+            f"({task.sys.options.n_detuning}) give learned {_ci(q_l['resonant'])}, random {_ci(q_r['resonant'])} "
+            f"(resonant; detuned {_ci(q_l['detuned'])} / {_ci(q_r['detuned'])})."
+        )
     lines = [
         "**Task 4, compress-and-reconstruct**: a learned pulse encoder writes 4x4 image patches (soft edges, two "
         "latent parameters) into MW blocks; the NV ensemble's gated readouts are the bottleneck (K photon counts, "
@@ -801,6 +888,8 @@ def report_body(
         f"{_ci(s_r['detuned'])}. Gaps (detuned - resonant): learned {_ci(s_l['gap'])} "
         f"({'significant' if qt.gap_significant('learned_nmse') else 'not significant'}), random {_ci(s_r['gap'])} "
         f"({'significant' if qt.gap_significant('random_nmse') else 'not significant'}).",
+        *far_lines,
+        *quad_lines,
         f"- Timing: learned strategy uses microsecond-scale (Rabi-scale) timing: "
         f"**{_bool(tv['strategy_learns_timing'])}** (details below).",
         "",
@@ -816,7 +905,9 @@ def report_body(
         f"bias field {cfg['device']['bias_field_t']} T), duration 0-{ly.max_ns:.0f} ns on the 10 ns grid "
         "(straight-through rounding; the surrogate's run-length path gives exact duration gradients).",
         f"- Device per seed: nuisance draw (T2*, Rabi full scale, beta, collection, background, strain) from the "
-        f"milestone-3 prior; T2* quadrature {task.sys.options.n_detuning} quantile nodes.",
+        f"milestone-3 prior. T2* quadrature (quantile rule): {task.sys.options.n_detuning} nodes for phase-1 "
+        f"training, {task.sys_eval.options.n_detuning} nodes for every bank, decoder, evaluation, timing probe and "
+        "the QuTiP check (every number in this report unless marked otherwise).",
         f"- Phase 1: Adam, {cfg['train']['steps']} steps, batch {cfg['train']['batch']}, Gaussian shot noise "
         f"(Poisson variance), shots log-uniform {cfg['train']['shots']}. Phase 2: fresh decoder, "
         f"{cfg['bank_decoder']['steps']} steps on a bank with Poisson noise. Wall time: phase 1 "
@@ -859,12 +950,14 @@ def report_body(
         "Pulse areas are the resonant rotation angle 2 f_R a d (f_R the seed's full-scale Rabi frequency on a [100] "
         "MW field; units of pi). Probes (resonant, K = headline, every seed): every MW duration shifted with the "
         "decoder frozen (the harness's `timing_sensitivity`) and with a decoder retrained on the shifted encoding; "
-        "every segment's phase replaced by an independent random phase (frozen decoder). Relative NMSE increase, "
+        "every segment's amplitude scaled so that its area changes as under the shift, durations kept (equal-area "
+        "control, frozen decoder); every segment's phase replaced by an independent random phase (frozen decoder). "
+        "Relative NMSE increase, "
         "mean [95 % t CI] over seeds:",
         "",
         "| encoder | median area (pi) | fraction of segments at 0.25-4 pi | fraction off | median duration (ns) | "
-        "+-20 ns, frozen | +-20 ns, retrained | phases scrambled |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "+-20 ns, frozen | +-20 ns, retrained | equal area by amplitude, frozen | phases scrambled |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for name in ENCODERS:
         o = tv[name]
@@ -878,7 +971,10 @@ def report_body(
                     _ci(o["frac_rabi_scale"], "{:.2f}"),
                     _ci(o["frac_off"], "{:.2f}"),
                     _ci(o["duration_median_ns"], "{:.0f}"),
-                    *[_ci(rel[p], "{:+.2f}") if p in rel else "" for p in ("frozen", "retrained", "phase_scramble")],
+                    *[
+                        _ci(rel[p], "{:+.2f}") if p in rel else ""
+                        for p in ("frozen", "retrained", "equal_area", "phase_scramble")
+                    ],
                 ]
             )
             + " |"
@@ -890,14 +986,17 @@ def report_body(
         f"{_bool(lv['relies_on_pulse_timing'])}; the information needs the exact timing (retrained decoder still "
         f"worse > 10 %): {_bool(lv['information_needs_exact_timing'])}; it uses coherent phase relations between "
         f"segments (scrambling costs > 10 %): {_bool(lv['uses_phase_coherence'])}; its pulse areas are Rabi-scale "
-        f"(median 0.25-4 pi): {_bool(lv['rabi_scale_areas'])}. `strategy_learns_timing` = relies on pulse timing "
+        f"(median 0.25-4 pi): {_bool(lv['rabi_scale_areas'])}. The same area change made with the amplitude (durations "
+        f"kept) costs at least half as much as the duration shift: {_bool(lv['area_explains_shift'])} (if yes, the "
+        "probe measures reliance on the pulse areas, i.e. the Rabi rotation angles, rather than on timing as such). "
+        "`strategy_learns_timing` = relies on pulse timing "
         f"and Rabi-scale areas = **{_bool(tv['strategy_learns_timing'])}**.",
         "- The same probes on the random encoder show what an unlearned encoding of the same family does.",
         "",
         "## Checks",
         "",
         f"- QuTiP reference (seed 0, resonant, K = {hk}, {ref['n_patterns']} learned test sequences run as full "
-        f"PulseSequences, {task.sys.options.n_detuning} quadrature nodes): gated counts within "
+        f"PulseSequences, {task.sys_eval.options.n_detuning} quadrature nodes): gated counts within "
         f"{ref['max_rel_diff']:.2g} (relative) of the surrogate, {ref['max_diff_over_signal']:.2g} of the "
         "input-dependent signal; frozen decoder NMSE at "
         f"{hs} shots {ref['nmse_noisy_ref']:.4f} on reference counts vs {ref['nmse_noisy_sur']:.4f} on surrogate "
@@ -906,7 +1005,7 @@ def report_body(
         f"- Quadrature: the frozen seed-0 system at {quad['n_detuning']} nodes: counts within "
         f"{quad['max_rel_diff']:.2g} (relative), {quad['max_diff_over_signal']:.2g} of the signal; NMSE "
         f"{quad['nmse_working']:.4f} -> {quad['nmse_more_nodes']:.4f} with the decoder trained at "
-        f"{task.sys.options.n_detuning} nodes.",
+        f"{task.sys_eval.options.n_detuning} nodes.",
         "",
         "## Assumptions and limits",
         "",
@@ -932,7 +1031,7 @@ def main(
     with RunLog(str(cfg["name"]), config=cfg, seed=int(cfg["seed"]), **kw) as run:
         task = AutoencoderTask(cfg, run, device)
         conds = (RESONANT, detuned_condition(float(cfg["detuned_offset_hz"])))
-        hib = {f"{n}_{m}": m == "skill" for n in ENCODERS for m in ("nmse", "skill")}
+        hib = {f"{n}_{m}": m == "skill" for n in ENCODERS for m in ("nmse", "skill", "nmse_train_quad")}
         qt = run_quantum_test(task, [int(s) for s in cfg["seeds"]], conds, higher_is_better=hib)
         print("[m4-ae] reference check", flush=True)
         ref = run_reference_check(task)
