@@ -36,7 +36,7 @@ encoder:                      # glowbox.learn.reservoir.EncoderSpec (n_inputs = 
   freq_span_hz: 4.0e+6
   gain: 1.5
 
-grid:
+grid:                         # two sweeps: every L at the headline delay, every delay at the headline L
   bits: [1, 2, 4, 8, 12]
   delays_ns: [100, 1000, 3000, 10000]
   # "none": readout only (populations); "pi2": the fixed read pulse first (also reads stored coherence)

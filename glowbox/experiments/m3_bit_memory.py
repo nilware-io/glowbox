@@ -162,6 +162,12 @@ class MemoryTask:
 
     # --- data -----------------------------------------------------------------------------------------------------
 
+    def grid_pairs(self) -> list[tuple[int, int]]:
+        """(bits, delay) pairs evaluated: every L at the headline delay and every delay at the headline L (the two
+        sweeps of the report; the full product would spend most of its time on 4096-pattern codebooks)."""
+        pairs = [(b, self.h_delay) for b in self.bits] + [(self.h_bits, d) for d in self.delays]
+        return list(dict.fromkeys(pairs))
+
     def env(self, seed: int) -> EnvParams:
         if seed not in self.envs:
             self.envs[seed] = device_env(self.cfg, seed, self.base_seed)
@@ -266,56 +272,61 @@ class MemoryTask:
         head: dict[str, float] = {}
         self.call_models = {}
         for arm in self.arms:
-            for bits in self.bits:
-                for delay in self.delays:
-                    cb = self.book(cond, seed, bits, arm, delay)
-                    model = None
-                    if arm == "none" and (bits, delay) in self.cnn_pairs:
-                        model = self.train_cnn(cb, seed, f"{cond.name}/{seed}/{bits}/{delay}")
-                        self.call_models[(bits, delay)] = model
-                        if seed == 0 and cond.name == "resonant":
-                            self.models[(arm, bits, delay)] = model
-                    for shots in self.shots:
-                        key = (self.base_seed, seed, bits, delay, self.arms.index(arm), shots)
-                        idx_tr, c_tr = self.draws(cb, nr, shots, *key, 0)
-                        idx_te, c_te = self.draws(cb, nt, shots, *key, 1)
-                        truth = cb.patterns[idx_te.cpu().numpy()]
-                        ridge = RidgeReadout().fit(
-                            c_tr.cpu().numpy() / shots, 2.0 * cb.patterns[idx_tr.cpu().numpy()] - 1.0
+            for bits, delay in self.grid_pairs():
+                cb = self.book(cond, seed, bits, arm, delay)
+                model = None
+                if arm == "none" and (bits, delay) in self.cnn_pairs:
+                    model = self.train_cnn(cb, seed, f"{cond.name}/{seed}/{bits}/{delay}")
+                    self.call_models[(bits, delay)] = model
+                    if seed == 0 and cond.name == "resonant":
+                        self.models[(arm, bits, delay)] = model
+                for shots in self.shots:
+                    key = (self.base_seed, seed, bits, delay, self.arms.index(arm), shots)
+                    idx_tr, c_tr = self.draws(cb, nr, shots, *key, 0)
+                    idx_te, c_te = self.draws(cb, nt, shots, *key, 1)
+                    truth = cb.patterns[idx_te.cpu().numpy()]
+                    ridge = RidgeReadout().fit(
+                        c_tr.cpu().numpy() / shots, 2.0 * cb.patterns[idx_tr.cpu().numpy()] - 1.0
+                    )
+                    if seed == 0 and cond.name == "resonant" and (bits, delay) == (self.h_bits, self.h_delay):
+                        self.ridges[(arm, shots)] = ridge
+                    preds = {
+                        "oracle": self.oracle_bits(cb, c_te, shots),
+                        "ridge": (ridge.predict(c_te.cpu().numpy() / shots) > 0).astype(np.int64),
+                    }
+                    if model is not None:
+                        preds["cnn"] = self.cnn_bits(model, c_te, shots)
+                    sep = template_separation(cb.templates, shots) if cb.patterns.shape[0] <= 4096 else math.nan
+                    for rname, pb in preds.items():
+                        m = recall_metrics(pb, truth)
+                        self.rows.append(
+                            {
+                                "condition": cond.name,
+                                "seed": seed,
+                                "arm": arm,
+                                "bits": bits,
+                                "delay_ns": delay,
+                                "shots": shots,
+                                "readout": rname,
+                                "separation": sep,
+                                "ridge_lambda": ridge.lam,
+                                **m,
+                            }
                         )
-                        if seed == 0 and cond.name == "resonant" and (bits, delay) == (self.h_bits, self.h_delay):
-                            self.ridges[(arm, shots)] = ridge
-                        preds = {
-                            "oracle": self.oracle_bits(cb, c_te, shots),
-                            "ridge": (ridge.predict(c_te.cpu().numpy() / shots) > 0).astype(np.int64),
-                        }
-                        if model is not None:
-                            preds["cnn"] = self.cnn_bits(model, c_te, shots)
-                        sep = template_separation(cb.templates, shots) if cb.patterns.shape[0] <= 4096 else math.nan
-                        for rname, pb in preds.items():
-                            m = recall_metrics(pb, truth)
-                            self.rows.append(
-                                {
-                                    "condition": cond.name,
-                                    "seed": seed,
-                                    "arm": arm,
-                                    "bits": bits,
-                                    "delay_ns": delay,
-                                    "shots": shots,
-                                    "readout": rname,
-                                    "separation": sep,
-                                    "ridge_lambda": ridge.lam,
-                                    **m,
-                                }
-                            )
-                            hl = (bits, delay, shots) == (self.h_bits, self.h_delay, self.h_shots)
-                            if hl and arm == self.h_arm:
-                                head[f"{rname}_bit_acc"] = m["bit_acc"]
-                                head[f"{rname}_recalled_bits"] = m["recalled_bits"]
-                                head[f"{rname}_pattern_acc"] = m["pattern_acc"]
-                            elif hl and arm == "pi2":
-                                head[f"pi2_{rname}_bit_acc"] = m["bit_acc"]
+                        hl = (bits, delay, shots) == (self.h_bits, self.h_delay, self.h_shots)
+                        if hl and arm == self.h_arm:
+                            head[f"{rname}_bit_acc"] = m["bit_acc"]
+                            head[f"{rname}_recalled_bits"] = m["recalled_bits"]
+                            head[f"{rname}_pattern_acc"] = m["pattern_acc"]
+                        elif hl and arm == "pi2":
+                            head[f"pi2_{rname}_bit_acc"] = m["bit_acc"]
+        t0 = time.perf_counter()
         self.timing_probe(cond, seed)
+        print(
+            f"[m3-bits]   timing probe {time.perf_counter() - t0:.0f} s; so far codebooks "
+            f"{self.seconds['codebooks']:.0f} s, CNN {self.seconds['cnn']:.0f} s",
+            flush=True,
+        )
         if cond.name == "resonant":
             self.encoding_stats(seed)
             if seed == 0:
