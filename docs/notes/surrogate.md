@@ -71,6 +71,30 @@ Exact reformulations for frequency sweeps, used to generate Task 1 datasets (tes
   (1e-14 against the full run, tests/learn/test_forecast.py). It gives the state after every cycle, from which the
   Task 3 oracle branches over the next drive value.
 
+## Run-length path (`glowbox/sim/surrogate/runs.py`, milestone 4)
+
+For pulse-level sequences (a learned encoder's MW segments, readout lasers) the bin loop is the cost: a 4-block
+encoder suffix is ~560 bins but only ~40 stretches of constant controls (*runs*). Within a run the generator is
+constant, so its propagator is exactly `exp(L T)`; `run_emission(statics, group, runs, r0)` steps the state run by
+run.
+
+- Same physics: equal to the bin path to 1e-9 (float64) when every T is a multiple of the grid
+  (tests/learn/test_encoder.py), including the frame bookkeeping (a frame switch at a run start applies
+  exp(-i 2 pi (F_new - F_old) t_start) to rho_{0~,+-~}; MW-off runs keep the last frame).
+- Durations are continuous: T enters as `exp(L T)`, so d/dT is exact (checked against finite differences). The
+  encoder rounds durations to the grid in the forward pass and passes the gradient straight through.
+- A recorded run (a gated photon counter) resets the photon accumulator at its start and keeps the accumulator
+  column inside the run: the accumulator then holds the photons per NV emitted over the whole run.
+- All run propagators are built first, in a few batched exponentials (runs grouped by their Taylor squaring count,
+  chosen per run from a triangle-inequality bound on |L T|; each chunk checkpointed when differentiating), and only
+  the 14-vector steps are sequential. Without gradients it uses `torch.linalg.matrix_exp`.
+- Float32 accuracy against the float64 bin path: `matrix_exp` (every evaluation bank) within 4e-5; the Taylor
+  path used for gradients within 8e-5 on resonance and 6e-4 with the MW frame 400 MHz from every line (a ~1700 rad
+  frame rotation over a microsecond of readout needs ~12 squarings). Both are below the shot noise of a gated
+  count at 10^5 shots (~2e-3).
+- Throughput (GPU machine, float32, M = 8): a 2-block encoder (4 segments per block, 1 us readouts) at batch 128
+  trains at ~0.23 s per step (forward + backward); the cost is the batched 14x14 matmuls of the exponentials.
+
 ## Differentiability
 
 `expected_rate_cps(arrays, env, options=..., mw_fill=..., laser_factor=...)` takes torch tensors that require grad
