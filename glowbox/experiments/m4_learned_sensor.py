@@ -4,16 +4,18 @@
 
 The learned protocol (glowbox.learn.sensor) is ``n_points`` measurements; each is the fixed initialisation, a MW
 block of two segments whose amplitude, phase, frequency (within a few MHz of the point's grid frequency) and duration
-(10 ns grid) are free parameters, and a time-resolved readout in 100 ns windows. It starts as milestone 2's pulsed
-ODMR (a 310 ns pi pulse at amplitude 0.2 on each grid frequency) and is trained end to end with a CNN decoder
-through the differentiable surrogate (phase 1, fresh fields from the prior at every step). Then the protocol is
+(10 ns grid) are free parameters, and a time-resolved readout in 100 ns windows. It starts as a pulsed ODMR
+protocol (by default the tuned baseline: amplitude and pulse area chosen by a small validation sweep for this grid;
+optionally milestone 2's 310 ns pi pulse at amplitude 0.2) and is trained end to end with a CNN decoder through the
+differentiable surrogate (phase 1, fresh fields from the prior at every step). Then the protocol is
 frozen, banks are simulated with milestone 2's numerics and a fresh CNN is trained on them (phase 2), exactly as
 for the fixed CW and pulsed protocols on the same grid, so the comparison isolates the protocol.
 
 The quantum test runs everything per seed twice: as designed, and with every MW frequency shifted by
 ``detuned_offset_hz`` (the learned protocol is trained in that condition too). Timing: the learned pulse areas and
 durations, the harness's timing probe (every MW duration shifted, decoder frozen) and a phase-scramble probe, with
-the fixed pulsed protocol's pi pulse as the comparison. Check: the learned protocol on the QuTiP reference.
+the tuned pulsed protocol as the comparison, an equal-area (amplitude) control and CNNs retrained on the shifted
+protocols. Check: the learned protocol on the QuTiP reference.
 """
 
 from __future__ import annotations
@@ -54,7 +56,7 @@ from glowbox.experiments.m1_odmr_rabi import load_config
 from glowbox.experiments.m2_field_estimation import _style, field_metrics
 from glowbox.experiments.m3_bit_memory import _band, _ci
 from glowbox.learn.decoder import ConvDecoder, DecoderConfig, TrainConfig, predict, train_decoder
-from glowbox.learn.encoder import BlockParams, Layout, pulse_areas_pi, suffix_to_numpy
+from glowbox.learn.encoder import BlockParams, Layout, area_matched_amplitude, pulse_areas_pi, suffix_to_numpy
 from glowbox.learn.field_data import (
     BankSpec,
     FieldBank,
@@ -83,11 +85,12 @@ from glowbox.sim.surrogate.model import ModelOptions
 
 DEFAULT_CONFIG = Path(__file__).with_name("configs") / "m4_learned_sensor.yaml"
 REPORT_NAME = "m4-learned-sensor"
-PROTOCOLS = ("learned", "pulsed", "cw")
-COLORS = {"learned": "#2a78d6", "pulsed": "#eb6834", "cw": "#1baf7a", "prior": "#8a8985"}
+PROTOCOLS = ("learned", "tuned", "pulsed", "cw")
+COLORS = {"learned": "#2a78d6", "tuned": "#8e44ad", "pulsed": "#eb6834", "cw": "#1baf7a", "prior": "#8a8985"}
 LABELS = {
     "learned": "learned protocol",
-    "pulsed": "fixed pulsed ODMR",
+    "tuned": "tuned pulsed ODMR",
+    "pulsed": "M2 pulsed ODMR (untuned)",
     "cw": "fixed CW ODMR",
     "prior": "prior only",
 }
@@ -124,18 +127,33 @@ def bank_spec(cfg: dict[str, Any]) -> BankSpec:
     )
 
 
-def fixed_protocol(cfg: dict[str, Any], spec: SensorSpec, kind: str, offset_hz: float = 0.0) -> SweepProtocol:
+def nominal_pi_ns(amplitude: float, rabi_full_scale_hz: float, grid_ns: int = 10) -> int:
+    """A nominal pi pulse at ``amplitude`` (MW along [100], |m_perp| = sqrt(2/3)), rounded to the grid."""
+    t = 1.0 / (2.0 * rabi_full_scale_hz * math.sqrt(2.0 / 3.0) * amplitude) * 1e9
+    return max(grid_ns, round(t / grid_ns) * grid_ns)
+
+
+def fixed_protocol(
+    cfg: dict[str, Any],
+    spec: SensorSpec,
+    kind: str,
+    offset_hz: float = 0.0,
+    pulse: tuple[float, int] | None = None,
+) -> SweepProtocol:
+    """A fixed sweep on the learned protocol's grid: ``cw``, ``pulsed`` (milestone 2's pi pulse) or a pulsed sweep
+    with the given ``pulse`` = (amplitude, pi_ns) (the tuned baseline)."""
     fc = cfg["fixed"]
+    amp, pi_ns = (float(fc["pulsed_amplitude"]), int(fc["pi_ns"])) if pulse is None else pulse
     return SweepProtocol(
-        kind=kind,  # type: ignore[arg-type]
+        kind="cw" if kind == "cw" else "pulsed",
         f_start_hz=spec.f_start_hz,
         f_stop_hz=spec.f_stop_hz,
         step_hz=(spec.f_stop_hz - spec.f_start_hz) / spec.n_points,
         mw_offset_hz=offset_hz,
         cw_amplitude=float(fc["cw_amplitude"]),
         cw_shot_ns=int(fc["cw_shot_ns"]),
-        pulsed_amplitude=float(fc["pulsed_amplitude"]),
-        pi_ns=int(fc["pi_ns"]),
+        pulsed_amplitude=float(amp),
+        pi_ns=int(pi_ns),
         init_ns=spec.init_ns,
         settle_ns=spec.settle_ns,
         readout_ns=spec.layout.readout_ns,
@@ -182,7 +200,11 @@ class SensorTask:
         self.models: dict[tuple[int, str, str], nn.Module] = {}  # (seed, condition, protocol), resonant seeds kept
         self.learned: dict[tuple[int, str], LearnedProtocol] = {}
         self.no_line_margin_hz = math.inf
-        self.seconds: dict[str, float] = {"phase1": 0.0, "banks": 0.0, "cnn": 0.0, "timing": 0.0}
+        self.seconds: dict[str, float] = {"tune": 0.0, "phase1": 0.0, "banks": 0.0, "cnn": 0.0, "timing": 0.0}
+        self.tune_rows: list[dict[str, Any]] = []
+        self.eqtime_rows: list[dict[str, Any]] = []
+        self.rabi_nominal_hz = float(np.mean(self.bspec.prior.rabi_full_scale_hz))
+        self.tuned: tuple[float, int] | None = None
         self.data_dir = run.dir / "data"
         self.data_dir.mkdir(exist_ok=True)
 
@@ -216,6 +238,16 @@ class SensorTask:
         )
         return ConvDecoder(n_time, self.spec.n_points, 3, cfg).to(self.device)
 
+    def protocol_for(self, kind: str, offset_hz: float = 0.0) -> SweepProtocol:
+        if kind == "tuned":
+            assert self.tuned is not None, "tune_pulse() first"
+            return fixed_protocol(self.cfg, self.spec, kind, offset_hz, self.tuned)
+        return fixed_protocol(self.cfg, self.spec, kind, offset_hz)
+
+    def shot_ns(self, kind: str) -> int:
+        """Wall time of one shot of one point (CW counts photons for all of it; pulsed and learned for the readout)."""
+        return self.spec.shot_ns if kind == "learned" else self.protocol_for(kind).shot_ns
+
     # --- banks ------------------------------------------------------------------------------------------------
     def bank(self, kind: str, cond: Condition, sd: SeedData, lp: LearnedProtocol | None = None) -> FieldBank:
         t0 = time.perf_counter()
@@ -227,14 +259,14 @@ class SensorTask:
             )
         else:
             bank = simulate_bank(
-                fixed_protocol(self.cfg, self.spec, kind, cond.mw_offset_hz),
+                self.protocol_for(kind, cond.mw_offset_hz),
                 sd.fields_t,
                 sd.envs,
                 self.bspec,
                 self.device,
                 workers=workers,
             )
-            if kind == "pulsed":
+            if kind != "cw":
                 bank = window_bank(bank, self.window_bins)
         self.seconds["banks"] += time.perf_counter() - t0
         return bank
@@ -250,9 +282,15 @@ class SensorTask:
     # --- training ---------------------------------------------------------------------------------------------
     def train_cnn(self, bank: FieldBank, scaler: TargetScaler, seed: int, salt: int) -> tuple[nn.Module, Any]:
         train, val, _ = self.split(bank)
+        return self.train_cnn_on(train, val, scaler, seed, salt)
+
+    def train_cnn_on(
+        self, train: FieldBank, val: FieldBank, scaler: TargetScaler, seed: int, salt: int
+    ) -> tuple[nn.Module, Any]:
+        """Milestone 2's CNN recipe on a train bank, validated on ``val``."""
         tc = self.cfg["train"]
         torch.manual_seed(self._seed(seed, salt))
-        model = self.cnn(bank.means.shape[1])
+        model = self.cnn(train.means.shape[1])
         gen, vgen = self._gen(seed, salt + 1), self._gen(seed, salt + 2)
         means = torch.as_tensor(train.means, device=self.device)
         y = torch.as_tensor(scaler.encode(train.fields_t), dtype=torch.float32, device=self.device)
@@ -296,12 +334,71 @@ class SensorTask:
         assert sig is not None
         return field_metrics(b, sig, fields)
 
+    def tune_pulse(self) -> tuple[float, int]:
+        """The tuned fixed pulsed baseline: a small sweep of the pulse amplitude (each with its nominal pi pulse),
+        then of the pulse area at the best amplitude, scored by the CNN recipe's validation RMSE (seed ``tune.seed``,
+        its train and validation fields only; the test fields are never seen)."""
+        tc = self.cfg["tune"]
+        seed = int(tc["seed"])
+        sd = self.data(seed)
+        scaler = self.scalers.setdefault(seed, TargetScaler.fit(sd.fields_t[: self.n_train]))
+        a = self.n_train + self.n_val
+        fpe = self.bspec.fields_per_env
+        fields, envs = sd.fields_t[:a], sd.envs[: a // fpe]
+        shots = int(tc.get("shots", self.headline))
+        t0 = time.perf_counter()
+        scores: dict[tuple[float, int], float] = {}
+
+        def score(amp: float, pi_ns: int, stage: str) -> float:
+            if (amp, pi_ns) in scores:
+                return scores[(amp, pi_ns)]
+            prot = fixed_protocol(self.cfg, self.spec, "tuned", 0.0, (amp, pi_ns))
+            bank = window_bank(
+                simulate_bank(prot, fields, envs, self.bspec, self.device, workers=int(self.cfg["bank"]["workers"])),
+                self.window_bins,
+            )
+            tr, va = bank.subset(np.arange(self.n_train)), bank.subset(np.arange(self.n_train, a))
+            model, _ = self.train_cnn_on(tr, va, scaler, seed, 700)  # same CNN seed for every candidate
+            v = self.evaluate(model, va.means, va.fields_t, scaler, seed, shots)["rmse_ut"]
+            scores[(amp, pi_ns)] = v
+            area = 2 * self.rabi_nominal_hz * math.sqrt(2 / 3) * amp * pi_ns * 1e-9
+            self.tune_rows.append({"stage": stage, "amplitude": amp, "pi_ns": pi_ns, "area_pi": area, "val_rmse_ut": v})
+            print(f"[m4-sensor] tune {stage}: a={amp:.2f} {pi_ns} ns -> val {v:.1f} uT", flush=True)
+            return v
+
+        for amp in tc["amplitudes"]:
+            score(float(amp), nominal_pi_ns(float(amp), self.rabi_nominal_hz), "amplitude")
+        best = min(scores, key=lambda k: scores[k])
+        amp0 = best[0]
+        pi0 = nominal_pi_ns(amp0, self.rabi_nominal_hz)
+        for f in tc["area_factors"]:
+            score(amp0, max(10, round(pi0 * float(f) / 10) * 10), "area")
+        best = min(scores, key=lambda k: scores[k])
+        self.seconds["tune"] += time.perf_counter() - t0
+        self.tuned = (float(best[0]), int(best[1]))
+        return self.tuned
+
+    def init_pulse(self) -> tuple[float, float]:
+        """The learned protocol's starting pulse: milestone 2's (``sensor.init: m2``) or the tuned one (``tuned``),
+        with the amplitude capped below ``amp_hi`` (a saturated sigmoid has no gradient), area kept."""
+        sc = self.cfg["sensor"]
+        if str(sc.get("init", "m2")) != "tuned":
+            return float(sc["init_amplitude"]), float(sc["init_pi_ns"])
+        assert self.tuned is not None
+        amp, pi_ns = float(self.tuned[0]), float(self.tuned[1])
+        cap = float(sc.get("init_amp_cap", 0.95)) * self.spec.layout.amp_hi
+        if amp > cap:
+            pi_ns, amp = pi_ns * amp / cap, cap
+        return amp, pi_ns
+
     def train_learned(self, cond: Condition, seed: int, scaler: TargetScaler) -> LearnedProtocol:
         sc, pt = self.cfg["sensor"], self.cfg["protocol_train"]
         torch.manual_seed(self._seed(seed, 50))
-        lp = LearnedProtocol(
-            self.spec, init=pulsed_init(self.spec, float(sc["init_amplitude"]), float(sc["init_pi_ns"]))
-        ).to(self.device)
+        amp, pi_ns = self.init_pulse()
+        init = pulsed_init(
+            self.spec, amp, pi_ns, float(sc.get("init_rest_amplitude", 0.0)), float(sc.get("init_rest_ns", 0.0))
+        )
+        lp = LearnedProtocol(self.spec, init=init).to(self.device)
         dec = self.cnn(self.spec.n_time)
         t0 = time.perf_counter()
         hist = train_protocol(
@@ -368,7 +465,7 @@ class SensorTask:
                 freqs = lp().frequency_hz.detach().cpu().numpy().ravel() + cond.mw_offset_hz
                 torch.save(lp.state_dict(), self.data_dir / f"protocol_s{seed}_{cond.name}.pt")
             else:
-                freqs = fixed_protocol(self.cfg, self.spec, kind, cond.mw_offset_hz).mw_freqs_hz()
+                freqs = self.protocol_for(kind, cond.mw_offset_hz).mw_freqs_hz()
             if cond.detuned:
                 self.check_detuned(freqs, sd)
             bank = self.bank(kind, cond, sd, lp)
@@ -400,6 +497,24 @@ class SensorTask:
                     out[f"{kind}_skill"] = 1.0 - met["rmse_ut"] / prior["rmse_ut"]
                 if level == self.budget:
                     out[f"{kind}_rmse_ut_budget"] = met["rmse_ut"]
+            # equal wall time per point: the learned protocol's shot count at each level, converted to this
+            # protocol's shots by its shot duration
+            for level in (self.headline, self.budget):
+                sh = max(1, round(level * self.spec.shot_ns / self.shot_ns(kind)))
+                met = self.evaluate(model, test.means, test.fields_t, scaler, seed, sh)
+                self.eqtime_rows.append(
+                    {
+                        "seed": seed,
+                        "condition": cond.name,
+                        "protocol": kind,
+                        "ref_shots": level,
+                        "wall_us": level * self.spec.shot_ns * 1e-3,
+                        "shots": sh,
+                        "rmse_ut": met["rmse_ut"],
+                    }
+                )
+                if level == self.headline:
+                    out[f"{kind}_rmse_ut_eqtime"] = met["rmse_ut"]
             if not cond.detuned:
                 self.models[(seed, cond.name, kind)] = model
             if seed == 0:
@@ -420,8 +535,15 @@ class SensorTask:
         return out
 
     def timing_probe(self, seed: int, scaler: TargetScaler) -> None:
-        """Frozen decoders: every MW duration shifted (learned: every segment; pulsed: the pi pulse), and the learned
-        protocol's phases scrambled, on the first ``n_fields`` test fields."""
+        """Resonant, learned and tuned pulsed protocols, on the first ``n_fields`` test fields:
+
+        * ``shift``: every MW duration shifted (learned: every segment; tuned: the pulse), frozen CNN;
+        * ``equal_area``: durations kept, amplitudes scaled so every pulse's area changes as under the shift
+          (separates "timing" from "pulse area", i.e. the Rabi rotation angle), frozen CNN;
+        * ``retrained``: a fresh CNN trained on a reduced bank of the shifted protocol (``retrain_n_train`` /
+          ``retrain_n_val`` fields of the seed's own splits), with an unshifted reduced-bank CNN as its reference;
+        * ``phase_scramble`` (learned): every segment's phase replaced by a random one, frozen CNN.
+        """
         tc = self.cfg["timing"]
         n = int(tc["n_fields"])
         sd = self.data(seed)
@@ -431,43 +553,66 @@ class SensorTask:
         fields = sd.fields_t[a : a + n]
         envs = sd.envs[a // fpe : (a + n) // fpe]
         lp = self.learned[(seed, "resonant")]
+        assert self.tuned is not None
+        amp_t, pi_t = self.tuned
+        ly = self.spec.layout
 
-        def score(kind: str, shift: int, scramble: bool = False) -> float:
+        def make_bank(kind: str, f: np.ndarray, e: list[EnvParams], shift: int, mode: str = "shift") -> FieldBank:
             if kind == "learned":
-                if scramble:
+                if mode == "scramble":
                     g = torch.Generator(device=self.device)
                     g.manual_seed(self._seed(seed, 900))
                     p = lp()
                     ph = (torch.rand(p.phase_rad.shape, generator=g, device=self.device) * 2 - 1) * math.pi
-                    lp2 = _FixedParams(lp, BlockParams(p.amplitude, ph, p.frequency_hz, p.duration_ns))
-                    bank = simulate_learned_bank(lp2, fields, envs, self.bspec, self.device)  # type: ignore[arg-type]
-                else:
-                    bank = simulate_learned_bank(lp, fields, envs, self.bspec, self.device, duration_shift_ns=shift)
-            else:
-                prot = dataclasses.replace(
-                    fixed_protocol(self.cfg, self.spec, "pulsed"), pi_ns=int(self.cfg["fixed"]["pi_ns"]) + shift
-                )
-                bank = window_bank(
-                    simulate_bank(prot, fields, envs, self.bspec, self.device, workers=4), self.window_bins
-                )
+                    fp = _FixedParams(lp, BlockParams(p.amplitude, ph, p.frequency_hz, p.duration_ns))
+                    return simulate_learned_bank(fp, f, e, self.bspec, self.device)  # type: ignore[arg-type]
+                if mode == "equal_area":
+                    fp = _FixedParams(lp, area_matched_amplitude(lp(), ly, float(shift)))
+                    return simulate_learned_bank(fp, f, e, self.bspec, self.device)  # type: ignore[arg-type]
+                return simulate_learned_bank(lp, f, e, self.bspec, self.device, duration_shift_ns=shift)
+            pi_s = max(ly.grid_ns, pi_t + shift)
+            pulse = (amp_t * pi_s / pi_t, pi_t) if mode == "equal_area" else (amp_t, pi_s)
+            prot = fixed_protocol(self.cfg, self.spec, "tuned", 0.0, pulse)
+            return window_bank(simulate_bank(prot, f, e, self.bspec, self.device, workers=4), self.window_bins)
+
+        def frozen(kind: str, shift: int, mode: str = "shift") -> float:
+            bank = make_bank(kind, fields, envs, shift, mode)
             model = self.models[(seed, "resonant", kind)]
             return self.evaluate(model, bank.means, fields, scaler, seed, self.headline)["rmse_ut"]
 
-        for kind in ("learned", "pulsed"):
-            ts = timing_sensitivity(functools.partial(score, kind), [int(x) for x in tc["duration_shifts_ns"]])
-            for s, v in zip(ts.shifts_ns, ts.metric, strict=True):
-                self.timing_rows.append(
-                    {"seed": seed, "protocol": kind, "probe": "shift", "shift_ns": int(s), "rmse_ut": float(v)}
+        def row(kind: str, probe: str, shift: int, v: float) -> None:
+            self.timing_rows.append(
+                {"seed": seed, "protocol": kind, "probe": probe, "shift_ns": int(shift), "rmse_ut": float(v)}
+            )
+
+        for kind in ("learned", "tuned"):
+            ts = timing_sensitivity(functools.partial(frozen, kind), [int(x) for x in tc["duration_shifts_ns"]])
+            for sh, v in zip(ts.shifts_ns, ts.metric, strict=True):
+                row(kind, "shift", int(sh), float(v))
+            for sh in tc["area_shifts_ns"]:
+                row(kind, "equal_area", int(sh), frozen(kind, int(sh), "equal_area"))
+        row("learned", "phase_scramble", 0, frozen("learned", 0, "scramble"))
+
+        # retrained CNNs on reduced banks (train / val fields from the seed's own splits, the same test fields)
+        nr = (min(int(tc["retrain_n_train"]), self.n_train) // fpe) * fpe
+        nv = (min(int(tc["retrain_n_val"]), self.n_val) // fpe) * fpe
+        if nr <= 0:
+            return
+        idx = np.r_[0:nr, self.n_train : self.n_train + nv]
+        f_all = np.concatenate([sd.fields_t[idx], fields])
+        e_all = [*sd.envs[: nr // fpe], *sd.envs[self.n_train // fpe : (self.n_train + nv) // fpe], *envs]
+        for kind in ("learned", "tuned"):
+            for sh in sorted({0, *[int(x) for x in tc["retrain_shifts_ns"]]}):
+                bank = make_bank(kind, f_all, e_all, sh)
+                tr, va = bank.subset(np.arange(nr)), bank.subset(np.arange(nr, nr + nv))
+                te = bank.subset(np.arange(nr + nv, len(bank)))
+                model, _ = self.train_cnn_on(tr, va, scaler, seed, 800 + sh)
+                row(
+                    kind,
+                    "retrained",
+                    sh,
+                    self.evaluate(model, te.means, te.fields_t, scaler, seed, self.headline)["rmse_ut"],
                 )
-        self.timing_rows.append(
-            {
-                "seed": seed,
-                "protocol": "learned",
-                "probe": "phase_scramble",
-                "shift_ns": 0,
-                "rmse_ut": score("learned", 0, True),
-            }
-        )
 
 
 class _FixedParams(torch.nn.Module):
@@ -716,18 +861,26 @@ def plot_training(task: SensorTask) -> Figure:
 
 def plot_timing(task: SensorTask) -> Figure:
     df = pd.DataFrame(task.timing_rows)
-    fig, ax = plt.subplots(figsize=(7, 3.6))
-    for kind in ("learned", "pulsed"):
+    fig, ax = plt.subplots(figsize=(7.5, 3.8))
+    for kind in ("learned", "tuned"):
         d = _sel(df, protocol=kind, probe="shift")
         xs = sorted(d.shift_ns.unique())
-        _band(
-            ax,
-            xs,
-            [d[d.shift_ns == x].rmse_ut.to_numpy() for x in xs],
-            COLORS[kind],
-            "-",
-            f"{LABELS[kind]}, frozen CNN",
-        )
+        _band(ax, xs, [d[d.shift_ns == x].rmse_ut.to_numpy() for x in xs], COLORS[kind], "-", f"{LABELS[kind]}, frozen")
+        for probe, mk, lab in (("equal_area", "s", "equal area by amplitude, frozen"), ("retrained", "^", "retrained")):
+            r = _sel(df, protocol=kind, probe=probe)
+            if len(r):
+                xr = sorted(r.shift_ns.unique())
+                mus = [t_ci(r[r.shift_ns == x].rmse_ut.to_numpy()) for x in xr]
+                ax.errorbar(
+                    xr,
+                    [m[0] for m in mus],
+                    yerr=[[m[0] - m[1] for m in mus], [m[2] - m[0] for m in mus]] if math.isfinite(mus[0][1]) else None,
+                    fmt=mk,
+                    mfc="none",
+                    color=COLORS[kind],
+                    capsize=3,
+                    label=f"{kind}, {lab}",
+                )
     scr = _sel(df, protocol="learned", probe="phase_scramble").rmse_ut.to_numpy()
     if scr.size:
         v, lo, hi = t_ci(scr)
@@ -741,10 +894,10 @@ def plot_timing(task: SensorTask) -> Figure:
             label="learned, phases scrambled",
         )
     ax.set_yscale("log")
-    ax.set_xlabel("shift of every MW duration (ns)")
+    ax.set_xlabel("shift of every MW duration (ns; equal area: the same area change by amplitude)")
     ax.set_ylabel(f"RMS field error (uT, {task.headline} shots)")
     ax.set_title("timing probe (resonant), mean over seeds, 95 % t CI", fontsize=9)
-    ax.legend(fontsize=7, frameon=False)
+    ax.legend(fontsize=6.5, frameon=False)
     _style(ax)
     fig.tight_layout()
     return fig
@@ -757,18 +910,35 @@ def timing_verdicts(task: SensorTask) -> dict[str, Any]:
     df = pd.DataFrame(task.timing_rows)
     pdf = pd.DataFrame(task.protocol_rows)
     out: dict[str, Any] = {}
-    for kind in ("learned", "pulsed"):
-        base = _sel(df, protocol=kind, probe="shift", shift_ns=0).sort_values("seed").rmse_ut.to_numpy()
+
+    def rel_of(kind: str, probe: str, s: int, base_probe: str = "shift") -> tuple[float, float, float] | None:
+        base = _sel(df, protocol=kind, probe=base_probe, shift_ns=0).sort_values("seed").rmse_ut.to_numpy()
+        per = []
+        for sg in (-s, s):
+            d = _sel(df, protocol=kind, probe=probe, shift_ns=sg).sort_values("seed").rmse_ut.to_numpy()
+            if d.size == base.size and d.size:
+                per.append(d / base - 1.0)
+        return t_ci(np.mean(per, axis=0)) if per else None
+
+    for kind in ("learned", "tuned"):
         rel: dict[str, Any] = {}
         for s in (20, 50):
-            per = []
-            for sg in (-s, s):
-                d = _sel(df, protocol=kind, probe="shift", shift_ns=sg).sort_values("seed").rmse_ut.to_numpy()
-                if d.size == base.size and d.size:
-                    per.append(d / base - 1.0)
-            if per:
-                rel[f"pm{s}"] = t_ci(np.mean(per, axis=0))
+            for probe, key, bp in (
+                ("shift", f"pm{s}", "shift"),
+                ("equal_area", f"area_pm{s}", "shift"),
+                ("retrained", f"retrained_pm{s}", "retrained"),
+            ):
+                v = rel_of(kind, probe, s, bp)
+                if v is not None:
+                    rel[key] = v
         out[kind] = {"relative_rmse_increase": rel}
+        o = out[kind]
+        o["relies_on_pulse_timing"] = bool("pm50" in rel and rel["pm50"][1] > 0.1)
+        o["information_needs_exact_timing"] = bool("retrained_pm50" in rel and rel["retrained_pm50"][1] > 0.1)
+        # the same area change made with the amplitude costs at least half as much: the probe measures pulse area
+        o["area_explains_shift"] = bool(
+            "area_pm50" in rel and "pm50" in rel and rel["area_pm50"][0] >= 0.5 * rel["pm50"][0]
+        )
     scr = _sel(df, protocol="learned", probe="phase_scramble").sort_values("seed").rmse_ut.to_numpy()
     base = _sel(df, protocol="learned", probe="shift", shift_ns=0).sort_values("seed").rmse_ut.to_numpy()
     if scr.size and scr.size == base.size:
@@ -794,7 +964,6 @@ def timing_verdicts(task: SensorTask) -> dict[str, Any]:
     )
     lv = out["learned"]
     rel = lv["relative_rmse_increase"]
-    lv["relies_on_pulse_timing"] = bool("pm50" in rel and rel["pm50"][1] > 0.1)
     lv["uses_phase_coherence"] = bool("phase_scramble" in rel and rel["phase_scramble"][1] > 0.1)
     lv["rabi_scale_areas"] = bool(0.25 <= lv["point_total_area_median_pi"][0] <= 6.0)
     out["strategy_learns_timing"] = bool(lv["relies_on_pulse_timing"] and lv["rabi_scale_areas"])
@@ -808,53 +977,58 @@ def _bool(x: bool) -> str:
 def report_body(task: SensorTask, qt: QuantumTestResult, tv: dict[str, Any], ref: dict[str, Any]) -> str:
     cfg = task.cfg
     df = pd.DataFrame(task.rows)
+    edf = pd.DataFrame(task.eqtime_rows)
     sp = task.spec
     ly = sp.layout
     hs, bs = task.headline, task.budget
     s = {k: qt.summary(f"{k}_rmse_ut") for k in PROTOCOLS}
+    assert task.tuned is not None
+    amp_t, pi_t = task.tuned
 
     def pair(a: str, b: str, shots: int) -> str:
         va = _sel(df, protocol=a, condition="resonant", shots=shots).sort_values("seed").rmse_ut.to_numpy()
         vb = _sel(df, protocol=b, condition="resonant", shots=shots).sort_values("seed").rmse_ut.to_numpy()
         return _ci(t_ci(va - vb))
 
-    fixed_pulse_area = (
-        2
-        * np.mean(task.bspec.prior.rabi_full_scale_hz)
-        * math.sqrt(2 / 3)
-        * float(cfg["fixed"]["pulsed_amplitude"])
-        * int(cfg["fixed"]["pi_ns"])
-        * 1e-9
-    )
+    def area_pi(amp: float, ns: float) -> float:
+        return 2 * task.rabi_nominal_hz * math.sqrt(2 / 3) * amp * ns * 1e-9
+
     lv = tv["learned"]
     rel = lv["relative_rmse_increase"]
-    prel = tv["pulsed"]["relative_rmse_increase"]
+    trel = tv["tuned"]["relative_rmse_increase"]
     nan3 = (float("nan"),) * 3
+    init_amp, init_ns = task.init_pulse()
     lines = [
         "**Task 1 with a learned sensor protocol**: the encoder chooses the pulses of every measurement point, trained "
-        "end to end with a CNN decoder through the differentiable surrogate, and compared with milestone 2's fixed "
-        "CW and pulsed ODMR on the same frequency grid, shots and decoder recipe. Simulation only; no claim of "
-        "quantum advantage: a gap only says that the performance depends on driving the spin resonance.",
+        "end to end with a CNN decoder through the differentiable surrogate, and compared with fixed protocols on the "
+        "same frequency grid, shots and decoder recipe: a pulsed ODMR sweep whose pulse is tuned for this grid, "
+        "milestone 2's untuned pulsed ODMR and fixed CW ODMR. Simulation only; no claim of quantum advantage: a gap "
+        "only says that the performance depends on driving the spin resonance.",
         "",
         "## Result",
         "",
         f"RMS error of the folded field (|B| {task.bspec.prior.b_min_t * 1e3:.1f}-{task.bspec.prior.b_max_t * 1e3:.0f} "
         f"mT, any direction) with {sp.n_points} points, mean over {len(qt.seeds)} seeds [95 % Student-t CI]:",
         "",
-        "| protocol | resonant, "
-        + f"{hs} shots/point | detuned | gap (detuned - resonant) | resonant, {bs} shots/point "
-        "(= M2's total shots) |",
-        "| --- | --- | --- | --- | --- |",
+        f"| protocol | shot (ns) | resonant, {hs} shots/point | detuned | gap (detuned - resonant) | resonant, {bs} "
+        "shots/point (= M2's total shots) |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for k in PROTOCOLS:
         b = t_ci(_sel(df, protocol=k, condition="resonant", shots=bs).sort_values("seed").rmse_ut.to_numpy())
         lines.append(
-            f"| {LABELS[k]} | {_ci(s[k]['resonant'])} | {_ci(s[k]['detuned'])} | {_ci(s[k]['gap'])} | {_ci(b)} |"
+            f"| {LABELS[k]} | {task.shot_ns(k)} | {_ci(s[k]['resonant'])} | {_ci(s[k]['detuned'])} | "
+            f"{_ci(s[k]['gap'])} | {_ci(b)} |"
         )
     lines += [
         "",
-        f"- Learned vs fixed pulsed (its starting point), paired difference pulsed - learned at {hs} shots: "
-        f"{pair('pulsed', 'learned', hs)} uT; learned vs CW, CW - learned: {pair('cw', 'learned', hs)} uT.",
+        f"- Tuned pulse (validation sweep below): amplitude {amp_t:g}, {pi_t} ns (nominal area "
+        f"{area_pi(amp_t, pi_t):.2f} pi); milestone 2's: amplitude {cfg['fixed']['pulsed_amplitude']}, "
+        f"{cfg['fixed']['pi_ns']} ns.",
+        f"- Paired differences at {hs} shots/point (positive = the second is better): tuned - learned "
+        f"{pair('tuned', 'learned', hs)} uT; CW - learned {pair('cw', 'learned', hs)} uT; CW - tuned "
+        f"{pair('cw', 'tuned', hs)} uT; untuned - tuned {pair('pulsed', 'tuned', hs)} uT. At {bs} shots: tuned - "
+        f"learned {pair('tuned', 'learned', bs)} uT; CW - learned {pair('cw', 'learned', bs)} uT.",
         f"- Context: milestone 2's CNN on its 200-point sweeps (1 MHz steps, 6000 training steps) reached "
         f"{M2_CONTEXT_UT['cw']} uT (CW) and {M2_CONTEXT_UT['pulsed']} uT (pulsed) at 1000 shots per point; at equal "
         f"total shots ({bs} per point here) compare with the last column.",
@@ -868,17 +1042,54 @@ def report_body(task: SensorTask, qt: QuantumTestResult, tv: dict[str, Any], ref
         f"- Timing: the learned strategy uses microsecond-scale (Rabi-scale) timing: "
         f"**{_bool(tv['strategy_learns_timing'])}** (details below).",
         "",
+        "## Equal wall time per point",
+        "",
+        "The protocols' shots differ in length (column `shot (ns)` above; CW counts photons for its whole shot, the "
+        "pulsed and learned protocols for their 600 ns readout). RMSE at equal wall time per point, the learned "
+        "protocol's shots converted by shot length, resonant:",
+        "",
+        "| wall time per point (us) | " + " | ".join(LABELS[k] for k in PROTOCOLS) + " |",
+        "|" + " --- |" * (len(PROTOCOLS) + 1),
+    ]
+    if len(edf):
+        for lvl in sorted(edf.ref_shots.unique()):
+            d0 = _sel(edf, condition="resonant", ref_shots=lvl)
+            cells = [f"{float(d0.wall_us.iloc[0]):.0f}"]
+            for k in PROTOCOLS:
+                d = _sel(d0, protocol=k)
+                cells.append(f"{_ci(t_ci(d.rmse_ut.to_numpy()))} ({int(d.shots.iloc[0])} shots)" if len(d) else "")
+            lines.append("| " + " | ".join(cells) + " |")
+    tdf = pd.DataFrame(task.tune_rows)
+    lines += [
+        "",
+        "## Tuning the fixed pulsed baseline",
+        "",
+        f"Seed {cfg['tune']['seed']}, its train / validation fields (test fields unseen), the CNN recipe below, "
+        f"validation RMSE at {int(cfg['tune'].get('shots', hs))} shots/point. Stage 1: amplitudes with their nominal "
+        "pi pulse; stage 2: pulse areas at the best amplitude.",
+        "",
+        "| stage | amplitude | pulse (ns) | nominal area (pi) | validation RMSE (uT) |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for _, tr_ in tdf.iterrows():
+        lines.append(
+            f"| {tr_.stage} | {tr_.amplitude:g} | {int(tr_.pi_ns)} | {tr_.area_pi:.2f} | {tr_.val_rmse_ut:.1f} |"
+        )
+    lines += [
+        "",
         "## Protocols and training",
         "",
         f"- Grid: {sp.n_points} points, {(sp.f_stop_hz - sp.f_start_hz) / sp.n_points / 1e6:.0f} MHz apart over "
         f"{sp.f_start_hz / 1e9:.2f}-{sp.f_stop_hz / 1e9:.2f} GHz. Every point: init laser {sp.init_ns} ns, dark "
         f"{sp.settle_ns} ns, MW, readout {ly.readout_ns} ns; features: readout counts in {ly.window_ns} ns windows "
-        f"({sp.n_time} per point; the fixed pulsed protocol's 10 ns bins summed into the same windows); CW: one "
+        f"({sp.n_time} per point; the fixed pulsed protocols' 10 ns bins summed into the same windows); CW: one "
         f"steady-state count per {cfg['fixed']['cw_shot_ns']} ns shot.",
         f"- Learned protocol: per point {ly.n_segments} segments in {ly.slot_ns} ns slots (amplitude 0-1, phase, "
         f"frequency within +-{ly.span_hz / 1e6:.1f} MHz of the point's grid frequency, duration 0-{ly.max_ns:.0f} ns "
-        f"on the grid); initialised at the fixed pulsed protocol (amplitude {cfg['sensor']['init_amplitude']}, "
-        f"{cfg['sensor']['init_pi_ns']} ns). Phase 1: {cfg['protocol_train']['steps']} Adam steps, "
+        f"on the grid); initialised at the {'tuned' if cfg['sensor'].get('init') == 'tuned' else 'M2'} pulse "
+        f"(amplitude {init_amp:.3g}, {init_ns:.0f} ns; unused segments at amplitude "
+        f"{cfg['sensor'].get('init_rest_amplitude', 0)}, {cfg['sensor'].get('init_rest_ns', 0)} ns). Phase 1: "
+        f"{cfg['protocol_train']['steps']} Adam steps (lr {cfg['protocol_train']['lr_protocol']}, cosine), "
         f"{cfg['protocol_train']['fields_per_step']} fresh fields of one nuisance draw per step, Gaussian shot noise "
         f"(shots log-uniform {cfg['protocol_train']['shots']}), {task.train_opt.n_detuning} uniform quadrature "
         "nodes. Phase 2 and the fixed protocols: banks with milestone 2's numerics "
@@ -886,8 +1097,9 @@ def report_body(task: SensorTask, qt: QuantumTestResult, tv: dict[str, Any], ref
         f"{cfg['bank']['n_train']} / {cfg['bank']['n_val']} / {cfg['bank']['n_test']} fields per seed, CNN "
         f"{cfg['train']['steps']} steps with Poisson noise at shots {cfg['train']['shots_min']}-"
         f"{cfg['train']['shots_max']}.",
-        f"- Wall time: phase 1 {task.seconds['phase1'] / 60:.0f} min, banks {task.seconds['banks'] / 60:.0f} min, "
-        f"CNNs {task.seconds['cnn'] / 60:.0f} min, timing probes {task.seconds['timing'] / 60:.1f} min.",
+        f"- Wall time: tuning {task.seconds['tune'] / 60:.0f} min, phase 1 {task.seconds['phase1'] / 60:.0f} min, "
+        f"banks {task.seconds['banks'] / 60:.0f} min, CNNs {task.seconds['cnn'] / 60:.0f} min, timing probes "
+        f"{task.seconds['timing'] / 60:.1f} min.",
         "",
         "## Error vs shots",
         "",
@@ -901,26 +1113,45 @@ def report_body(task: SensorTask, qt: QuantumTestResult, tv: dict[str, Any], ref
         cells.append(f"{_sel(df, protocol='learned', condition='resonant', shots=sh).prior_rmse_ut.mean():.0f}")
         lines.append("| " + " | ".join(cells) + " |")
     lines += ["", "## Quantum test", "", qt.to_markdown(), ""]
+
+    def r(d: dict[str, Any], key: str) -> str:
+        return _ci(d.get(key, nan3), "{:+.2f}")
+
     lines += [
         "## What the protocol learned, and timing",
         "",
-        f"- Pulse areas at the nominal Rabi full scale (10 MHz, MW along [100]): per point (both segments) median "
-        f"{_ci(lv['point_total_area_median_pi'])} pi (the fixed protocol: {fixed_pulse_area:.2f} pi); median "
-        f"amplitude {_ci(lv['amplitude_median'], '{:.2f}')} (fixed: {cfg['fixed']['pulsed_amplitude']}); median "
-        f"total MW time per point {_ci(lv['duration_total_median_ns'], '{:.0f}')} ns (fixed: {cfg['fixed']['pi_ns']}).",
+        f"- Pulse areas at the nominal Rabi full scale ({task.rabi_nominal_hz / 1e6:.0f} MHz, MW along [100]): per "
+        f"point (both segments) median {_ci(lv['point_total_area_median_pi'])} pi (its start: "
+        f"{area_pi(init_amp, init_ns):.2f} pi; tuned: {area_pi(amp_t, pi_t):.2f} pi); median amplitude "
+        f"{_ci(lv['amplitude_median'], '{:.2f}')} (start {init_amp:.2f}); median total MW time per point "
+        f"{_ci(lv['duration_total_median_ns'], '{:.0f}')} ns (start {init_ns:.0f}).",
         f"- Fraction of points whose two segments are both on and > 0.5 MHz apart: "
         f"{_ci(lv['frac_points_two_frequencies'], '{:.2f}')}; median split "
         f"{_ci(lv['segment_split_mhz_median'], '{:.1f}')} MHz.",
-        "- Timing probe (frozen CNN, every MW duration shifted; resonant, first test fields, every seed), relative "
-        "RMSE increase [95 % t CI]: learned +-20 ns "
-        f"{_ci(rel.get('pm20', nan3), '{:+.2f}')}, +-50 ns {_ci(rel.get('pm50', nan3), '{:+.2f}')}; "
-        "fixed pulsed +-20 ns "
-        f"{_ci(prel.get('pm20', nan3), '{:+.2f}')}, +-50 ns {_ci(prel.get('pm50', nan3), '{:+.2f}')}. Learned phases "
-        f"scrambled: {_ci(rel.get('phase_scramble', nan3), '{:+.2f}')}.",
-        f"- Relies on its pulse timing (> 10 % worse at +-50 ns, CI): {_bool(lv['relies_on_pulse_timing'])}; uses "
-        f"coherent phases between its segments (> 10 % worse scrambled): {_bool(lv['uses_phase_coherence'])}; "
-        f"Rabi-scale areas: {_bool(lv['rabi_scale_areas'])}. `strategy_learns_timing` = "
-        f"**{_bool(tv['strategy_learns_timing'])}**.",
+        "",
+        "Timing probes (resonant, every seed, the first test fields), relative RMSE increase at "
+        f"{hs} shots [95 % t CI]: every MW duration shifted (frozen CNN); the same area change made with the "
+        "amplitude, durations kept (equal-area control, frozen CNN); a CNN retrained on a reduced bank of the shifted "
+        f"protocol ({cfg['timing']['retrain_n_train']} train fields, relative to the same recipe unshifted):",
+        "",
+        "| protocol | +-20 ns, frozen | +-50 ns, frozen | equal area +-20, frozen | equal area +-50, frozen | "
+        "+-50 ns, retrained | phases scrambled |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+        f"| learned | {r(rel, 'pm20')} | {r(rel, 'pm50')} | {r(rel, 'area_pm20')} | {r(rel, 'area_pm50')} | "
+        f"{r(rel, 'retrained_pm50')} | {r(rel, 'phase_scramble')} |",
+        f"| tuned pulsed | {r(trel, 'pm20')} | {r(trel, 'pm50')} | {r(trel, 'area_pm20')} | {r(trel, 'area_pm50')} | "
+        f"{r(trel, 'retrained_pm50')} | |",
+        "",
+        f"- Learned: relies on its pulse timing (> 10 % worse at +-50 ns, frozen, CI): "
+        f"{_bool(lv['relies_on_pulse_timing'])}; the information needs it (retrained CNN still > 10 % worse): "
+        f"{_bool(lv['information_needs_exact_timing'])}; the equal-area control costs at least half as much (the "
+        f"probe measures pulse area, the Rabi rotation angle, rather than timing as such): "
+        f"{_bool(lv['area_explains_shift'])}; coherent phases between its segments (> 10 % worse scrambled): "
+        f"{_bool(lv['uses_phase_coherence'])}; Rabi-scale areas: {_bool(lv['rabi_scale_areas'])}. "
+        f"`strategy_learns_timing` = **{_bool(tv['strategy_learns_timing'])}**.",
+        f"- Tuned pulsed: relies on its pulse timing (frozen): {_bool(tv['tuned']['relies_on_pulse_timing'])}; "
+        f"retrained: {_bool(tv['tuned']['information_needs_exact_timing'])}; area explains it: "
+        f"{_bool(tv['tuned']['area_explains_shift'])}.",
         "",
         "## Reference check",
         "",
@@ -933,9 +1164,11 @@ def report_body(task: SensorTask, qt: QuantumTestResult, tv: dict[str, Any], ref
         "## Assumptions and limits",
         "",
         f"- Fewer points ({sp.n_points}) than milestone 2's sweeps (200), and fewer CNN steps, to fit end-to-end "
-        "training into "
-        "the GPU budget: the absolute errors are not milestone 2's; the comparison between protocols is at equal "
-        "points, shots, time per shot (within 3 %) and decoder recipe.",
+        "training into the GPU budget: the absolute errors are not milestone 2's; the protocols are compared at equal "
+        "points, decoder recipe and shots per point (shot lengths in the table above; equal wall time in its own "
+        "table).",
+        "- The tuned baseline is tuned on one seed's validation fields with the same CNN recipe; the learned protocol "
+        "starts from it. Both tunings are coarse (a handful of candidates, one phase-1 schedule).",
         "- The learned protocol is trained with fewer quadrature nodes than its banks use; phase 2 retrains the CNN "
         "on the bank numerics, so the reported errors are consistent with the banks.",
         "- Segment frequencies are tied to the grid (+-span): a frequency far from every line has no gradient.",
@@ -952,8 +1185,14 @@ def main(
     t_start = time.perf_counter()
     with RunLog(str(cfg["name"]), config=cfg, seed=int(cfg["seed"]), **kw) as run:
         task = SensorTask(cfg, run, device)
+        print("[m4-sensor] tuning the fixed pulsed baseline", flush=True)
+        task.tune_pulse()
         conds = (RESONANT, detuned_condition(float(cfg["detuned_offset_hz"])))
-        hib = {f"{k}_{m}": m == "skill" for k in PROTOCOLS for m in ("rmse_ut", "skill", "rmse_ut_budget")}
+        hib = {
+            f"{k}_{m}": m == "skill"
+            for k in PROTOCOLS
+            for m in ("rmse_ut", "skill", "rmse_ut_budget", "rmse_ut_eqtime")
+        }
         qt = run_quantum_test(task, [int(s) for s in cfg["seeds"]], conds, higher_is_better=hib)
         print("[m4-sensor] reference check", flush=True)
         ref = run_reference_check(task)
@@ -962,6 +1201,8 @@ def main(
         pd.DataFrame(task.rows).to_parquet(run.dir / "results.parquet")
         pd.DataFrame(task.timing_rows).to_parquet(run.dir / "timing.parquet")
         pd.DataFrame(task.protocol_rows).to_parquet(run.dir / "protocols.parquet")
+        pd.DataFrame(task.tune_rows).to_parquet(run.dir / "tuning.parquet")
+        pd.DataFrame(task.eqtime_rows).to_parquet(run.dir / "equal_time.parquet")
         (run.dir / "train_history.json").write_text(json.dumps(task.histories), encoding="utf-8")
         (run.dir / "reference_check.json").write_text(json.dumps(ref), encoding="utf-8")
         (run.dir / "timing_verdicts.json").write_text(json.dumps(tv, default=str), encoding="utf-8")
@@ -975,7 +1216,7 @@ def main(
             "training": plot_training(task),
             "timing": plot_timing(task),
         }
-        paths = [run.save_figure(f, name, dpi=90) for name, f in figs.items()]
+        paths = [run.save_figure(f, name, dpi=72 if name == "protocol" else 90) for name, f in figs.items()]
         for f in figs.values():
             plt.close(f)
         summary: dict[str, Any] = {
@@ -986,6 +1227,8 @@ def main(
             summary[f"{k}_rmse_ut_resonant"] = sm["resonant"][0]
             summary[f"{k}_rmse_ut_detuned"] = sm["detuned"][0]
             summary[f"{k}_gap"], summary[f"{k}_gap_lo"], summary[f"{k}_gap_hi"] = sm["gap"]
+        assert task.tuned is not None
+        summary["tuned_amplitude"], summary["tuned_pi_ns"] = task.tuned
         summary["ref_max_rel_feature_diff"] = ref["max_rel_feature_diff"]
         summary["strategy_learns_timing"] = float(tv["strategy_learns_timing"])
         summary["learned_relies_on_pulse_timing"] = float(tv["learned"]["relies_on_pulse_timing"])

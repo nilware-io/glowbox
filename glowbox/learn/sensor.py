@@ -95,10 +95,13 @@ class SensorSpec:
         return self.init_ns + self.settle_ns + self.layout.n_bins * self.layout.grid_ns
 
 
-def pulsed_init(spec: SensorSpec, amplitude: float, pi_ns: float) -> np.ndarray:
-    """Pre-activations (n_points, n_segments, 4) of milestone 2's pulsed ODMR: one pulse of ``pi_ns`` at
+def pulsed_init(
+    spec: SensorSpec, amplitude: float, pi_ns: float, rest_amplitude: float = 0.0, rest_ns: float = 0.0
+) -> np.ndarray:
+    """Pre-activations (n_points, n_segments, 4) of a pulsed ODMR protocol: one pulse of ``pi_ns`` at
     ``amplitude`` on each point's base frequency, split over the slots (the first slots full, the rest in the
-    next one, unused slots off)."""
+    next one). Unused slots get ``rest_amplitude`` for ``rest_ns`` (default off; a small nonzero rest keeps their
+    bounded parameters away from saturation so training can still switch them on)."""
     ly = spec.layout
     durs = np.zeros(ly.n_segments)
     left = pi_ns
@@ -106,7 +109,8 @@ def pulsed_init(spec: SensorSpec, amplitude: float, pi_ns: float) -> np.ndarray:
         durs[s] = min(left, ly.max_ns)
         left -= durs[s]
     big = dataclasses.replace(ly, n_blocks=spec.n_points)
-    amp = np.where(durs > 0, amplitude, 0.0)
+    amp = np.where(durs > 0, amplitude, rest_amplitude)
+    durs = np.where(durs > 0, durs, rest_ns)
     z = preactivations_for(big, amplitude=np.broadcast_to(amp, (spec.n_points, ly.n_segments)), duration_ns=durs)
     return z
 

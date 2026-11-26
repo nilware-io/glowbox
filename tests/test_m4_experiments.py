@@ -64,5 +64,7 @@ def test_m4_learned_sensor_runs_end_to_end(tmp_path):
     (run_dir,) = (tmp_path / "out").iterdir()
     info = load_run(run_dir)
     assert len(info["traces"]) == 2 * 2 * 10  # condition x point x shots
-    for f in ("results.parquet", "timing.parquet", "protocols.parquet", "quantum_test.json"):
+    assert summary["tuned_amplitude"] in (0.2, 0.5) and summary["tuned_pi_ns"] > 0
+    assert "## Tuning the fixed pulsed baseline" in text and "## Equal wall time per point" in text
+    for f in ("results.parquet", "timing.parquet", "protocols.parquet", "tuning.parquet", "quantum_test.json"):
         assert (run_dir / f).exists()

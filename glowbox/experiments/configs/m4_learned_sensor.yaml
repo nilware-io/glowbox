@@ -1,9 +1,10 @@
 # Milestone 4, Task 1 re-run: the encoder chooses the sensor protocol. A learned protocol of n_points measurements
 # (each: init, a two-segment MW block with free amplitude, phase, frequency and duration, a time-resolved readout)
 # is trained end to end with a CNN decoder through the differentiable surrogate, then compared with milestone 2's
-# fixed CW and pulsed ODMR sweeps at the same number of points, shots and decoder recipe. Quantum test: every MW
-# frequency + 400 MHz, trained and evaluated the same way.
-# Run: uv run python -m glowbox.experiments.m4_learned_sensor  (add --quick for a few-minute smoke run)
+# fixed CW and pulsed ODMR sweeps at the same number of points, shots and decoder recipe; the fixed pulsed sweep's
+# pulse is first tuned for this grid (amplitude and area, on validation fields) and the learned protocol starts from
+# it. Quantum test: every MW frequency + 400 MHz, trained and evaluated the same way.
+# Run: uv run python -m glowbox.experiments.m4_learned_sensor  (add --quick for a smoke run: ~10 min on a 32-core CPU)
 name: m4-learned-sensor
 seed: 20261129
 seeds: [0, 1, 2, 3, 4]
@@ -47,17 +48,27 @@ sensor:                       # glowbox.learn.sensor.SensorSpec
     window_ns: 100
   init_ns: 1500
   settle_ns: 1000
-  init_amplitude: 0.2         # starts at milestone 2's pulsed ODMR: a pi pulse of 310 ns at amplitude 0.2
+  init: tuned                 # start at the tuned pulse (below); "m2": milestone 2's pi pulse (init_amplitude, init_pi_ns)
+  init_amplitude: 0.2
   init_pi_ns: 310.0
+  init_amp_cap: 0.95          # a tuned amplitude above 0.95 amp_hi starts at 0.95 (same area): saturated sigmoids
+  init_rest_amplitude: 0.05   # unused segments start nearly off (0.02 pi) but trainable
+  init_rest_ns: 20.0
 
 fixed:                        # milestone 2's fixed protocols on the same grid
   cw_amplitude: 0.1
   cw_shot_ns: 3000
-  pulsed_amplitude: 0.2
+  pulsed_amplitude: 0.2       # milestone 2's pi pulse (tuned for its 1 MHz grid): the "untuned" baseline
   pi_ns: 310
 
+tune:                         # the tuned fixed pulsed baseline: CNN recipe, validation RMSE of one seed
+  seed: 0
+  shots: 1000
+  amplitudes: [0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]   # stage 1: each with its nominal pi pulse
+  area_factors: [0.6, 0.8, 1.25, 1.5]               # stage 2: pulse area at the best amplitude
+
 protocol_train:               # phase 1: protocol + CNN through the surrogate (fresh fields every step)
-  steps: 1000
+  steps: 2000
   fields_per_step: 16
   lr_protocol: 3.0e-2
   lr_decoder: 1.0e-3
@@ -81,9 +92,13 @@ eval:
   headline_shots: 1000
   budget_shots: 5000          # 40 points x 5000 shots = milestone 2's 200 points x 1000 shots (equal total shots)
 
-timing:                       # resonant, every seed: learned and fixed pulsed protocols, frozen decoders
+timing:                       # resonant, every seed: learned and tuned pulsed protocols
   n_fields: 200
-  duration_shifts_ns: [-100, -50, -20, 0, 20, 50, 100]
+  duration_shifts_ns: [-100, -50, -20, 0, 20, 50, 100]   # frozen CNN
+  area_shifts_ns: [-50, -20, 20, 50]                     # equal-area control (amplitude), frozen CNN
+  retrain_shifts_ns: [-50, 50]                           # fresh CNN on a reduced bank of the shifted protocol
+  retrain_n_train: 1000
+  retrain_n_val: 256
 
 reference:                    # QuTiP check of the learned protocol, seed 0 resonant
   n_fields: 2
@@ -96,5 +111,7 @@ quick:
   train: {steps: 60, eval_every: 30, batch: 32}
   decoder: {channels: [16, 32], hidden: 32}
   eval: {shots: [100, 1000, 5000]}
-  timing: {n_fields: 16, duration_shifts_ns: [-50, 0, 50]}
+  tune: {amplitudes: [0.2, 0.5], area_factors: [1.25]}
+  timing: {n_fields: 16, duration_shifts_ns: [-50, 0, 50], area_shifts_ns: [-50, 50], retrain_shifts_ns: [50],
+           retrain_n_train: 64, retrain_n_val: 32}
   reference: {n_fields: 1, workers: 4}
