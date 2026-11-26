@@ -17,6 +17,8 @@ from glowbox.learn.reservoir import (
     compose_suffix,
     full_sequence,
     init_prefix,
+    laser_bins,
+    multiplex_block,
     simulate_suffixes,
 )
 from glowbox.sim.interface import EnvParams
@@ -126,3 +128,23 @@ def test_ridge_gcv_shrinks_on_pure_noise():
     lam_noise = RidgeReadout().fit(x, noise).lam
     lam_signal = RidgeReadout().fit(x, signal + 0.1 * noise).lam
     assert lam_noise > lam_signal
+
+
+def test_multiplexed_block_layout_and_readout_bins():
+    spec = EncoderSpec(n_inputs=2, n_segments=4, slot_ns=50, max_ns=50)
+    enc = RandomPulseEncoder(spec, LINES, seed=1)
+    u = _inputs(3, 2)
+    blk = multiplex_block(enc.block(u), spec, 2, 100)
+    assert blk.n_bins == spec.block_bins + 10
+    laser = np.asarray(blk.laser)
+    assert np.all(laser[:, 10:20] == 1) and laser.sum() == 3 * 10
+    assert np.all(np.asarray(blk.mw_amplitude)[:, 10:20] == 0)
+    suf = compose_suffix(3, blk, 0, 100)
+    idx = laser_bins(suf)
+    np.testing.assert_array_equal(idx, np.concatenate([np.arange(10, 20), np.arange(30, 40)]))
+    env = EnvParams(b_field_t=B)
+    opt = ModelOptions(n_detuning=4)
+    sel = simulate_suffixes(init_prefix(1000, 500), suf, env, idx, options=opt)
+    last = simulate_suffixes(init_prefix(1000, 500), suf, env, 10, options=opt)
+    np.testing.assert_allclose(sel[:, -10:], last)
+    assert sel.shape == (3, 20)

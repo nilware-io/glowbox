@@ -18,6 +18,8 @@ Pieces:
   The spins are the reservoir: the readout fluorescence is a nonlinear (rotation, interference, saturation)
   function of the pulse parameters, and the spin state carries the information of earlier segments forward
   (populations for ~T1, coherences for ~T2*).
+* :func:`multiplex_block`: time multiplexing, short readouts interleaved between groups of segments (virtual
+  nodes; the spin state carries over between them); :func:`laser_bins` lists every readout bin of a suffix.
 * :func:`compose_suffix`: a MW block (or nothing) + a dark delay + an optional fixed read pulse + a time-resolved
   readout laser, as :class:`~glowbox.control.pulse.SequenceArrays`; :func:`init_prefix`: the shared MW-free
   initialisation (laser + settle). :func:`simulate_suffixes` runs the prefix once and every suffix from its final
@@ -232,6 +234,50 @@ def compose_suffix(
     )
 
 
+def multiplex_block(block: SequenceArrays, spec: EncoderSpec, n_groups: int, readout_ns: int) -> SequenceArrays:
+    """Time multiplexing: split the block's slots into ``n_groups`` consecutive groups and put a readout laser of
+    ``readout_ns`` after every group but the last (the suffix's own readout follows the last one).
+
+    Each interleaved readout is a *virtual node* of the reservoir: it reads the spins part-way through the encoding
+    and only partly repolarises them, so later groups act on a state that still remembers earlier ones.
+    """
+    b = block.to_numpy()
+    g = spec.grid_ns
+    if spec.n_segments % n_groups:
+        raise ValueError("n_segments must be divisible by n_groups")
+    if readout_ns % g:
+        raise ValueError("readout length must be a multiple of the grid")
+    n = b.batch_shape[0]
+    gb = spec.n_segments // n_groups * spec.slot_ns // g
+    nr = readout_ns // g
+    cols: dict[str, list[np.ndarray]] = {"laser": [], "amp": [], "freq": [], "phase": []}
+    for k in range(n_groups):
+        sl = slice(k * gb, (k + 1) * gb)
+        cols["laser"].append(np.asarray(b.laser)[:, sl])
+        cols["amp"].append(np.asarray(b.mw_amplitude)[:, sl])
+        cols["freq"].append(np.asarray(b.mw_frequency_hz)[:, sl])
+        cols["phase"].append(np.asarray(b.mw_phase_rad)[:, sl])
+        if k < n_groups - 1:
+            cols["laser"].append(np.ones((n, nr), np.float32))
+            cols["amp"].append(np.zeros((n, nr), np.float32))
+            cols["freq"].append(np.zeros((n, nr)))
+            cols["phase"].append(np.zeros((n, nr), np.float32))
+    return SequenceArrays(
+        laser=np.concatenate(cols["laser"], axis=1),
+        mw_amplitude=np.concatenate(cols["amp"], axis=1),
+        mw_frequency_hz=np.concatenate(cols["freq"], axis=1),
+        mw_phase_rad=np.concatenate(cols["phase"], axis=1),
+        magnet_t=np.asarray(b.magnet_t),
+        grid_ns=g,
+    )
+
+
+def laser_bins(suffix: SequenceArrays) -> np.ndarray:
+    """Indices of the laser-on bins of a suffix (row 0): every readout window of a multiplexed reservoir."""
+    out: np.ndarray = np.flatnonzero(np.asarray(suffix.to_numpy().laser).reshape(-1, suffix.n_bins)[0] > 0)
+    return out
+
+
 def init_prefix(
     init_ns: int, settle_ns: int, magnet_t: Sequence[float] = (0.0, 0.0, 0.0), grid_ns: int = GRID_DEFAULT_NS
 ) -> SequenceArrays:
@@ -266,21 +312,26 @@ def simulate_suffixes(
     prefix: SequenceArrays,
     suffix: SequenceArrays,
     env: EnvParams,
-    readout_bins: int,
+    readout_bins: int | np.ndarray,
     *,
     options: ModelOptions | None = None,
     device: torch.device | str | None = None,
     chunk: int = DEFAULT_CHUNK,
 ) -> np.ndarray:
-    """Mean detected counts per shot in the last ``readout_bins`` bins of ``prefix + suffix[i]`` for every row of
-    ``suffix`` (all rows share the one prefix), (N, readout_bins) float64."""
+    """Mean detected counts per shot in the last ``readout_bins`` bins (an int) or in the given suffix bins (an
+    index array) of ``prefix + suffix[i]`` for every row of ``suffix`` (all rows share the one prefix), (N, bins)
+    float64."""
     sfx = suffix.to_numpy()
     n = sfx.batch_shape[0]
+    if isinstance(readout_bins, np.ndarray):
+        sel = np.asarray(readout_bins, dtype=np.int64)
+    else:
+        sel = np.arange(sfx.n_bins - int(readout_bins), sfx.n_bins)
     pre = prefix.to_numpy()
     if pre.batch_shape != (1,):
         raise ValueError("the prefix must be a batch of one")
     dt_s = sfx.grid_ns * 1e-9
-    out = np.empty((n, readout_bins))
+    out = np.empty((n, sel.size))
     for i in range(0, n, chunk):
         sub = _take(sfx, slice(i, i + chunk))
         m = sub.batch_shape[0]
@@ -296,7 +347,7 @@ def simulate_suffixes(
         if not np.all(mag == mag[:1]):
             raise ValueError("all suffixes must share the prefix's magnet setting")
         rate = branched_rate_cps(pre_m, sub, np.zeros(m, dtype=np.int64), env, options=options, device=device)
-        out[i : i + m] = (rate[:, -readout_bins:] * dt_s).double().cpu().numpy()
+        out[i : i + m] = (rate[:, torch.as_tensor(sel, device=rate.device)] * dt_s).double().cpu().numpy()
     return out
 
 
