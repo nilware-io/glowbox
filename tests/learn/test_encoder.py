@@ -11,8 +11,10 @@ import torch
 
 from glowbox.analysis.field_fit import transition_lines_hz
 from glowbox.learn.encoder import (
+    BlockParams,
     Layout,
     PulseEncoder,
+    area_matched_amplitude,
     build_suffix,
     gaussian_shot_noise,
     preactivations_for,
@@ -230,3 +232,19 @@ def test_run_length_float32_accuracy(offset_hz: float, rtol_grad: float):
     ref = readout_features(suffix_counts(arr, fill, ENV, st0_64.expand(4, *st0_64.shape[1:]), OPT), ly).numpy()
     np.testing.assert_allclose(mexp, ref, rtol=1e-4)
     np.testing.assert_allclose(taylor, ref, rtol=rtol_grad)
+
+
+def test_area_matched_amplitude_matches_shifted_areas():
+    """The equal-area control changes every on-segment's area exactly as the duration shift does, keeps durations,
+    leaves off segments off."""
+    ly = Layout(n_blocks=1, n_segments=4, slot_ns=100, max_ns=100.0)
+    d = torch.tensor([[[0.0, 30.0, 60.0, 90.0]]])
+    a = torch.tensor([[[0.5, 0.4, 0.3, 0.2]]])
+    p = BlockParams(a, torch.zeros_like(a), torch.zeros_like(a), d)
+    for shift in (-50.0, -20.0, 20.0):
+        q = area_matched_amplitude(p, ly, shift)
+        assert torch.equal(q.duration_ns, p.duration_ns)
+        ds = torch.clamp(d + shift, 0.0, 100.0)
+        on = d > 0
+        assert torch.allclose((q.amplitude * d)[on], (a * ds)[on])
+        assert q.amplitude[0, 0, 0] == a[0, 0, 0]

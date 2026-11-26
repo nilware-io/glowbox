@@ -28,6 +28,9 @@ run it). The backward pass uses the continuous fill fractions of
 slot): ``fill = fill_q + (fill_c - fill_c.detach())``. The
 gradient with respect to a duration is then the derivative of the propagator of the boundary bin with respect to
 its fill, an approximation (the true function of d is piecewise constant).
+This fill straight-through belongs to the bin path (:func:`build_suffix`, :func:`suffix_counts`) only. Training
+(:func:`encoded_counts`, the run-length path :func:`layout_runs`) instead rounds the duration straight-through
+(:func:`_ste_duration_ns`) and differentiates the propagator of the continuous duration exactly.
 
 **Simulation.** :func:`prefix_states` runs the initialisation once per static field (no gradient); every suffix
 continues from its prefix's final state (:func:`suffix_counts`, exact because a MW-free prefix leaves no spin
@@ -554,3 +557,16 @@ def pulse_areas_pi(
     d = params.quantized_ns(grid_ns).cpu().numpy() * 1e-9
     out: np.ndarray = 2.0 * f_r * params.amplitude.detach().cpu().numpy() * d
     return out
+
+
+def area_matched_amplitude(params: BlockParams, layout: Layout, shift_ns: float) -> BlockParams:
+    """The equal-area control of a duration-shift probe: durations unchanged, every amplitude scaled by
+    ``d_shifted / d`` (grid-rounded, clamped to the slot as :func:`encoded_counts` shifts them), so every pulse's
+    resonant rotation angle changes exactly as under ``duration_shift_ns = shift_ns`` but its timing does not.
+    Segments that are off (d = 0) stay off (a shift would switch them on; no amplitude can mimic that). Amplitudes
+    may exceed ``amp_hi`` (the surrogate does not clip; only the control needs it)."""
+    g = float(layout.grid_ns)
+    d = torch.round(torch.clamp(params.duration_ns, 0.0, float(layout.slot_ns)) / g) * g
+    ds = torch.round(torch.clamp(params.duration_ns + shift_ns, 0.0, float(layout.slot_ns)) / g) * g
+    scale = torch.where(d > 0, ds / torch.clamp(d, min=g), torch.ones_like(d))
+    return BlockParams(params.amplitude * scale, params.phase_rad, params.frequency_hz, params.duration_ns)
