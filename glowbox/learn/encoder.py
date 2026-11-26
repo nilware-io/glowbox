@@ -53,6 +53,7 @@ from glowbox.control.pulse import SequenceArrays
 from glowbox.sim.constants import GRID_DEFAULT_NS
 from glowbox.sim.interface import EnvParams
 from glowbox.sim.surrogate.model import ModelOptions, Statics, emission_and_state, statics_for
+from glowbox.sim.surrogate.runs import Run, run_emission
 
 
 @dataclass(frozen=True)
@@ -70,8 +71,10 @@ class Layout:
     span_hz: float = 4e6
     #: Readout laser after every block (power 1), ns.
     readout_ns: int = 1000
-    #: Counted window at the start of each readout, ns; 0 = every readout bin is a feature (time-resolved).
+    #: Counted window at the start of each readout, ns; 0 = time-resolved: the readout split into windows of
+    #: ``window_ns`` (0 = the grid, every bin).
     gate_ns: int = 300
+    window_ns: int = 0
     #: Dark time after each readout (lets the singlet empty), ns.
     gap_ns: int = 0
     grid_ns: int = GRID_DEFAULT_NS
@@ -80,7 +83,7 @@ class Layout:
         g = self.grid_ns
         if self.n_blocks < 1 or self.n_segments < 1:
             raise ValueError("need n_blocks >= 1 and n_segments >= 1")
-        for name in ("slot_ns", "readout_ns", "gate_ns", "gap_ns"):
+        for name in ("slot_ns", "readout_ns", "gate_ns", "gap_ns", "window_ns"):
             if getattr(self, name) % g:
                 raise ValueError(f"{name} must be a multiple of the grid")
         if not 0 <= self.min_ns <= self.max_ns <= self.slot_ns:
@@ -89,6 +92,8 @@ class Layout:
             raise ValueError("need 0 <= amp_lo <= amp_hi <= 1")
         if not 0 <= self.gate_ns <= self.readout_ns or self.readout_ns <= 0:
             raise ValueError("need 0 <= gate_ns <= readout_ns, readout_ns > 0")
+        if self.window_ns and self.readout_ns % self.window_ns:
+            raise ValueError("readout_ns must be a multiple of window_ns")
 
     @property
     def slot_bins(self) -> int:
@@ -115,9 +120,17 @@ class Layout:
         return self.n_blocks * self.period_bins
 
     @property
+    def window_bins(self) -> int:
+        return (self.window_ns or self.grid_ns) // self.grid_ns
+
+    @property
+    def features_per_readout(self) -> int:
+        return 1 if self.gate_ns else self.readout_bins // self.window_bins
+
+    @property
     def n_features(self) -> int:
-        """Numbers the decoder sees per sequence: one per readout (gated) or every readout bin."""
-        return self.n_blocks * (1 if self.gate_ns else self.readout_bins)
+        """Numbers the decoder sees per sequence: one per readout (gated) or one per readout window."""
+        return self.n_blocks * self.features_per_readout
 
     def readout_start(self, k: int) -> int:
         """First bin of readout ``k``."""
@@ -386,6 +399,25 @@ def prefix_states(
     return state
 
 
+@torch.no_grad()
+def prefix_states_and_statics(
+    prefix: SequenceArrays,
+    env: EnvParams,
+    options: ModelOptions,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, Statics, torch.Tensor]:
+    """(final states (P, K, M, 14), statics of the prefixes' distinct static fields, group index (P,) of each
+    prefix row into them): everything :func:`encoded_counts` needs to continue every prefix."""
+    pre = prefix.to_numpy()
+    if np.any(np.asarray(pre.mw_amplitude) != 0):
+        raise ValueError("the prefix must be MW-free")
+    st = statics_for(pre, env, options, device)
+    fields = np.asarray(env.b_field_t, dtype=np.float64)[None] + np.asarray(pre.magnet_t, np.float64).reshape(-1, 3)
+    _, inv = np.unique(fields, axis=0, return_inverse=True)
+    _, state = emission_and_state(pre, env, options=options, device=device, statics=st)
+    return state, st, torch.as_tensor(inv.reshape(-1), device=torch.device(device))
+
+
 def suffix_counts(
     arrays: SequenceArrays,
     fill: torch.Tensor,
@@ -407,14 +439,93 @@ def suffix_counts(
 
 
 def readout_features(counts: torch.Tensor, layout: Layout) -> torch.Tensor:
-    """The decoder's numbers from per-bin counts (N, n_bins): gated sums (N, n_blocks), or every readout bin
-    (N, n_blocks, readout_bins) when ``gate_ns == 0``."""
+    """The decoder's numbers from per-bin counts (N, n_bins): gated sums or window sums, (N, n_features) in
+    block-major order."""
     ly = layout
-    per = counts.reshape(counts.shape[0], ly.n_blocks, ly.period_bins)
+    n = counts.shape[0]
+    per = counts.reshape(n, ly.n_blocks, ly.period_bins)
     ro = per[..., ly.block_bins : ly.block_bins + ly.readout_bins]
     if ly.gate_ns:
         return ro[..., : ly.gate_bins].sum(-1)
-    return ro
+    return ro.reshape(n, ly.n_blocks, -1, ly.window_bins).sum(-1).reshape(n, ly.n_features)
+
+
+def _ste_duration_ns(d: torch.Tensor, layout: Layout, shift_ns: float, quantize: bool) -> torch.Tensor:
+    """Duration clamped to the slot; forward rounded to the grid, backward continuous (straight-through)."""
+    g = float(layout.grid_ns)
+    dc = torch.clamp(d + shift_ns, 0.0, float(layout.slot_ns))
+    if not quantize:
+        return dc
+    return torch.round(dc.detach() / g) * g + (dc - dc.detach())
+
+
+def layout_runs(
+    params: BlockParams,
+    layout: Layout,
+    env: EnvParams,
+    *,
+    offset_hz: float = 0.0,
+    duration_shift_ns: float = 0.0,
+    quantize: bool = True,
+) -> list[Run]:
+    """The suffix of :func:`build_suffix` as runs (:mod:`glowbox.sim.surrogate.runs`): per segment an MW-on run
+    (its duration exact and differentiable) and an MW-off rest of the slot; per readout the recorded gate or
+    windows, the rest of the laser and the gap. Frames as the bin path: off runs and readouts keep the last MW
+    frequency."""
+    ly = layout
+    ns = 1e-9
+    beta_on = env.optical_beta_full_scale
+    dur = _ste_duration_ns(params.duration_ns, ly, duration_shift_ns, quantize)
+    amp, ph = params.amplitude, params.phase_rad
+    freq = params.frequency_hz + offset_hz
+    ac, as_ = amp * torch.cos(ph), amp * torch.sin(ph)
+    runs: list[Run] = []
+    for k in range(ly.n_blocks):
+        t_blk = k * ly.period_bins * ly.grid_ns
+        f_last = freq[:, k, -1]
+        for s in range(ly.n_segments):
+            t0 = (t_blk + s * ly.slot_ns) * ns
+            f = freq[:, k, s]
+            d = dur[:, k, s]
+            runs.append(Run(d * ns, 0.0, ac[:, k, s], as_[:, k, s], f, t0))
+            runs.append(Run((ly.slot_ns - d) * ns, 0.0, 0.0, 0.0, f, t0))
+        if ly.gate_ns:
+            runs.append(Run(ly.gate_ns * ns, beta_on, frame_hz=f_last, record=True))
+            rest = ly.readout_ns - ly.gate_ns
+            if rest:
+                runs.append(Run(rest * ns, beta_on, frame_hz=f_last))
+        else:
+            w = ly.window_bins * ly.grid_ns
+            for _ in range(ly.features_per_readout):
+                runs.append(Run(w * ns, beta_on, frame_hz=f_last, record=True))
+        if ly.gap_ns:
+            runs.append(Run(ly.gap_ns * ns, 0.0, frame_hz=f_last))
+    return runs
+
+
+def encoded_counts(
+    params: BlockParams,
+    layout: Layout,
+    env: EnvParams,
+    initial_state: torch.Tensor,
+    statics: Statics,
+    *,
+    group: torch.Tensor | None = None,
+    offset_hz: float = 0.0,
+    duration_shift_ns: float = 0.0,
+    quantize: bool = True,
+) -> torch.Tensor:
+    """Noiseless mean detected counts per shot of every feature (gate or window), (N, n_features); the run-length
+    path (one propagator per run, exact and differentiable durations). ``group`` (N,) indexes the static fields of
+    ``statics`` (default: all 0, one field)."""
+    n = params.amplitude.shape[0]
+    dev = initial_state.device
+    g = torch.zeros(n, dtype=torch.long, device=dev) if group is None else group
+    runs = layout_runs(params, layout, env, offset_hz=offset_hz, duration_shift_ns=duration_shift_ns, quantize=quantize)
+    em, _ = run_emission(statics, g, runs, initial_state)
+    t_s = layout.gate_ns * 1e-9 if layout.gate_ns else layout.window_bins * layout.grid_ns * 1e-9
+    per_nv = em  # photons per NV per recorded run
+    return env.collection_efficiency * env.n_nv * per_nv + (env.background_cps + env.dark_cps) * t_s
 
 
 def gaussian_shot_noise(mean: torch.Tensor, shots: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:

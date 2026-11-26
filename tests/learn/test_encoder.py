@@ -147,3 +147,54 @@ def test_gaussian_shot_noise_moments():
     x = gaussian_shot_noise(mu, torch.full((20000,), 100.0), g)
     assert abs(float(x.mean()) - 3.0) < 3e-3
     assert abs(float(x.var()) - 0.03) < 2e-3
+
+
+@pytest.mark.parametrize("gate", [200, 0])
+def test_run_length_path_equals_bin_path(gate: int):
+    import dataclasses
+
+    from glowbox.learn.encoder import encoded_counts, prefix_states_and_statics
+
+    ly = dataclasses.replace(LAYOUT, gate_ns=gate, window_ns=100 if gate == 0 else 0)
+    torch.manual_seed(0)
+    enc = PulseEncoder(ly, BASE, n_inputs=3, init=preactivations_for(ly, 0.5, 30.0)).double()
+    enc.randomize_(1.5, torch.Generator().manual_seed(2))
+    u = torch.randn(3, 3, dtype=torch.float64)
+    pre = init_prefix(600, 400)
+    st0, st, grp = prefix_states_and_statics(pre, ENV, OPT, "cpu")
+    p = enc(u)
+    arr, fill = build_suffix(p, ly)
+    ref = readout_features(suffix_counts(arr, fill, ENV, st0.expand(3, *st0.shape[1:]), OPT), ly).detach()
+    got = encoded_counts(p, ly, ENV, st0.expand(3, *st0.shape[1:]), st).detach()
+    assert got.shape == (3, ly.n_features)
+    np.testing.assert_allclose(got.numpy(), ref.numpy(), rtol=1e-9)
+    assert grp.tolist() == [0]
+
+
+def test_run_length_duration_gradient_is_exact():
+    """Continuous durations (no rounding): autograd vs central differences of the duration pre-activation."""
+    from glowbox.learn.encoder import encoded_counts, prefix_states_and_statics
+
+    z0 = preactivations_for(LAYOUT, amplitude=0.7, duration_ns=np.array([[23.0, 41.0], [17.0, 52.0]]))
+    enc = PulseEncoder(LAYOUT, BASE, n_inputs=0, init=z0).double()
+    pre = init_prefix(600, 400)
+    st0, st, _ = prefix_states_and_statics(pre, ENV, OPT, "cpu")
+    w = torch.tensor([1.0, -0.4], dtype=torch.float64)
+
+    def loss() -> torch.Tensor:
+        return (encoded_counts(enc(None, 1), LAYOUT, ENV, st0, st, quantize=False)[0] * w).sum()
+
+    loss().backward()
+    assert enc.bias is not None and enc.bias.grad is not None
+    g = enc.bias.grad.reshape(2, 2, 4).clone()
+    h = 1e-5
+    for idx in [(0, 0, 3), (0, 1, 3), (1, 0, 3), (1, 1, 3), (1, 0, 0), (0, 1, 2)]:
+        flat = int(np.ravel_multi_index(idx, (2, 2, 4)))
+        vals = []
+        for sgn in (1, -1):
+            with torch.no_grad():
+                enc.bias[flat] += sgn * h
+                vals.append(float(loss()))
+                enc.bias[flat] -= sgn * h
+        fd = (vals[0] - vals[1]) / (2 * h)
+        assert abs(float(g[idx]) - fd) <= 1e-5 * max(abs(fd), 1e-8), (idx, float(g[idx]), fd)
