@@ -1,0 +1,100 @@
+# Milestone 4, Task 1 re-run: the encoder chooses the sensor protocol. A learned protocol of n_points measurements
+# (each: init, a two-segment MW block with free amplitude, phase, frequency and duration, a time-resolved readout)
+# is trained end to end with a CNN decoder through the differentiable surrogate, then compared with milestone 2's
+# fixed CW and pulsed ODMR sweeps at the same number of points, shots and decoder recipe. Quantum test: every MW
+# frequency + 400 MHz, trained and evaluated the same way.
+# Run: uv run python -m glowbox.experiments.m4_learned_sensor  (add --quick for a few-minute smoke run)
+name: m4-learned-sensor
+seed: 20261129
+seeds: [0, 1, 2, 3, 4]
+detuned_offset_hz: 4.0e+8
+
+prior:                        # milestone 2's prior (glowbox.learn.field_data.FieldPrior)
+  b_min_t: 0.5e-3
+  b_max_t: 3.0e-3
+  t2_star_s: [0.5e-6, 2.0e-6]
+  rabi_full_scale_hz: [8.0e+6, 12.0e+6]
+  optical_beta_full_scale: [0.07, 0.13]
+  collection_efficiency: [2.0e-3, 4.0e-3]
+  background_cps: [5.0e+3, 2.0e+4]
+  e_hz: [0.0, 3.0e+5]
+
+bank:                         # every protocol's banks (milestone 2's numerics)
+  n_train: 3000
+  n_val: 512
+  n_test: 1000
+  fields_per_env: 8
+  n_detuning: 32
+  detuning_rule: uniform
+  detuning_spacing: 2.0
+  workers: 4
+
+sensor:                       # glowbox.learn.sensor.SensorSpec
+  n_points: 40                # 5 MHz grid over 2.77-2.97 GHz (milestone 2: 200 points at 1 MHz)
+  f_start_hz: 2.77e+9
+  f_stop_hz: 2.97e+9
+  layout:                     # per point: 2 MW segments in 200 ns slots, 600 ns readout in 100 ns windows
+    n_blocks: 1
+    n_segments: 2
+    slot_ns: 200
+    min_ns: 0.0
+    max_ns: 200.0
+    amp_lo: 0.0
+    amp_hi: 1.0
+    span_hz: 7.5e+6           # each segment within +-7.5 MHz of its point's grid frequency
+    readout_ns: 600
+    gate_ns: 0
+    window_ns: 100
+  init_ns: 1500
+  settle_ns: 1000
+  init_amplitude: 0.2         # starts at milestone 2's pulsed ODMR: a pi pulse of 310 ns at amplitude 0.2
+  init_pi_ns: 310.0
+
+fixed:                        # milestone 2's fixed protocols on the same grid
+  cw_amplitude: 0.1
+  cw_shot_ns: 3000
+  pulsed_amplitude: 0.2
+  pi_ns: 310
+
+protocol_train:               # phase 1: protocol + CNN through the surrogate (fresh fields every step)
+  steps: 1000
+  fields_per_step: 16
+  lr_protocol: 3.0e-2
+  lr_decoder: 1.0e-3
+  shots: [10, 10000]
+  n_detuning: 8               # weighted uniform quadrature while training (banks use the bank settings)
+  detuning_rule: uniform
+  detuning_spacing: 2.0
+
+train:                        # phase 2 and the fixed protocols: CNN on banks (milestone 2's recipe, fewer steps)
+  steps: 2500
+  batch: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  eval_every: 250
+  shots_min: 10
+  shots_max: 10000
+decoder: {mix_channels: 8, channels: [32, 64, 128], kernel: 7, hidden: 256}
+
+eval:
+  shots: [30, 100, 300, 1000, 3000, 5000, 10000]
+  headline_shots: 1000
+  budget_shots: 5000          # 40 points x 5000 shots = milestone 2's 200 points x 1000 shots (equal total shots)
+
+timing:                       # resonant, every seed: learned and fixed pulsed protocols, frozen decoders
+  n_fields: 200
+  duration_shifts_ns: [-100, -50, -20, 0, 20, 50, 100]
+
+reference:                    # QuTiP check of the learned protocol, seed 0 resonant
+  n_fields: 2
+  workers: 16
+
+quick:
+  bank: {n_train: 128, n_val: 32, n_test: 32, n_detuning: 8}
+  sensor: {n_points: 16}
+  protocol_train: {steps: 4, fields_per_step: 4, n_detuning: 4}
+  train: {steps: 60, eval_every: 30, batch: 32}
+  decoder: {channels: [16, 32], hidden: 32}
+  eval: {shots: [100, 1000, 5000]}
+  timing: {n_fields: 16, duration_shifts_ns: [-50, 0, 50]}
+  reference: {n_fields: 1, workers: 4}
