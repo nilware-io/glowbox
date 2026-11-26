@@ -1177,6 +1177,15 @@ def report_body(task: SensorTask, qt: QuantumTestResult, tv: dict[str, Any], ref
     return "\n".join(lines)
 
 
+def _shrink_png(path: Path, colors: int = 128) -> None:
+    """Re-save a PNG with a ``colors``-entry palette (figures in docs/ stay small)."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        q = im.convert("RGB").quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+    q.save(path, optimize=True)
+
+
 def main(
     cfg: dict[str, Any], output_root: Path | None = None, report_dir: Path | None = None
 ) -> tuple[Path, dict[str, Any]]:
@@ -1217,6 +1226,7 @@ def main(
             "timing": plot_timing(task),
         }
         paths = [run.save_figure(f, name, dpi=72 if name == "protocol" else 90) for name, f in figs.items()]
+        _shrink_png(paths[0])  # the dense scatter plot: a palette PNG keeps it small
         for f in figs.values():
             plt.close(f)
         summary: dict[str, Any] = {
