@@ -270,7 +270,9 @@ class ForecastTask:
 
     def __call__(self, cond: Condition, seed: int) -> dict[str, float]:
         print(f"[m3-forecast] {cond.name} seed {seed}", flush=True)
+        t_call = time.perf_counter()
         sd, states = self.data(cond, seed)
+        print(f"[m3-forecast]   series {time.perf_counter() - t_call:.0f} s", flush=True)
         w = self.window
         enc = self.encoder(sd, seed)
         if cond.detuned:
@@ -323,6 +325,7 @@ class ForecastTask:
             g_tr = self.reservoir_features(sd, enc, u_tr, off, seed, 2)
             g_te = self.reservoir_features(sd, enc, u_te, off, seed, 3)
             preds["reservoir_offres"] = RidgeReadout().fit(g_tr, y_ar[pick]).predict(g_te)
+        print(f"[m3-forecast]   predictors {time.perf_counter() - t_call:.0f} s", flush=True)
         # hidden-state oracle
         t0 = time.perf_counter()
         zlat = self.series.latent(sd.amps["test"])
@@ -365,6 +368,7 @@ class ForecastTask:
         if cond.name == "resonant":
             self.encoding_stats(sd, enc, u_te, seed)
             self.timing_probe(sd, enc, (u_tr, f_tr), (u_te, f_te), y_ar[pick], target, res, seed)
+        print(f"[m3-forecast]   done {time.perf_counter() - t_call:.0f} s", flush=True)
         return {k: v for k, v in out.items() if k not in ("signal_rel_sd", "cnn_z_rms")}
 
     # --- timing ---------------------------------------------------------------------------------------------------
@@ -380,8 +384,13 @@ class ForecastTask:
         frozen: RidgeReadout,
         seed: int,
     ) -> None:
-        """Every reservoir MW duration shifted: skill of the frozen (shift-0) ridge and of a retrained one."""
+        """Every reservoir MW duration shifted: skill of the frozen (shift-0) ridge and of a ridge retrained at that
+        shift, on the first ``timing.n_windows`` training and test windows (the frozen one keeps its full-data
+        training)."""
+        n = int(self.cfg["timing"]["n_windows"])
         (u_tr, f_tr0), (u_te, f_te0) = train, test
+        u_tr, f_tr0, y_tr = u_tr[:n], f_tr0[:n], y_tr[:n]
+        u_te, f_te0, target = u_te[:n], f_te0[:n], target[:n]
         for shift in [int(s) for s in self.cfg["timing"]["duration_shifts_ns"]]:
             if shift == 0:
                 f_tr, f_te = f_tr0, f_te0
@@ -781,6 +790,10 @@ def report_body(task: ForecastTask, qt: QuantumTestResult, tv: dict[str, Any], r
                 f"{s:+d} ns: {_ci(x)}" for s, x in zip(tv["shifts"], tv[f"shift_drop_{name}"], strict=True)
             )
             a(f"- NV reservoir skill at shift 0 minus with every reservoir MW duration shifted, ridge {name}: {parts}.")
+        a(
+            f"  (On the first {cfg['timing']['n_windows']} training and test windows; the frozen ridge is the one "
+            "trained on all training windows at shift 0.)"
+        )
         a(
             f"  Verdicts: `reservoir_readout_relies_on_pulse_timing` = "
             f"**{tv['reservoir_readout_relies_on_pulse_timing']}** (frozen readout), "

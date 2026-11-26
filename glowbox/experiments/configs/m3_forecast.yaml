@@ -33,7 +33,7 @@ series:                       # glowbox.learn.forecast.DrivenSeries
 data:
   n_train_seq: 384
   n_val_seq: 64
-  n_test_seq: 128
+  n_test_seq: 64              # 3584 test windows, shared (paired) by every predictor
   window: 8
   shots: 10000                # shots per sequence: every reading is summed over them
   ar_draws: 4                 # noise draws of the training set for the AR fit
@@ -47,7 +47,7 @@ cnn:
 decoder: {mix_channels: 8, channels: [32, 64, 128], kernel: 3, hidden: 256}
 
 reservoir:
-  n_train: 8192               # training windows (one noise draw), test = every test window
+  n_train: 4096               # training windows (one noise draw), test = every test window
   shots: 10000                # shots of each reservoir sequence
   init_ns: 1500
   settle_ns: 1000
@@ -60,8 +60,9 @@ reservoir:
 oracle:
   n_quad: 16                  # Gauss-Hermite nodes over the next drive innovation
 
-timing:                       # reservoir write-block MW durations shifted, every seed, resonant
-  duration_shifts_ns: [-20, -10, 0, 10, 20]
+timing:                       # reservoir MW durations shifted, every seed, resonant, on window subsets
+  duration_shifts_ns: [-20, 0, 20]
+  n_windows: 2048             # first n training and test windows (the reservoir costs ~13 ms per sequence on GPU)
 
 reference:                    # QuTiP check, seed 0 resonant
   n_series: 2                 # test sequences of the system (full 46 us sequences)
@@ -75,5 +76,5 @@ quick:
   cnn: {steps: 150, eval_every: 50, batch: 64}
   decoder: {channels: [16, 32], hidden: 64}
   reservoir: {n_train: 512}
-  timing: {duration_shifts_ns: [-20, 0, 20]}
+  timing: {duration_shifts_ns: [-20, 0, 20], n_windows: 256}
   reference: {n_series: 1, n_reservoir: 2, workers: 4}
