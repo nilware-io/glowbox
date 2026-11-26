@@ -198,3 +198,35 @@ def test_run_length_duration_gradient_is_exact():
                 enc.bias[flat] -= sgn * h
         fd = (vals[0] - vals[1]) / (2 * h)
         assert abs(float(g[idx]) - fd) <= 1e-5 * max(abs(fd), 1e-8), (idx, float(g[idx]), fd)
+
+
+@pytest.mark.parametrize(("offset_hz", "rtol_grad"), [(0.0, 2e-4), (400e6, 1e-3)])
+def test_run_length_float32_accuracy(offset_hz: float, rtol_grad: float):
+    """Float32 run path vs the float64 bin path. Without gradients (``matrix_exp``; every evaluation bank) within
+    1e-4; with gradients (Taylor scaling-and-squaring, training) within 2e-4 on resonance and 1e-3 in the 400 MHz
+    detuned frame, where a ~1700 rad frame rotation over a microsecond readout needs ~12 squarings (measured 8e-5 and
+    6e-4; the shot noise of a gated count at 10^5 shots is ~2e-3)."""
+    import dataclasses
+
+    from glowbox.learn.encoder import encoded_counts, prefix_states_and_statics
+
+    ly = dataclasses.replace(LAYOUT, readout_ns=1000, gate_ns=300)
+    torch.manual_seed(0)
+    enc = PulseEncoder(ly, BASE, n_inputs=3, init=preactivations_for(ly, 0.5, 30.0)).double()
+    enc.randomize_(1.5, torch.Generator().manual_seed(3))
+    u = torch.randn(4, 3, dtype=torch.float64)
+    pre = init_prefix(600, 400)
+    opt32 = ModelOptions(n_detuning=4, dtype=torch.float32)
+    st0, st, _ = prefix_states_and_statics(pre, ENV, opt32, "cpu")
+    p = enc(u).detach()
+    p32 = type(p)(p.amplitude.float(), p.phase_rad.float(), p.frequency_hz, p.duration_ns.float())
+    r0 = st0.expand(4, *st0.shape[1:])
+    with torch.enable_grad():
+        taylor = encoded_counts(p32, ly, ENV, r0, st, offset_hz=offset_hz).detach().double().numpy()
+    with torch.no_grad():
+        mexp = encoded_counts(p32, ly, ENV, r0, st, offset_hz=offset_hz).double().numpy()
+    st0_64 = prefix_states(pre, ENV, OPT, "cpu")
+    arr, fill = build_suffix(p, ly, offset_hz=offset_hz)
+    ref = readout_features(suffix_counts(arr, fill, ENV, st0_64.expand(4, *st0_64.shape[1:]), OPT), ly).numpy()
+    np.testing.assert_allclose(mexp, ref, rtol=1e-4)
+    np.testing.assert_allclose(taylor, ref, rtol=rtol_grad)
