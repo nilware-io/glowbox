@@ -1,0 +1,78 @@
+# Milestone 3, Task 3: predict the next fluorescence reading of the driven NV ensemble. Persistence, linear AR,
+# a CNN decoder, the NV reservoir (fixed random pulse encoding + ridge), a hidden-state oracle, and the quantum test.
+# Run: uv run python -m glowbox.experiments.m3_forecast  (add --quick for a few-minute CPU smoke run)
+name: m3-forecast
+seed: 20261128
+seeds: [0, 1, 2, 3, 4]
+detuned_offset_hz: 4.0e+8     # every MW frequency + 400 MHz (the system's drive and the reservoir's encoding)
+
+device:                       # as m3_bit_memory: one device per seed
+  bias_field_t: [1.2e-3, 0.7e-3, 2.5e-3]
+  prior:
+    t2_star_s: [0.5e-6, 2.0e-6]
+    rabi_full_scale_hz: [8.0e+6, 12.0e+6]
+    optical_beta_full_scale: [0.07, 0.13]
+    collection_efficiency: [2.0e-3, 4.0e-3]
+    background_cps: [5.0e+3, 2.0e+4]
+    e_hz: [0.0, 3.0e+5]
+  n_detuning: 32              # quantile rule; the node set revives after ~2 M T2* >= 32 us, but the laser
+                              # destroys coherence every cycle, so the 46 us series never sees a revival
+
+series:                       # glowbox.learn.forecast.DrivenSeries
+  n_cycles: 64
+  burn_in: 8
+  init_ns: 2000
+  mw_ns: 200                  # area up to ~1.6 pi at amplitude 0.95: non-monotonic response
+  readout_ns: 400             # short: the spins are only partly repolarised (memory across cycles)
+  gap_ns: 100
+  line_index: 0
+  rho: 0.8
+  amp_center: 0.5
+  amp_scale: 0.45
+  rebin: 2
+data:
+  n_train_seq: 384
+  n_val_seq: 64
+  n_test_seq: 128
+  window: 8
+  shots: 10000                # shots per sequence: every reading is summed over them
+  ar_draws: 4                 # noise draws of the training set for the AR fit
+
+cnn:
+  steps: 3000
+  batch: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  eval_every: 250
+decoder: {mix_channels: 8, channels: [32, 64, 128], kernel: 3, hidden: 256}
+
+reservoir:
+  n_train: 8192               # training windows (one noise draw), test = every test window
+  shots: 10000                # shots of each reservoir sequence
+  init_ns: 1500
+  settle_ns: 1000
+  delay_ns: 0
+  readout_ns: 600
+  encoder: {n_segments: 8, slot_ns: 100, min_ns: 10, max_ns: 100, amp_lo: 0.05, amp_hi: 1.0, freq_span_hz: 4.0e+6,
+            gain: 1.5}
+
+oracle:
+  n_quad: 16                  # Gauss-Hermite nodes over the next drive innovation
+
+timing:                       # reservoir write-block MW durations shifted, every seed, resonant
+  duration_shifts_ns: [-20, -10, 0, 10, 20]
+
+reference:                    # QuTiP check, seed 0 resonant
+  n_series: 2                 # test sequences of the system (full 46 us sequences)
+  n_reservoir: 8              # reservoir sequences
+  workers: 16
+
+quick:
+  device: {n_detuning: 8}
+  series: {n_cycles: 24, burn_in: 4}
+  data: {n_train_seq: 48, n_val_seq: 8, n_test_seq: 16, window: 4, ar_draws: 2}
+  cnn: {steps: 150, eval_every: 50, batch: 64}
+  decoder: {channels: [16, 32], hidden: 64}
+  reservoir: {n_train: 512}
+  timing: {duration_shifts_ns: [-20, 0, 20]}
+  reference: {n_series: 1, n_reservoir: 2, workers: 4}
