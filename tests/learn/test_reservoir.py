@@ -91,7 +91,7 @@ def test_branched_suffixes_equal_full_sequences_with_absolute_phases():
     branched = simulate_suffixes(pre, suf, env, 30, options=opt)
     for i, row in enumerate(suf.unbatch()):
         seq = full_sequence(pre, row)
-        full = expected_rate_cps(seq.to_arrays(), env, options=opt).numpy()[-30:] * 1e-8
+        full = expected_rate_cps(seq.to_arrays(), env, options=opt).cpu().numpy()[-30:] * 1e-8
         np.testing.assert_allclose(full, branched[i], rtol=1e-7, atol=1e-12)
     # without the phase correction (suffix-relative phases used as absolute ones) the results differ
     seq = full_sequence(pre, suf.unbatch()[0])
@@ -101,7 +101,7 @@ def test_branched_suffixes_equal_full_sequences_with_absolute_phases():
         k = (m.start_ns - pre.n_bins * 10) // 10
         naive_mws.append(dataclasses.replace(m, phase_rad=float(sp[k])))
     naive = dataclasses.replace(seq, microwave=tuple(naive_mws))
-    wrong = expected_rate_cps(naive.to_arrays(), env, options=opt).numpy()[-30:] * 1e-8
+    wrong = expected_rate_cps(naive.to_arrays(), env, options=opt).cpu().numpy()[-30:] * 1e-8
     assert np.max(np.abs(wrong - branched[0])) / np.ptp(branched[:, 0]) > 1e-3
 
 
