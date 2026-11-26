@@ -52,8 +52,9 @@ reservoir:
   init_ns: 1500
   settle_ns: 1000
   delay_ns: 0
-  readout_ns: 600
-  encoder: {n_segments: 8, slot_ns: 100, min_ns: 10, max_ns: 100, amp_lo: 0.05, amp_hi: 1.0, freq_span_hz: 4.0e+6,
+  n_groups: 8                 # time multiplexing: a readout after every 2 segments (8 virtual nodes)
+  readout_ns: 300             # each readout (the last one included)
+  encoder: {n_segments: 16, slot_ns: 100, min_ns: 10, max_ns: 100, amp_lo: 0.05, amp_hi: 1.0, freq_span_hz: 4.0e+6,
             gain: 1.5}
 
 oracle:

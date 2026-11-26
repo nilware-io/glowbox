@@ -62,6 +62,8 @@ from glowbox.learn.reservoir import (
     compose_suffix,
     full_sequence,
     init_prefix,
+    laser_bins,
+    multiplex_block,
     simulate_suffixes,
 )
 from glowbox.sim.interface import EnvParams
@@ -93,6 +95,19 @@ LABELS = {
 }
 
 __all__ = ["DEFAULT_CONFIG", "ForecastTask", "_merge", "load_config", "main"]
+
+
+def reservoir_sequences(
+    rc: dict[str, Any], enc: RandomPulseEncoder, u: np.ndarray, offset_hz: float = 0.0, shift: int = 0
+) -> tuple[Any, Any]:
+    """(prefix, suffixes) of the NV reservoir for inputs ``u``: init, settle, the encoded block time-multiplexed
+    into ``n_groups`` groups with a readout after each (virtual nodes), the last readout at the end."""
+    block = enc.block(u, offset_hz=offset_hz, duration_shift_ns=shift)
+    n_groups = int(rc.get("n_groups", 1))
+    if n_groups > 1:
+        block = multiplex_block(block, enc.spec, n_groups, int(rc["readout_ns"]))
+    suf = compose_suffix(u.shape[0], block, int(rc["delay_ns"]), int(rc["readout_ns"]))
+    return init_prefix(int(rc["init_ns"]), int(rc["settle_ns"])), suf
 
 
 def condition_for(cfg: dict[str, Any], name: str) -> Condition:
@@ -239,13 +254,9 @@ class ForecastTask:
     ) -> np.ndarray:
         """Counts per shot of the reservoir readout for inputs ``u`` (n, window), Poisson at the reservoir shots."""
         rc = self.cfg["reservoir"]
-        block = enc.block(u, offset_hz=offset_hz, duration_shift_ns=shift)
-        suf = compose_suffix(u.shape[0], block, int(rc["delay_ns"]), int(rc["readout_ns"]))
-        pre = init_prefix(int(rc["init_ns"]), int(rc["settle_ns"]))
+        pre, suf = reservoir_sequences(rc, enc, u, offset_hz, shift)
         t0 = time.perf_counter()
-        m = simulate_suffixes(
-            pre, suf, sd.env, int(rc["readout_ns"]) // 10, options=self.options, device=self.device, chunk=2048
-        )
+        m = simulate_suffixes(pre, suf, sd.env, laser_bins(suf), options=self.options, device=self.device, chunk=2048)
         self.seconds["reservoir"] += time.perf_counter() - t0
         s = float(rc["shots"])
         out: np.ndarray = np.random.default_rng([self.base_seed, seed, 5, key]).poisson(m * s) / s
@@ -449,8 +460,7 @@ def run_reference_check(task: ForecastTask) -> dict[str, Any]:
     u = (past - sd.y_mean) / sd.y_std
     res_cfg = task.cfg["reservoir"]
     enc = task.encoder(sd, 0)
-    suf = compose_suffix(n_r, enc.block(u), int(res_cfg["delay_ns"]), int(res_cfg["readout_ns"]))
-    pre = init_prefix(int(res_cfg["init_ns"]), int(res_cfg["settle_ns"]))
+    pre, suf = reservoir_sequences(res_cfg, enc, u)
     rseqs = [full_sequence(pre, row) for row in suf.unbatch()]
     ctx = mp.get_context("spawn")
     with ctx.Pool(int(rc["workers"]), initializer=_ref_init, initargs=(task.options.n_detuning,)) as pool:
@@ -476,9 +486,9 @@ def run_reference_check(task: ForecastTask) -> dict[str, Any]:
     for p in ("ar", "cnn"):
         a, b = np.asarray(out[f"{p}_pred_ref"]), np.asarray(out[f"{p}_pred_sur"])
         out[f"{p}_max_pred_diff_over_ystd"] = float(np.max(np.abs(a - b)) / sd.y_std)
-    nro = int(res_cfg["readout_ns"]) // 10
-    ref_f = np.stack(rates[n_s:])[:, -nro:]
-    sur_f = simulate_suffixes(pre, suf, sd.env, nro, options=task.options, device=task.device)
+    sel = laser_bins(suf) + pre.n_bins
+    ref_f = np.stack(rates[n_s:])[:, sel]
+    sur_f = simulate_suffixes(pre, suf, sd.env, laser_bins(suf), options=task.options, device=task.device)
     out["reservoir_max_rel_feature_diff"] = float(np.max(np.abs(ref_f - sur_f)) / np.max(sur_f))
     fdev = sur_f - sur_f.mean(axis=0)
     out["reservoir_max_diff_over_signal"] = float(np.max(np.abs(ref_f - sur_f)) / max(np.max(np.abs(fdev)), 1e-30))
@@ -721,8 +731,11 @@ def report_body(task: ForecastTask, qt: QuantumTestResult, tv: dict[str, Any], r
     a(
         f"- **NV reservoir**: the past readings, standardised, are the input u ({task.window} numbers) of a fixed "
         f"random pulse encoder ({e['n_segments']} segments of {e['slot_ns']} ns, as in Task 2) that writes them "
-        f"into a separate sequence on the same diamond ({rc['init_ns']} ns init, {rc['settle_ns']} ns dark, the block, "
-        f"{rc['readout_ns']} ns readout, {int(float(rc['shots']))} shots); ridge on its readout counts, trained on "
+        f"into a separate sequence on the same diamond ({rc['init_ns']} ns init, {rc['settle_ns']} ns dark, then the "
+        f"block split into {rc.get('n_groups', 1)} groups, each followed by a {rc['readout_ns']} ns readout: time "
+        "multiplexing, every readout a virtual node that sees the spins part-way through the encoding, the next "
+        f"group acting on a partly repolarised state; {int(float(rc['shots']))} shots); ridge on all readout counts, "
+        "trained on "
         f"{rc['n_train']} windows. Variants: + direct input (ridge on [reservoir counts, u]), and in the resonant arm "
         "the reservoir with only its encoding detuned by the quantum-test offset."
     )
@@ -794,7 +807,7 @@ def report_body(task: ForecastTask, qt: QuantumTestResult, tv: dict[str, Any], r
     a("## Reference check (QuTiP)")
     a("")
     a(
-        f"Seed 0, resonant: {ref.get('n_series', 0)} full system test sequences and {ref.get('n_reservoir', 0)} "
+        f"Seed 0, resonant: {ref.get('n_series', 0)} full system test sequence(s) and {ref.get('n_reservoir', 0)} "
         "reservoir sequences re-simulated on the QuTiP reference (same quadrature nodes; "
         f"{ref.get('seconds', 0):.0f} s on the CPU pool):"
     )
@@ -837,11 +850,16 @@ def outcome(qt: QuantumTestResult) -> str:
         s = qt.summary(f"{p}_skill")
         sig = "significant" if qt.gap_significant(f"{p}_skill") else "not significant"
         parts.append(f"{LABELS[p]} gap {_ci(s['gap'])} ({sig}; detuned {_ci(s['detuned'])})")
+    det = {p: qt.summary(f"{p}_skill")["detuned"][0] for p in (*PREDICTORS, "oracle")}
+    best = max((p for p in det if p != "persistence"), key=lambda p: det[p])
+    pers = det["persistence"]
     return (
         "Outcome (skill): "
         + "; ".join(parts)
-        + ". Detuned, the drive moves no spin, the readings are a constant plus shot noise and nothing is "
-        "predictable (skill <= 0 for every predictor, persistence and AR slightly negative from fitting noise)."
+        + ". Detuned, the drive moves no spin and the readings are (almost) a constant plus shot noise: the best "
+        f"detuned skill is {det[best]:.3g} ({LABELS[best]}); persistence scores {pers:.3g} (on white noise it "
+        "doubles the error variance: -1). What is left on the detuned side is MW-independent (the laser-only "
+        "repolarisation transient along the sequence) or off-resonant transfer, ~(f_R / 260 MHz)^2."
     )
 
 
