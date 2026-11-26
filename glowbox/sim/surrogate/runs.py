@@ -20,9 +20,10 @@ MW keep the previous frame (the caller passes the same F). Like :func:`~glowbox.
 with an ``initial_state``, the time origin is unobservable when the start state has no spin coherence (after a
 MW-free prefix).
 
-Matrix exponentials: Taylor scaling-and-squaring (:func:`~glowbox.sim.surrogate.model._expm_taylor`, backward ~2x
-forward) when differentiating, ``torch.linalg.matrix_exp`` otherwise. The scaling is chosen per call from the largest
-norm; long runs (|L T| ~ 100 for a microsecond of laser) cost a few extra squarings, not more steps.
+Matrix exponentials: Taylor scaling-and-squaring (backward ~2x forward) when differentiating, with the squaring
+count chosen per run from a norm bound and runs of equal count batched together; ``torch.linalg.matrix_exp``
+otherwise. Long runs (|L T| ~ 100-1000 for a microsecond of laser with the frame 100 MHz from a line) cost a few
+extra squarings, not more steps.
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ from glowbox.sim.surrogate.model import (
     ACC,
     N_AUG,
     Statics,
-    _expm_taylor,
     _generator,
     _rotate,
 )
@@ -72,6 +72,20 @@ def _vec(x: torch.Tensor | float, b: int, dtype: torch.dtype, device: torch.devi
     return t.expand(b) if t.ndim == 0 else t
 
 
+def _expm_taylor_fixed(a: torch.Tensor, s: int) -> torch.Tensor:
+    """exp(a) by Taylor (degree 10 float32 / 18 float64) after scaling by 2^-s, then s squarings; ``s`` given by the
+    caller (from a norm bound, :func:`_scaling`), so there is no host sync."""
+    x = a / (2.0**s)
+    deg = 18 if a.dtype == torch.float64 else 10
+    eye = torch.eye(a.shape[-1], dtype=a.dtype, device=a.device)
+    e = eye + x / deg
+    for k in range(deg - 1, 0, -1):
+        e = eye + (x @ e) / k
+    for _ in range(s):
+        e = e @ e
+    return e
+
+
 def _run_propagators(
     st: Statics,
     group: torch.Tensor,
@@ -81,13 +95,41 @@ def _run_propagators(
     frame: torch.Tensor,
     dur: torch.Tensor,
     taylor: bool,
+    s: int,
 ) -> torch.Tensor:
     """exp(L T) for a chunk of runs, controls (B, R): (B, R, K, M, 14, 14)."""
     lgen = _generator(st, group[:, None].expand_as(beta), beta, ac, as_, frame)
     x = lgen * dur[..., None, None, None, None]
     flat = x.reshape(-1, N_AUG, N_AUG)
-    fn = _expm_taylor if taylor else torch.linalg.matrix_exp
-    return fn(flat).reshape(x.shape)
+    out = _expm_taylor_fixed(flat, s) if taylor else torch.linalg.matrix_exp(flat)
+    return out.reshape(x.shape)
+
+
+def _scaling(
+    st: Statics, beta: torch.Tensor, ac: torch.Tensor, as_: torch.Tensor, frame: torch.Tensor, dur: torch.Tensor
+) -> list[int]:
+    """Per run (columns of the (B, R) controls): the squaring count s that brings an upper bound of the 1-norm of
+    L T below 1/2 (triangle inequality over the generator's terms; detunings bounded by the extreme e+- of the
+    statics)."""
+
+    def n1(x: torch.Tensor) -> float:
+        return float(x.abs().sum(-2).amax())
+
+    c0, cp = n1(st.l0), n1(st.k_pump)
+    cd = max(n1(st.drive_a), n1(st.drive_b))
+    ck = max(n1(st.k_m), n1(st.k_p))
+    e = torch.stack([st.e_minus_hz.amin(), st.e_minus_hz.amax(), st.e_plus_hz.amin(), st.e_plus_hz.amax()])
+    dmax = (e[None, None] - frame[..., None]).abs().amax(-1)  # (B, R) Hz
+    with torch.no_grad():
+        bound = dur.detach().abs().double() * (
+            c0
+            + beta.detach().abs().double() * cp
+            + (ac.detach().abs() + as_.detach().abs()).double() * cd
+            + 2.0 * ck * dmax.detach()
+        )
+        nb = bound.amax(0).clamp_min(1e-30)
+        s = torch.ceil(torch.log2(nb / 0.5)).clamp_min(0).long()
+    return [int(x) for x in s.tolist()]
 
 
 def run_emission(
@@ -129,21 +171,38 @@ def run_emission(
     k, m = st.weights.shape
     per_run = max(1, b * k * m)
     chunk = max(1, MAX_RUN_BATCH // per_run)
-    props = []
-    for i in range(0, n_runs, chunk):
-        sl = slice(i, min(n_runs, i + chunk))
-        args = (st, group, beta[:, sl], ac[:, sl], as_[:, sl], frame[:, sl], dur[:, sl], use_taylor)
-        if grad and use_checkpoint:
-            props.append(checkpoint(_run_propagators, *args, use_reentrant=False))
-        else:
-            props.append(_run_propagators(*args))
-    p_all = torch.cat(props, dim=1)  # (B, R, K, M, 14, 14)
+    scal = _scaling(st, beta, ac, as_, frame, dur) if use_taylor else [0] * n_runs
+    # Runs with equal scaling share exponential calls (a long readout no longer forces its squarings on every
+    # short MW segment).
+    props: list[torch.Tensor | None] = [None] * n_runs
+    for sv in sorted(set(scal)):
+        idx = [j for j in range(n_runs) if scal[j] == sv]
+        for i in range(0, len(idx), chunk):
+            cols = torch.as_tensor(idx[i : i + chunk], device=dev)
+            args = (
+                st,
+                group,
+                beta[:, cols],
+                ac[:, cols],
+                as_[:, cols],
+                frame[:, cols],
+                dur[:, cols],
+                use_taylor,
+                sv,
+            )
+            if grad and use_checkpoint:
+                pc = checkpoint(_run_propagators, *args, use_reentrant=False)
+            else:
+                pc = _run_propagators(*args)
+            for c_i, j in enumerate(idx[i : i + chunk]):
+                props[j] = pc[:, c_i]
     r = r0.to(dtype)
     out = []
     for j, run in enumerate(runs):
         if rot[j]:
             r = _rotate(r, cos_t[:, j, None, None], sin_t[:, j, None, None])
-        p = p_all[:, j]
+        p = props[j]
+        assert p is not None
         if run.record:
             # Reset the accumulator, then integrate it over the whole run (accumulator column kept).
             r = (p @ (r * keep)[..., None])[..., 0]
