@@ -31,6 +31,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from glowbox.sim.surrogate.model import (
     _KEEP_COLS,
@@ -43,8 +44,9 @@ from glowbox.sim.surrogate.model import (
 )
 
 _TWO_PI = 2.0 * math.pi
-#: Matrices per exponential call (memory bound, as MAX_EXP_BATCH_GRAD of the bin path).
-MAX_RUN_BATCH = 1 << 16
+#: 14x14 matrices per exponential call (one chunk of runs; memory bound when differentiating: the Taylor
+#: intermediates of one chunk, ~(deg + s) x 2^17 x 784 B ~ 2 GB float32).
+MAX_RUN_BATCH = 1 << 17
 
 
 @dataclass
@@ -70,12 +72,22 @@ def _vec(x: torch.Tensor | float, b: int, dtype: torch.dtype, device: torch.devi
     return t.expand(b) if t.ndim == 0 else t
 
 
-def _expm_batched(x: torch.Tensor, taylor: bool) -> torch.Tensor:
+def _run_propagators(
+    st: Statics,
+    group: torch.Tensor,
+    beta: torch.Tensor,
+    ac: torch.Tensor,
+    as_: torch.Tensor,
+    frame: torch.Tensor,
+    dur: torch.Tensor,
+    taylor: bool,
+) -> torch.Tensor:
+    """exp(L T) for a chunk of runs, controls (B, R): (B, R, K, M, 14, 14)."""
+    lgen = _generator(st, group[:, None].expand_as(beta), beta, ac, as_, frame)
+    x = lgen * dur[..., None, None, None, None]
     flat = x.reshape(-1, N_AUG, N_AUG)
     fn = _expm_taylor if taylor else torch.linalg.matrix_exp
-    if flat.shape[0] <= MAX_RUN_BATCH:
-        return fn(flat).reshape(x.shape)
-    return torch.cat([fn(p) for p in torch.split(flat, MAX_RUN_BATCH)]).reshape(x.shape)
+    return fn(flat).reshape(x.shape)
 
 
 def run_emission(
@@ -85,42 +97,56 @@ def run_emission(
     r0: torch.Tensor,
     *,
     taylor: bool | None = None,
+    use_checkpoint: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Propagate (B, K, M, 14) states ``r0`` through ``runs``; returns (photons per NV of the recorded runs, averaged
     over orientations and detuning nodes with the quadrature weights, (B, n_recorded); final states).
 
     ``group`` (B,) is each sequence's static-field index into ``st``. ``taylor`` defaults to "when gradients are
-    enabled".
+    enabled". The propagators of all runs are built in a few large batched exponentials (chunks of runs; with
+    gradients each chunk is checkpointed: backward recomputes it instead of storing the Taylor intermediates), then
+    the state steps through them run by run.
     """
     b = r0.shape[0]
     dev, dtype = r0.device, st.l0.dtype
-    use_taylor = torch.is_grad_enabled() if taylor is None else taylor
+    grad = torch.is_grad_enabled()
+    use_taylor = grad if taylor is None else taylor
     keep = _KEEP_COLS.to(dtype).to(dev)
+    n_runs = len(runs)
+    if n_runs == 0:
+        return torch.zeros(b, 0, dtype=dtype, device=dev), r0
+
+    def col(name: str, dt: torch.dtype) -> torch.Tensor:
+        return torch.stack([_vec(getattr(r, name), b, dt, dev) for r in runs], dim=1)  # (B, R)
+
+    beta, ac, as_ = col("beta", dtype), col("ac", dtype), col("as_", dtype)
+    frame, start = col("frame_hz", torch.float64), col("start_s", torch.float64)
+    dur = col("duration_s", dtype)
+    df = torch.diff(frame, dim=1, prepend=frame[:, :1])
+    theta = torch.remainder(_TWO_PI * df * start, _TWO_PI)
+    rot = (theta != 0).any(0).tolist()
+    cos_t, sin_t = torch.cos(theta).to(dtype), torch.sin(theta).to(dtype)
+    k, m = st.weights.shape
+    per_run = max(1, b * k * m)
+    chunk = max(1, MAX_RUN_BATCH // per_run)
+    props = []
+    for i in range(0, n_runs, chunk):
+        sl = slice(i, min(n_runs, i + chunk))
+        args = (st, group, beta[:, sl], ac[:, sl], as_[:, sl], frame[:, sl], dur[:, sl], use_taylor)
+        if grad and use_checkpoint:
+            props.append(checkpoint(_run_propagators, *args, use_reentrant=False))
+        else:
+            props.append(_run_propagators(*args))
+    p_all = torch.cat(props, dim=1)  # (B, R, K, M, 14, 14)
     r = r0.to(dtype)
     out = []
-    prev_f: torch.Tensor | None = None
-    for run in runs:
-        f = _vec(run.frame_hz, b, torch.float64, dev)
-        if prev_f is not None:
-            t0 = _vec(run.start_s, b, torch.float64, dev)
-            theta = torch.remainder(_TWO_PI * (f - prev_f) * t0, _TWO_PI)
-            if bool((theta != 0).any()):
-                r = _rotate(r, torch.cos(theta).to(dtype)[:, None, None], torch.sin(theta).to(dtype)[:, None, None])
-        prev_f = f
-        lgen = _generator(
-            st,
-            group,
-            _vec(run.beta, b, dtype, dev),
-            _vec(run.ac, b, dtype, dev),
-            _vec(run.as_, b, dtype, dev),
-            f,
-        )  # (B, K, M, 14, 14)
-        dur = _vec(run.duration_s, b, dtype, dev)
-        p = _expm_batched(lgen * dur[:, None, None, None, None], use_taylor)
+    for j, run in enumerate(runs):
+        if rot[j]:
+            r = _rotate(r, cos_t[:, j, None, None], sin_t[:, j, None, None])
+        p = p_all[:, j]
         if run.record:
-            # Reset the accumulator, then integrate it over the whole run (column kept).
-            r = r * keep
-            r = (p @ r[..., None])[..., 0]
+            # Reset the accumulator, then integrate it over the whole run (accumulator column kept).
+            r = (p @ (r * keep)[..., None])[..., 0]
             out.append(torch.einsum("bkm,km->b", r[..., ACC], st.weights))
         else:
             r = ((p * keep) @ r[..., None])[..., 0]
