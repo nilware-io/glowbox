@@ -920,7 +920,8 @@ def report_body(
     a("")
     a(
         "  A frozen readout that degrades means it relies on the exact pulse areas the encoder produced at "
-        "calibration (Rabi-scale structure: a 10-30 ns change is 5-30 % of a Rabi period at these amplitudes); a "
+        "calibration (Rabi-scale structure: the Rabi period is ~120 ns at full amplitude and longer below, so a "
+        "30 ns change is up to a quarter of a period); a "
         "retrained readout that does not degrade means the shifted encoding is just another random encoding, equally "
         "informative. Verdicts: `readout_relies_on_pulse_timing` = "
         f"**{tv['readout_relies_on_pulse_timing']}**, `information_needs_exact_timing` = "
