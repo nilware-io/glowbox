@@ -120,6 +120,13 @@ class TimeBinLinear(nn.Module):
 
 
 Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+#: ``loss(mean, log_var, target) -> scalar``; the default is :func:`gaussian_nll`.
+LossFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def bce_logits_loss(mean: torch.Tensor, log_var: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Binary cross-entropy with the model's mean output as logits (bit targets in {0, 1}); log_var unused."""
+    return nn.functional.binary_cross_entropy_with_logits(mean, target)
 
 
 @dataclass
@@ -150,9 +157,14 @@ def train_decoder(
     val_batches: list[Batch],
     config: TrainConfig,
     log: Callable[[int, dict[str, float]], None] | None = None,
+    loss: LossFn | None = None,
 ) -> TrainHistory:
     """Train with AdamW + cosine decay on fresh batches ``sample(step) -> (x, c, y)``; keep the weights with the
-    best validation NLL (on the fixed ``val_batches``). Returns the history; ``model`` ends at the best weights."""
+    best validation loss (on the fixed ``val_batches``). Returns the history; ``model`` ends at the best weights.
+
+    ``loss`` replaces the Gaussian NLL (e.g. :func:`bce_logits_loss` for bit recall); the MSE warm-up applies only
+    to the default loss."""
+    loss_fn = loss or gaussian_nll
     import time
 
     opt = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -169,21 +181,21 @@ def train_decoder(
         model.train()
         x, c, y = sample(step)
         mean, log_var = model(x, c)
-        loss = ((mean - y) ** 2).mean() if step <= warm else gaussian_nll(mean, log_var, y)
+        value = ((mean - y) ** 2).mean() if loss is None and step <= warm else loss_fn(mean, log_var, y)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        value.backward()
         nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         opt.step()
         sched.step()
-        running += float(loss.detach())
+        running += float(value.detach())
         if step % config.eval_every == 0 or step == config.steps:
-            nll, rmse = evaluate_nll(model, val_batches)
+            nll, rmse = evaluate_nll(model, val_batches, loss)
             hist.step.append(step)
             hist.train_loss.append(running / config.eval_every)
             hist.val_nll.append(nll)
             hist.val_rmse.append(rmse)
             running = 0.0
-            if step > warm and nll < best:
+            if (step > warm or loss is not None) and nll < best:
                 best, hist.best_step = nll, step
                 best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             if log is not None:
@@ -194,13 +206,14 @@ def train_decoder(
 
 
 @torch.no_grad()
-def evaluate_nll(model: nn.Module, batches: list[Batch]) -> tuple[float, float]:
-    """(mean NLL, RMSE over components) in network units."""
+def evaluate_nll(model: nn.Module, batches: list[Batch], loss: LossFn | None = None) -> tuple[float, float]:
+    """(mean loss (default: Gaussian NLL), RMSE of the means over components) in network units."""
+    loss_fn = loss or gaussian_nll
     model.eval()
     nll, se, n = 0.0, 0.0, 0
     for x, c, y in batches:
         mean, log_var = model(x, c)
-        nll += float(gaussian_nll(mean, log_var, y)) * y.shape[0]
+        nll += float(loss_fn(mean, log_var, y)) * y.shape[0]
         se += float(((mean - y) ** 2).mean()) * y.shape[0]
         n += y.shape[0]
     return nll / n, math.sqrt(se / n)
