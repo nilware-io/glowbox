@@ -256,7 +256,7 @@ class ForecastTask:
         rc = self.cfg["reservoir"]
         pre, suf = reservoir_sequences(rc, enc, u, offset_hz, shift)
         t0 = time.perf_counter()
-        m = simulate_suffixes(pre, suf, sd.env, laser_bins(suf), options=self.options, device=self.device, chunk=2048)
+        m = simulate_suffixes(pre, suf, sd.env, laser_bins(suf), options=self.options, device=self.device)
         self.seconds["reservoir"] += time.perf_counter() - t0
         s = float(rc["shots"])
         out: np.ndarray = np.random.default_rng([self.base_seed, seed, 5, key]).poisson(m * s) / s

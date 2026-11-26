@@ -58,8 +58,11 @@ from glowbox.sim.interface import EnvParams
 from glowbox.sim.surrogate.model import ModelOptions
 from glowbox.sim.surrogate.sweeps import branched_rate_cps
 
-#: Sequences per surrogate call in :func:`simulate_suffixes` (memory: B x 4 axes x M nodes x 14 reals per bin).
-DEFAULT_CHUNK = 1024
+#: Sequences per surrogate call in :func:`simulate_suffixes`. Memory is dominated by the distinct propagators: with
+#: random encodings every segment of every sequence is distinct, B x segments x 4 axes x M nodes x 14 x 14 floats
+#: (256 x 16 x 128 x 784 B = 0.4 GB at M = 32, plus matrix-exponential workspace). Larger chunks spilled a 16 GB GPU
+#: into shared host memory (Windows), which is an order of magnitude slower.
+DEFAULT_CHUNK = 256
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:

@@ -228,24 +228,30 @@ class DrivenSeries:
         n_quad: int = 16,
         options: ModelOptions | None = None,
         device: torch.device | str | None = None,
+        chunk: int = 256,
     ) -> np.ndarray:
         """E[next reading per shot | z_k, spin state after cycle k], (n,): Gauss-Hermite average over the drive
-        innovation z_{k+1} = rho z_k + sqrt(1 - rho^2) xi, xi ~ N(0, 1)."""
+        innovation z_{k+1} = rho z_k + sqrt(1 - rho^2) xi, xi ~ N(0, 1). ``chunk`` windows (x ``n_quad`` one-cycle
+        sequences, each with its own propagator) per surrogate call."""
         x, w = np.polynomial.hermite_e.hermegauss(n_quad)
         w = w / w.sum()
         n = z_prev.shape[0]
-        z = self.rho * z_prev[:, None] + np.sqrt(1 - self.rho**2) * x[None]  # (n, J)
-        amps = (self.amp_center + self.amp_scale * np.tanh(z)).ravel()
-        ca = self.cycle_arrays(amps, line_hz, offset_hz)
-        r0 = state.repeat_interleave(n_quad, dim=0)
         opt = options or ModelOptions()
-        with torch.no_grad():
-            em, _ = emission_and_state(ca, env, options=opt, device=device, initial_state=r0)
         nm = self.mw_ns // self.grid_ns
-        em_ro = em[:, nm : nm + self.readout_bins]
-        rate = env.collection_efficiency * env.n_nv * em_ro + env.background_cps + env.dark_cps  # laser on
-        reading = (rate.sum(dim=1) * self.grid_ns * 1e-9).double().cpu().numpy().reshape(n, n_quad)
-        out: np.ndarray = reading @ w
+        out = np.empty(n)
+        for i in range(0, n, chunk):
+            zc = z_prev[i : i + chunk]
+            m = zc.shape[0]
+            z = self.rho * zc[:, None] + np.sqrt(1 - self.rho**2) * x[None]  # (m, J)
+            amps = (self.amp_center + self.amp_scale * np.tanh(z)).ravel()
+            ca = self.cycle_arrays(amps, line_hz, offset_hz)
+            r0 = state[i : i + chunk].repeat_interleave(n_quad, dim=0)
+            with torch.no_grad():
+                em, _ = emission_and_state(ca, env, options=opt, device=device, initial_state=r0)
+            em_ro = em[:, nm : nm + self.readout_bins]
+            rate = env.collection_efficiency * env.n_nv * em_ro + env.background_cps + env.dark_cps  # laser on
+            reading = (rate.sum(dim=1) * self.grid_ns * 1e-9).double().cpu().numpy().reshape(m, n_quad)
+            out[i : i + m] = reading @ w
         return out
 
     def latent(self, amps: np.ndarray) -> np.ndarray:
