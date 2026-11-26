@@ -34,12 +34,15 @@ compress-and-reconstruct; Task 1 re-run with a learned sensor protocol; the quan
 an MLP; mean over 5 seeds with 95 % t CIs. Learned encoder (blue) vs the same parametrisation fixed at random
 (milestone-3 reservoir, orange), noiseless PCA and a noiseless K-number autoencoder; detuned: dashed.*
 
-- Task 4, K = 2 readouts, 10^4 shots: NMSE 0.047 [0.036, 0.057] with the learned encoder, 0.73 [0.57, 0.89] with
-  the fixed random one; linear PCA with two noiseless numbers 0.305, a noiseless two-number autoencoder 0.0044.
-  Detuned 400 MHz, both fall to the mean patch (0.998 / 1.000); gap 0.951 [0.940, 0.962] (learned).
-- The learned strategy uses Rabi-scale timing: shifting every MW duration by 20 ns multiplies its error by 9 with
-  the decoder frozen and by 2.8 with the decoder retrained; scrambling the segment phases doubles it (coherent
-  rotations within T2*). Learned sequences run on the QuTiP reference agree to 1e-5.
+- Task 4, K = 2 readouts, 10^4 shots (banks and evaluation at 32 T2* quadrature nodes, converged against 64):
+  NMSE 0.047 [0.037, 0.058] with the learned encoder, 0.72 [0.56, 0.88] with the fixed random one; linear PCA
+  with two noiseless numbers 0.305, a noiseless two-number autoencoder 0.0044. Detuned 400 MHz, both fall to the
+  mean patch (0.998 / 1.000; the learned arm's tiny residual is off-resonant drive and vanishes at 800 MHz); gap
+  0.950 [0.939, 0.962] (learned).
+- The learned strategy relies on Rabi rotation angles: shifting every MW duration by 20 ns multiplies its error by
+  9 with the decoder frozen and by 2.7 with the decoder retrained, the same area change made with the amplitude
+  costs as much, and scrambling the segment phases doubles it (coherent rotations within T2*). Learned sequences
+  run on the QuTiP reference agree to 1e-5.
 - Task 1 with a learned sensor protocol (40 points; the encoder sets amplitude, phase, frequency and duration of two
   MW segments per point, starting from milestone 2's pulsed ODMR): 75.7 [71.8, 79.6] uT at 1000 shots per point
   against 364 [348, 379] uT for the fixed pulsed protocol and 60.1 [50.8, 69.5] uT for fixed CW on the same grid,
@@ -52,7 +55,7 @@ an MLP; mean over 5 seeds with 95 % t CIs. Learned encoder (blue) vs the same pa
   duration gradients), `glowbox/learn/autoencoder.py` (Task 4), `glowbox/learn/sensor.py` (learned sensor
   protocol). Notes: [docs/notes/encoder.md](docs/notes/encoder.md).
 
-Run (RTX 5070 Ti: Task 4 ~105 min, Task 1 ~156 min; `--quick` a few minutes on a CPU):
+Run (RTX 5070 Ti: Task 4 ~105 min, Task 1 ~156 min; `--quick` ~10 min each on a 32-core CPU, much longer on a laptop):
 
     uv run python -m glowbox.experiments.m4_autoencoder --quick
     uv run python -m glowbox.experiments.m4_learned_sensor --quick

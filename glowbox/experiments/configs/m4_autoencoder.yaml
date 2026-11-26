@@ -2,7 +2,7 @@
 # the NV ensemble's gated readouts are the bottleneck, a decoder reconstructs the patch; trained end to end through
 # the differentiable surrogate. Baseline: the same encoder parametrisation fixed at random (reservoir). Quantum
 # test: every MW frequency + 400 MHz, trained and evaluated the same way.
-# Run: uv run python -m glowbox.experiments.m4_autoencoder  (add --quick for a smoke run: ~6 min on a 32-core CPU)
+# Run: uv run python -m glowbox.experiments.m4_autoencoder  (add --quick for a smoke run: ~10 min on a 32-core CPU)
 name: m4-autoencoder
 seed: 20261128
 seeds: [0, 1, 2, 3, 4]        # each seed: its own device (nuisance draw), data, initialisation and noise
