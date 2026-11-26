@@ -32,13 +32,18 @@ test). Report: [docs/results/m2-field-estimation.md](docs/results/m2-field-estim
 sweep point, CW and pulsed ODMR, mean over 5 seeds with 95 % CIs. Detuned (dashed): every estimator falls to the
 prior.*
 
-- At 1000 shots per point the CNN decoder reaches 11.9 [11.4, 12.4] µT (CW) and 26.3 [23.5, 29.1] µT (pulsed); the
-  physics fit (Lorentzian dips at the H0 transitions of a trial field) 13.5 / 18.6 µT; the linear time-bin
-  baseline ~400 µT; prior only 830 µT. The CNN's uncertainty is calibrated (error/sigma RMS 1.0-1.15).
+- At 1000 shots per point the CNN decoder reaches 11.9 [11.0, 12.9] µT (CW) and 26.4 [21.1, 31.8] µT (pulsed;
+  95 % Student-t CIs over 5 seeds); the linear time-bin baseline ~400 µT; prior only 830 µT. The physics fit
+  (Lorentzian dips at the H0 transitions of a trial field, seed 0, same 300 fields) is as good or better than the
+  CNN at 100-300 shots (CW) and 300-1000 shots (pulsed, typical case; 18.6 vs 35.9 µT RMSE at 1000); the CNN wins
+  where the fit finds few dips (<= 30 shots CW, <= 100 pulsed) and on RMSE at >= 1000 (CW) / 3000 (pulsed) shots.
+  The CNN's uncertainty is well calibrated below 1000 shots and 5-16 % over-confident at >= 1000.
 - Quantum test: with the microwaves 400 MHz off resonance every learned estimator drops to the prior (skill
-  ~0); gap 819 [817, 820] µT (CW CNN), 804 [801, 807] µT (pulsed CNN). The pulsed decoder relies on its pulse
-  being a pi pulse (error 8-14x higher at 110 / 510 ns instead of 310 ns, flat when detuned): it uses Rabi
-  timing. The decoders agree on QuTiP-reference inputs to < 0.02 µT.
+  ~0); gap 819 [816, 822] µT (CW CNN), 804 [798, 810] µT (pulsed CNN). Timing: no timing is learned in M2 (fixed
+  protocols). The hand-designed pulsed protocol relies on its pi pulse (`protocol_uses_rabi_timing`: frozen-decoder
+  error 8-14x higher at 110 / 510 ns, which mixes contrast loss and distribution shift); what the decoder learned
+  is a readout time-bin weighting that follows the spin-contrast transient (saliency vs contrast r = 0.98). The
+  decoders agree on QuTiP-reference inputs to < 0.02 µT.
 - Code: `glowbox/learn/field_data.py` (priors, protocols, surrogate datasets), `glowbox/learn/decoder.py`
   (1D CNN + Gaussian NLL, linear time-bin baseline), `glowbox/analysis/field_fit.py` (physics fit),
   `glowbox/analysis/quantum_test.py` (the reusable quantum-test harness), surrogate fast paths for sweeps
