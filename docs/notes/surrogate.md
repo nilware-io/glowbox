@@ -62,6 +62,14 @@ Exact reformulations for frequency sweeps, used to generate Task 1 datasets (tes
   continue each sweep point from its final state. Exact (1e-14 in float64), because without MW the state carries
   no 0~/+-~ coherence, so the frame frequency and the absolute-time origin of the frame are unobservable at the
   cut. A 200-point pulsed ODMR sweep then costs its 91 suffix bins instead of 341 bins per point.
+  The suffix's MW phases are then relative to the suffix start. With one MW frequency that is only a global phase;
+  with several (the milestone-3 reservoir encoder) the full sequence that is the same experiment has the absolute
+  phases phi - 2 pi f T_pre (T_pre the prefix length): `glowbox.learn.reservoir.full_sequence` writes it, and
+  tests/learn/test_reservoir.py checks it against the branched run (and that the naive phases differ).
+- Cycle-wise continuation (`DrivenSeries.states_after_cycles`, milestone 3): a sequence with a single MW frequency
+  and phase can be cut anywhere, coherence or not, because the rotating frame is then continuous across the cut
+  (1e-14 against the full run, tests/learn/test_forecast.py). It gives the state after every cycle, from which the
+  Task 3 oracle branches over the next drive value.
 
 ## Differentiability
 
