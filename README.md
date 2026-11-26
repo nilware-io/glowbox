@@ -23,6 +23,40 @@ GPU-machine workflow: [docs/dev.md](docs/dev.md). Physics spec: [docs/physics.md
 
 ## Status
 
+**Milestone 4 done** (a learned pulse encoder trained end to end through the differentiable surrogate; Task 4,
+compress-and-reconstruct; Task 1 re-run with a learned sensor protocol; the quantum test for both). Reports:
+[docs/results/m4-autoencoder.md](docs/results/m4-autoencoder.md),
+[docs/results/m4-learned-sensor.md](docs/results/m4-learned-sensor.md).
+
+![Task 4: reconstruction error vs the number of readouts and vs shots](docs/results/figures/m4-autoencoder-nmse.png)
+
+*Task 4: 4x4 edge patches written by a learned encoder into MW blocks, read back as K gated photon counts, decoded by
+an MLP; mean over 5 seeds with 95 % t CIs. Learned encoder (blue) vs the same parametrisation fixed at random
+(milestone-3 reservoir, orange), noiseless PCA and a noiseless K-number autoencoder; detuned: dashed.*
+
+- Task 4, K = 2 readouts, 10^4 shots: NMSE 0.047 [0.036, 0.057] with the learned encoder, 0.73 [0.57, 0.89] with
+  the fixed random one; linear PCA with two noiseless numbers 0.305, a noiseless two-number autoencoder 0.0044.
+  Detuned 400 MHz, both fall to the mean patch (0.998 / 1.000); gap 0.951 [0.940, 0.962] (learned).
+- The learned strategy uses Rabi-scale timing: shifting every MW duration by 20 ns multiplies its error by 9 with
+  the decoder frozen and by 2.8 with the decoder retrained; scrambling the segment phases doubles it (coherent
+  rotations within T2*). Learned sequences run on the QuTiP reference agree to 1e-5.
+- Task 1 with a learned sensor protocol (40 points; the encoder sets amplitude, phase, frequency and duration of two
+  MW segments per point, starting from milestone 2's pulsed ODMR): 75.7 [71.8, 79.6] uT at 1000 shots per point
+  against 364 [348, 379] uT for the fixed pulsed protocol and 60.1 [50.8, 69.5] uT for fixed CW on the same grid,
+  same decoder recipe. It learned stronger, frequency-split composite pulses and switched off points the field
+  prior never needs. It beats CW at <= 100 shots but not at high shots (it controls only the MW, not the laser).
+  Detuned, all fall to the prior (833 uT); it relies on its pulse timing (+330 % error at +-50 ns, frozen decoder)
+  and on coherent phases between its segments.
+- Code: `glowbox/learn/encoder.py` (bounded pulse parametrisation, grid durations with straight-through gradients),
+  `glowbox/sim/surrogate/runs.py` (run-length surrogate path: one propagator per pulse or readout window, exact
+  duration gradients), `glowbox/learn/autoencoder.py` (Task 4), `glowbox/learn/sensor.py` (learned sensor
+  protocol). Notes: [docs/notes/encoder.md](docs/notes/encoder.md).
+
+Run (RTX 5070 Ti: Task 4 ~105 min, Task 1 ~156 min; `--quick` a few minutes on a CPU):
+
+    uv run python -m glowbox.experiments.m4_autoencoder --quick
+    uv run python -m glowbox.experiments.m4_learned_sensor --quick
+
 **Milestone 3 done** (reservoir baseline; Task 2, store a bit pattern in the pulse response and recall it; Task 3,
 predict the next fluorescence reading; the quantum test for both). Reports:
 [docs/results/m3-bit-memory.md](docs/results/m3-bit-memory.md),
@@ -122,5 +156,5 @@ Run milestone 1:
 
 Tests: `uv run pytest` (about 2-3 minutes; CUDA tests are skipped without a GPU, slow ones need `-m slow`).
 
-Next: the remaining phase-2 learners and tasks (an encoder trained through the differentiable surrogate, the RL
-agent; Task 4, and Tasks 2-3 with learned encodings), each with the quantum test.
+Next: the remaining phase-2 learners (the RL agent, adaptive measurement), Tasks 2-3 with learned encodings, and
+the phase-3 DeepDream experiments, each with the quantum test.
