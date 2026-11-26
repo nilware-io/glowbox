@@ -68,7 +68,7 @@ from glowbox.learn.decoder import (
     predict,
     train_decoder,
 )
-from glowbox.learn.field_data import FieldPrior, features, log_shots, sample_shots
+from glowbox.learn.field_data import FieldPrior, log_shots, sample_shots
 from glowbox.learn.reservoir import EncoderSpec, RidgeReadout, full_sequence
 from glowbox.sim.interface import EnvParams
 from glowbox.sim.surrogate import SurrogateSimulator
@@ -117,6 +117,22 @@ def _tgen(device: torch.device, *key: int) -> torch.Generator:
     g = torch.Generator(device=device)
     g.manual_seed(int(np.random.default_rng(list(key)).integers(2**62)))
     return g
+
+
+class LevelDecoder(torch.nn.Module):
+    """A :class:`ConvDecoder` on counts per shot relative to a fixed reference (the codebook's mean template):
+    ``10 (x / ref - 1)``. Unlike ``field_data.features`` (normalised by the sample's own mean, M2, where brightness
+    was a nuisance), the overall level is kept: each seed is one device, and the pattern changes the level."""
+
+    def __init__(self, ref: torch.Tensor, net: ConvDecoder) -> None:
+        super().__init__()
+        self.register_buffer("ref", ref)
+        self.net = net
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        ref = self.get_buffer("ref")
+        out: tuple[torch.Tensor, torch.Tensor] = self.net(10.0 * (x / ref - 1.0), c)
+        return out
 
 
 @dataclasses.dataclass
@@ -220,8 +236,8 @@ class MemoryTask:
         )
         t_bins = cb.templates.shape[1]
         torch.manual_seed(int(np.random.default_rng([self.base_seed, seed, cb.patterns.shape[1], 7]).integers(2**31)))
-        model = ConvDecoder(1, t_bins, cb.patterns.shape[1], dcfg).to(self.device)
         tm = torch.as_tensor(cb.templates, dtype=torch.float32, device=self.device)[:, None, :]
+        model = LevelDecoder(tm.mean(dim=0), ConvDecoder(1, t_bins, cb.patterns.shape[1], dcfg)).to(self.device)
         pt = torch.as_tensor(cb.patterns, dtype=torch.float32, device=self.device)
         lo, hi = float(c["shots_min"]), float(c["shots_max"])
         g = _tgen(self.device, self.base_seed, seed, cb.patterns.shape[1], 8)
@@ -230,7 +246,7 @@ class MemoryTask:
             idx = torch.randint(0, tm.shape[0], (n,), generator=gen, device=self.device)
             shots = sample_shots(n, lo, hi, gen, self.device)
             counts = torch.poisson(tm[idx] * shots[:, None, None], generator=gen)
-            return features(counts), log_shots(shots), pt[idx]
+            return counts / shots[:, None, None], log_shots(shots), pt[idx]
 
         gv = _tgen(self.device, self.base_seed, seed, cb.patterns.shape[1], 9)
         val = [batch(256, gv) for _ in range(max(1, int(c["n_val"]) // 256))]
@@ -249,7 +265,7 @@ class MemoryTask:
         return model
 
     def cnn_bits(self, model: torch.nn.Module, counts: torch.Tensor, shots: float) -> np.ndarray:
-        x = features(counts[:, None, :])
+        x = counts[:, None, :] / float(shots)
         c = log_shots(torch.full((counts.shape[0],), float(shots), device=self.device))
         logits, _ = predict(model, x, c)
         return (logits > 0).cpu().numpy().astype(np.int64)
@@ -399,7 +415,7 @@ class MemoryTask:
             return
         cb = self.books[("resonant", 0, self.h_arm, self.h_bits, self.h_delay)]
         _, counts = self.draws(cb, 1024, self.h_shots, self.base_seed, 0, 55)
-        x = features(counts[:, None, :])
+        x = counts[:, None, :] / float(self.h_shots)
         c = log_shots(torch.full((counts.shape[0],), float(self.h_shots), device=self.device))
         sal = input_saliency(self.models[key], x, c, lambda m: m.abs().sum(dim=1))[0]
         contrast = cb.templates.std(axis=0) / cb.templates.mean(axis=0)
@@ -813,7 +829,9 @@ def report_body(
     )
     c = cfg["cnn"]
     a(
-        f"- **CNN decoder** (`ConvDecoder`, one logit per bit, BCE): input = counts / own mean (brightness removed), "
+        "- **CNN decoder** (`ConvDecoder`, one logit per bit, BCE): input = counts per shot relative to the "
+        "codebook's mean template (`LevelDecoder`: the level is kept, since each seed is one device and the pattern "
+        "changes the level), "
         f"conditioned on log10(shots); trained {c['steps']} steps of {c['batch']} on fresh Poisson noise, shots "
         f"log-uniform in [{c['shots_min']}, {c['shots_max']}], best validation loss kept. Trained on the no-read-pulse "
         f"arm at (L, delay) = {', '.join(f'({b}, {d} ns)' for b, d in task.cnn_pairs)}."
