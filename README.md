@@ -43,19 +43,21 @@ an MLP; mean over 5 seeds with 95 % t CIs. Learned encoder (blue) vs the same pa
   9 with the decoder frozen and by 2.7 with the decoder retrained, the same area change made with the amplitude
   costs as much, and scrambling the segment phases doubles it (coherent rotations within T2*). Learned sequences
   run on the QuTiP reference agree to 1e-5.
-- Task 1 with a learned sensor protocol (40 points; the encoder sets amplitude, phase, frequency and duration of two
-  MW segments per point, starting from milestone 2's pulsed ODMR): 75.7 [71.8, 79.6] uT at 1000 shots per point
-  against 364 [348, 379] uT for the fixed pulsed protocol and 60.1 [50.8, 69.5] uT for fixed CW on the same grid,
-  same decoder recipe. It learned stronger, frequency-split composite pulses and switched off points the field
-  prior never needs. It beats CW at <= 100 shots but not at high shots (it controls only the MW, not the laser).
-  Detuned, all fall to the prior (833 uT); it relies on its pulse timing (+330 % error at +-50 ns, frozen decoder)
-  and on coherent phases between its segments.
+- Task 1 with a learned sensor protocol (40 points, 5 MHz apart; the encoder sets amplitude, phase, frequency and
+  duration of two MW segments per point, starting from a pulsed ODMR whose pulse was tuned for this grid on
+  validation fields: amplitude 0.6, 100 ns): at 1000 shots per point 69.1 [66.6, 71.7] uT, the same as the tuned
+  pulse (69.7 [63.2, 76.2]); fixed CW 57.2 [51.9, 62.5]; milestone 2's untuned pi pulse 364. Learning helps at
+  low shots (272 vs 414 uT at 100) and hurts at high shots (42.0 vs 31.4 uT at 5000, where the tuned pulse also
+  beats CW, 37.4, including at equal wall time). It chose a stronger, shorter, slightly under-pi pulse and turned
+  down points the field prior never needs. Detuned, all fall to the prior (834 uT); like the tuned pulse it relies
+  on its pulse areas (+-50 ns: 12.6x error frozen, 6.4x retrained; the same area change by amplitude costs as
+  much).
 - Code: `glowbox/learn/encoder.py` (bounded pulse parametrisation, grid durations with straight-through gradients),
   `glowbox/sim/surrogate/runs.py` (run-length surrogate path: one propagator per pulse or readout window, exact
   duration gradients), `glowbox/learn/autoencoder.py` (Task 4), `glowbox/learn/sensor.py` (learned sensor
   protocol). Notes: [docs/notes/encoder.md](docs/notes/encoder.md).
 
-Run (RTX 5070 Ti: Task 4 ~105 min, Task 1 ~156 min; `--quick` ~10 min each on a 32-core CPU, much longer on a laptop):
+Run (RTX 5070 Ti: Task 4 ~2 h, Task 1 ~6.4 h; `--quick` ~10 min each on a 32-core CPU, much longer on a laptop):
 
     uv run python -m glowbox.experiments.m4_autoencoder --quick
     uv run python -m glowbox.experiments.m4_learned_sensor --quick
