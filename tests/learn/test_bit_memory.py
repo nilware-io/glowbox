@@ -82,5 +82,7 @@ def test_bce_training_learns_a_bit():
         return x, torch.zeros(64), y
 
     val = [sample(0)]
-    hist = train_decoder(model, sample, val, TrainConfig(steps=150, eval_every=50, mse_warmup=0.0), loss=bce_logits_loss)
+    hist = train_decoder(
+        model, sample, val, TrainConfig(steps=150, eval_every=50, mse_warmup=0.0), loss=bce_logits_loss
+    )
     assert min(hist.val_nll) < 0.4  # BCE well below log 2 = 0.69
