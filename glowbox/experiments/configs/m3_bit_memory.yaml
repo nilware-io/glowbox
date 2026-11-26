@@ -1,0 +1,76 @@
+# Milestone 3, Task 2: store a short bit pattern in the pulse response and recall it, with the reservoir readout
+# (ridge), a CNN decoder, the Bayes-optimal (oracle) readout and the quantum test (resonant vs detuned MW).
+# Run: uv run python -m glowbox.experiments.m3_bit_memory  (add --quick for a few-minute CPU smoke run)
+name: m3-bit-memory
+seed: 20261127
+# Quantum-test seeds (>= 5). Each seed is its own device (nuisance draw), its own random encoder, initialisation
+# and noise; both conditions of a seed share them (paired design).
+seeds: [0, 1, 2, 3, 4]
+detuned_offset_hz: 4.0e+8     # every MW frequency + 400 MHz (write block and read pulse)
+
+device:
+  bias_field_t: [1.2e-3, 0.7e-3, 2.5e-3]   # known static field: eight distinct lines (as milestone 1)
+  prior:                      # nuisance ranges per seed (glowbox.learn.field_data.FieldPrior, assumptions)
+    t2_star_s: [0.5e-6, 2.0e-6]
+    rabi_full_scale_hz: [8.0e+6, 12.0e+6]
+    optical_beta_full_scale: [0.07, 0.13]
+    collection_efficiency: [2.0e-3, 4.0e-3]
+    background_cps: [5.0e+3, 2.0e+4]
+    e_hz: [0.0, 3.0e+5]
+  n_detuning: 32              # T2* quadrature, quantile rule (pulsed protocol; revival after ~2 M T2* >= 32 us)
+
+protocol:                     # glowbox.learn.bit_memory.MemoryProtocol
+  init_ns: 1500
+  settle_ns: 1000
+  readout_ns: 1000
+  read_amplitude: 0.5         # the optional read pulse: ~pi/2 at the nominal full scale (f_R 4.1 MHz, 60 ns)
+  read_ns: 60
+  read_line: 0
+encoder:                      # glowbox.learn.reservoir.EncoderSpec (n_inputs = number of bits)
+  n_segments: 8
+  slot_ns: 100
+  min_ns: 10
+  max_ns: 100
+  amp_lo: 0.05
+  amp_hi: 1.0
+  freq_span_hz: 4.0e+6
+  gain: 1.5
+
+grid:
+  bits: [1, 2, 4, 8, 12]
+  delays_ns: [100, 1000, 3000, 10000]
+  # "none": readout only (populations); "pi2": the fixed read pulse first (also reads stored coherence)
+  read_arms: [none, pi2]
+  shots: [1000, 10000, 100000]
+headline: {bits: 4, delay_ns: 1000, shots: 10000, read: none}
+
+ridge:
+  n_train: 8192
+  n_test: 4096
+cnn:                          # trained on the "none" arm at these (bits, delay_ns); fresh noise every step
+  pairs: [[1, 1000], [2, 1000], [4, 1000], [8, 1000], [12, 1000], [4, 100], [4, 3000], [4, 10000]]
+  shots_min: 300
+  shots_max: 300000
+  steps: 2500
+  batch: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  eval_every: 250
+  n_val: 2048
+decoder: {mix_channels: 8, channels: [32, 64, 128], kernel: 7, hidden: 256}
+
+timing:                       # headline protocol, every seed: every MW duration of the write block shifted
+  duration_shifts_ns: [-30, -20, -10, 0, 10, 20, 30]
+
+reference:                    # QuTiP check, seed 0 resonant, headline bits and delay, both read arms
+  n_patterns: 8
+  workers: 16
+
+quick:
+  device: {n_detuning: 8}
+  grid: {bits: [1, 2, 4], delays_ns: [100, 1000], shots: [1000, 10000]}
+  ridge: {n_train: 1024, n_test: 512}
+  cnn: {pairs: [[2, 1000], [4, 1000]], steps: 150, eval_every: 50, batch: 64, n_val: 256}
+  decoder: {channels: [16, 32], hidden: 64}
+  timing: {duration_shifts_ns: [-20, 0, 20]}
+  reference: {n_patterns: 2, workers: 4}
