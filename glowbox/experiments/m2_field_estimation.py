@@ -1076,7 +1076,7 @@ def _levels(xs: list[int]) -> str:
 
 def fit_vs_cnn_conclusion(rows: list[dict[str, Any]]) -> str:
     """Per protocol: at which shot levels the fit or the CNN is better (paired CI excludes 0), by RMSE and median."""
-    parts = []
+    parts, short = [], []
     for kind in KINDS:
         rs = sorted((r for r in rows if r["protocol"] == kind), key=lambda r: r["shots"])
         if not rs:
@@ -1091,24 +1091,35 @@ def fit_vs_cnn_conclusion(rows: list[dict[str, Any]]) -> str:
         tails = [
             f"{r['shots']} ({100 * (1 - r['ok_fraction']):.0f} % failed fits)"
             for r in rs
-            if int(r["shots"]) in verdict["rmse_diff"]["cnn"] and int(r["shots"]) in verdict["median_diff"]["fit"]
+            if int(r["shots"]) in verdict["median_diff"]["fit"] and int(r["shots"]) not in verdict["rmse_diff"]["fit"]
         ]
         s = (
             f"**{kind}**: by RMSE the fit is better at {_levels(verdict['rmse_diff']['fit'])} shots, the CNN at "
             f"{_levels(verdict['rmse_diff']['cnn'])}, no significant difference at "
             f"{_levels(verdict['rmse_diff']['tie'])}; by median (typical case) the fit is better at "
-            f"{_levels(verdict['median_diff']['fit'])}, the CNN at {_levels(verdict['median_diff']['cnn'])}"
+            f"{_levels(verdict['median_diff']['fit'])}, the CNN at {_levels(verdict['median_diff']['cnn'])}, no "
+            f"significant difference at {_levels(verdict['median_diff']['tie'])}"
         )
         if tails:
-            s += "; where the CNN wins on RMSE but the fit on median, the fit's RMSE comes from its tail: " + ", ".join(
-                tails
+            s += (
+                "; where the fit wins on median but not on RMSE, a minority of large fit errors (failed fits, "
+                "mis-assigned lines, shape bias) carries its RMSE: " + ", ".join(tails)
             )
         parts.append(s + ".")
+        as_good_rmse = sorted(verdict["rmse_diff"]["fit"] + verdict["rmse_diff"]["tie"])
+        as_good_med = sorted(verdict["median_diff"]["fit"] + verdict["median_diff"]["tie"])
+        short.append(
+            f"{kind}: as good or better by RMSE at {_levels(as_good_rmse)} shots, in the typical case at "
+            f"{_levels(as_good_med)}"
+        )
     return (
         "Comparison against the classical baseline: "
         + " ".join(parts)
-        + " Failed fits (no significant dip, or mis-assigned lines) dominate the fit's RMSE at low shots; its E = 0 / "
-        "Lorentzian-shape bias sets its floor at high shots. Uncertainty calibration of both is in the next section."
+        + " In short, the physics fit is "
+        + "; ".join(short)
+        + ". The CNN wins where the fit finds no dips (the lowest shot levels) and on RMSE at high shots, where the "
+        "fit's E = 0 / Lorentzian-shape bias sets a floor; it is not better everywhere, and its other advantage is "
+        "an uncertainty that is close to calibrated (next section)."
     )
 
 
@@ -1119,17 +1130,20 @@ def calibration_summary(df: pd.DataFrame, fdf: pd.DataFrame, headline: int) -> s
     lo, hi = g[g.shots < headline], g[g.shots >= headline]
 
     def rng_(x: pd.Series, f: str = "{:.2f}") -> str:
-        return f"{f.format(x.min())}-{f.format(x.max())}" if len(x) else "n/a"
+        if not len(x):
+            return "n/a"
+        a, b = f.format(x.min()), f.format(x.max())
+        return a if a == b else f"{a}-{b}"
 
     def verdict(x: pd.DataFrame) -> str:
         z = x.z_rms
-        if z.max() <= 1.05 and z.min() >= 0.95:
-            return "well calibrated"
-        if z.min() > 1.0:
+        if z.min() > 1.03:
             return (
                 f"mildly over-confident (sigma about {100 * (z.min() - 1):.0f}-{100 * (z.max() - 1):.0f} % too small)"
             )
-        return "calibrated to within the spread shown"
+        if z.max() <= 1.10 and z.min() >= 0.90:
+            return "well calibrated (z RMS within 10 % of 1)"
+        return "not uniformly calibrated"
 
     s = (
         f"The CNN is {verdict(lo)} below {headline} shots (z RMS {rng_(lo.z_rms)}, 68 % coverage "
@@ -1142,8 +1156,8 @@ def calibration_summary(df: pd.DataFrame, fdf: pd.DataFrame, headline: int) -> s
         s += (
             f" The physics fit's Jacobian sigma: z RMS up to {f.z_rms.max():.1f} over the shot levels (failed or "
             f"mis-assigned fits at low shots) and {rng_(top.z_rms)} at {int(f.shots.max())} shots, where its error "
-            f"({rng_(top.rmse_ut, '{:.0f}')} µT) includes the E = 0 and Lorentzian-shape bias that the Jacobian does "
-            "not know about."
+            f"({rng_(top.rmse_ut, '{:.0f}')} µT RMS) includes the E = 0 and Lorentzian-shape bias that the Jacobian "
+            "does not know about."
         )
     return s
 
