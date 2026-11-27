@@ -6,9 +6,13 @@ the run registry is committed, and every run it reads is registered and its reco
 
 0. :func:`build_episode_table`: the frozen reduction of unsealed counts to per-step observables (r, r_model,
    off-line flags, task error, action-sequence hashes) and the arm-blind exclusion flags of every block.
+   :func:`run_table` applies it to a registered run: from exactly the sealed artifact files whose sha256 the run's
+   end entry registered, with the acquisition flags of that entry, the released sealing key and the frozen model
+   executed from its locked file. No step reads a pre-built table.
 1. :func:`freeze_calibration` on the CALIBRATION block (control arms only: no decision process applied, no live
    reader of the results) and on *all* registered model runs of the series (runs of the frozen drift and timing
-   model that predict the selection effect theta0_D of each model in the pre-registered set). It derives the
+   model that predict the selection effect theta0_D of each member of the model set locked with the plan). It
+   derives the
    control-vs-control pair series (the empirical null of every test), the smallest effect size of interest per
    geometry (:func:`control_margin`), the theta0_D set and the model check, and writes the calibration and its
    calibration lock. Both are committed, and the calibration is registered, before any decision or observer arm
@@ -22,8 +26,9 @@ the run registry is committed, and every run it reads is registered and its reco
    blinding key is released.
 3. :func:`unblind_run`: maps codes to arms with the released blinding key and reads off the pre-registered cells:
    the two primary hypotheses (a positive claim needs Holm rejection against the calibration controls *and* against
-   the run's own sealed controls; a null claim needs a stable null), the model check, the null-stability check, the
-   secondary family (Holm), and every other cell as exploratory.
+   the run's own sealed controls; a null claim needs a stable null), the model check (member by member), the
+   null-stability check, the secondary family (the same complete rule), the manipulation check, and every other cell
+   as exploratory. :func:`series_claim` combines the two series S1 and S2.
 
 The empirical null: a cell's statistic is the mean over its pairs of a per-pair statistic; under the null
 hypothesis the pairs are distributed like control-vs-control pairs of the same geometry, which are exchangeable
@@ -31,9 +36,10 @@ hypothesis the pairs are distributed like control-vs-control pairs of the same g
 pairs is a circular moving-block bootstrap of the control series with a random sign per bootstrap block
 (:func:`null_means`): the spread and shape come from the control runs, the centre from the exchangeability. The one
 term no control run can contain is the selection effect of a decision arm under drift (its choices depend on counts
-that carry drift); it comes from the pre-registered set of drift and timing models (theta0_D per model), a decision
-cell counts only if it rejects at *every* model's centre, and the model check refuses H_decision when the sealed
-controls' within-episode correlation lies outside what the model set predicts.
+that carry drift); it comes from the pre-registered set of drift and timing models (theta0_D per model and per
+decision statistic). Members whose predicted within-episode correlation excludes the sealed controls are dropped, a
+decision cell counts only if it rejects at *every* remaining member's centre, and with no member left H_decision is
+inconclusive.
 """
 
 from __future__ import annotations
@@ -54,13 +60,15 @@ import pyarrow.parquet as pq
 import yaml
 from scipy import stats
 
-from glowbox.analysis.arms import action_hash
+from glowbox.analysis.arms import action_hash, read_artifacts, unseal_outcomes
 from glowbox.analysis.prereg import (
+    KeyStore,
     Lock,
     LockMismatchError,
     Registry,
     check_run_record,
     committed_unchanged,
+    is_ancestor,
     plan_files,
     published_lock_problems,
     sha256_bytes,
@@ -94,10 +102,11 @@ WARMUP_BLOCKS = 2
 ATTEMPT_CAP = 1.2
 #: The margin rule (smallest effect size of interest): Delta = Q_{1 - ALPHA/2}(|D|) + Q_{2 MARGIN_POWER - 1}(|D|),
 #: D the empirical control-vs-control null of the mean of N_CONF pairs. That is the shift at which the
-#: calibration-null test at Holm's first level (ALPHA / 2, two-sided) has power MARGIN_POWER. 0.95 leaves room for the
-#: two further conditions of a positive claim (the concurrent null, the model check): the complete rule is validated
-#: to keep power >= 0.90 at Delta.
-MARGIN_POWER = 0.95
+#: calibration-null test at Holm's first level (ALPHA / 2, two-sided) has power MARGIN_POWER. MARGIN_POWER =
+#: 1 - ALPHA_EQ makes the two tests dual at the margin: an effect of exactly Delta is missed by the test, and a zero
+#: effect fails the equivalence test (TOST at ALPHA_EQ per side), each with probability about ALPHA_EQ. The complete
+#: rule (with the concurrent null and the model check) is validated to keep power >= POWER at Delta.
+MARGIN_POWER = 1.0 - ALPHA_EQ
 #: Planned power of the complete decision rule at the margin (validated in stage S).
 POWER = 0.90
 #: Bootstrap draws of the empirical null (confirmatory analysis).
@@ -120,6 +129,12 @@ OFF_LINE_WIDTHS = 3.0
 #: Engineering comparisons (M7, E5): exactly this many treatment pairs and control repeats.
 ENG_N = 20
 ENG_N_CONTROL = 20
+#: The run series under one lock: S1 the original, S2 the replication. No other series is accepted, every claim
+#: needs its rule in both, and a series without a completed analysis (aborted, missing) means no claim
+#: (:func:`series_claim`).
+SERIES = ("S1", "S2")
+#: Statistics of the decision cell whose selection effect the model set predicts (theta0_D per statistic).
+DECISION_STATS = ("r", "r_off", "lvr")
 
 CONFIRMATORY_ARMS = ("A1", "A2", "A3", "A3b", "A3L", "A4", "A5")
 CALIBRATION_ARMS = ("C1", "C2", "C3", "C3b", "C3L", "C4", "C5")
@@ -158,14 +173,27 @@ STABILITY = {
     "lag1": CellSpec("A3", "A3L", 1, "r"),
 }
 MODEL_CHECK = CellSpec("A3", "A3b", 0, "wcorr")
+#: The secondary family (Holm at ALPHA, the complete rule of the primaries: calibration null and concurrent null;
+#: the decision cells centred at every consistent model's theta0_D of the statistic and refused without a passed
+#: model check).
 SECONDARY = {
-    "S1_sham_vs_yoked": CellSpec("A4", "A2", 0, "resid", "block"),
     "S2_dispersion_decision": CellSpec("A1", "A2", 1, "lvr"),
     "S2_dispersion_observer": CellSpec("A2", "A3", 0, "lvr"),
     "S3_offline_decision": CellSpec("A1", "A2", 1, "r_off"),
     "S3_offline_observer": CellSpec("A2", "A3", 0, "r_off"),
-    "S4_quantum_test": CellSpec("A5", "A2", 0, "task"),
 }
+#: The concurrent null of each secondary: the run's own sealed controls of the same geometry and statistic.
+SECONDARY_CONCURRENT = {
+    "S2_dispersion_decision": CellSpec("A3", "A3L", 1, "lvr"),
+    "S2_dispersion_observer": CellSpec("A3", "A3b", 0, "lvr"),
+    "S3_offline_decision": CellSpec("A3", "A3L", 1, "r_off"),
+    "S3_offline_observer": CellSpec("A3", "A3b", 0, "r_off"),
+}
+#: Manipulation check (not a hypothesis, outside the secondary family): the detuned arm must lose the task.
+MANIPULATION = {"S4_quantum_test": CellSpec("A5", "A2", 0, "task")}
+#: Exploratory only (it compares different action sequences, which no sealed control can calibrate when the model is
+#: imperfect): the mean model residual of the sham arm against the yoked arm.
+EXPLORATORY_NAMED = {"S1_sham_vs_yoked": CellSpec("A4", "A2", 0, "resid", "block")}
 #: The calibration block mirrors a confirmatory block slot for slot, every arm replaced by a sealed replay without
 #: an applied decision: C1 (offline sequence k, in A1's role), C2, C3, C3b (sequence k - 1), C3L (k - 2), C4 (sealed
 #: sham), C5 (sequence k - 1 detuned). Its pairs give the null of lag-0 cells (C2, C3: the geometry of H_observer),
@@ -248,6 +276,8 @@ class EpisodeTable:
 
     @classmethod
     def load(cls, path: Path | str) -> EpisodeTable:
+        """A saved table (for inspection only: the pipeline never reads one, it rebuilds every table from the
+        registered sealed artifacts, :func:`run_table`)."""
         t = pq.read_table(path)
         meta = t.schema.metadata or {}
         inv = {int(k): str(v) for k, v in json.loads(meta.get(b"invalid_blocks", b"{}")).items()}
@@ -418,20 +448,74 @@ def block_length(m: int) -> int:
     return max(1, math.floor(4.0 * (m / 100.0) ** (2.0 / 9.0)))
 
 
+def _flat_top(x: np.ndarray) -> np.ndarray:
+    out: np.ndarray = np.where(x <= 0.5, 1.0, np.clip(2.0 * (1.0 - x), 0.0, 1.0))
+    return out
+
+
+def correlation_time(series: np.ndarray) -> float:
+    """Integrated correlation time tau = 1 + 2 sum_k lambda(k / M) rho(k) of a series (NaN dropped), with the
+    flat-top lag window lambda and the bandwidth M = 2 m* of Politis and White (2004): m* the smallest lag after
+    which K_N = max(5, ceil(sqrt(log10 m))) consecutive autocorrelations are all below 2 sqrt(log10 m / m) in size.
+    At least 1."""
+    s = np.asarray(series, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    m = s.size
+    if m < 8:
+        return 1.0
+    e = s - s.mean()
+    den = float(e @ e)
+    if den <= 0:
+        return 1.0
+    k_max = max(2, m // 4)
+    rho = np.array([float(e[k:] @ e[:-k]) / den for k in range(1, k_max + 1)])
+    thr = 2.0 * math.sqrt(math.log10(m) / m)
+    kn = max(5, math.ceil(math.sqrt(math.log10(m))))
+    m_star = k_max
+    for k in range(0, k_max - kn + 1):
+        if np.all(np.abs(rho[k : k + kn]) < thr):
+            m_star = k
+            break
+    big_m = min(max(2 * m_star, 1), k_max)
+    lags = np.arange(1, big_m + 1)
+    tau = 1.0 + 2.0 * float(np.sum(_flat_top(lags / big_m) * rho[:big_m]))
+    return max(tau, 1.0)
+
+
+def block_length_for(series: np.ndarray) -> int:
+    """The bootstrap block length of a control series of m pairs: the larger of the Newey-West rule
+    (:func:`block_length`) and twice the series' integrated correlation time (:func:`correlation_time`), at most
+    m / 4. Without correlation between pairs this is the Newey-West rule; drift that correlates the pairs over
+    several blocks lengthens the blocks so that the null keeps the drift's contribution to the variance."""
+    s = np.asarray(series, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    m = s.size
+    if m == 0:
+        return 1
+    ln = max(block_length(m), math.ceil(2.0 * correlation_time(s)))
+    return max(1, min(ln, max(1, m // 4), m))
+
+
 def null_means(series: np.ndarray, n: int, n_boot: int, rng: np.random.Generator) -> np.ndarray:
-    """(n_boot,) means of n pairs under the null: circular moving blocks of the control series (NaN dropped), each
-    block multiplied by a random sign (exchangeable controls: symmetric about zero)."""
+    """(n_boot,) means of n pairs under the null: circular moving blocks (length :func:`block_length_for` of the
+    series) of the control series (NaN dropped), each block multiplied by a random sign (exchangeable controls:
+    symmetric about zero)."""
     s = np.asarray(series, dtype=np.float64)
     s = s[np.isfinite(s)]
     if s.size == 0 or n <= 0:
         return np.full(n_boot, np.nan)
-    ln = min(block_length(s.size), s.size)
+    ln = min(block_length_for(s), s.size)
     nb = -(-n // ln)
     starts = rng.integers(0, s.size, size=(n_boot, nb))
-    idx = (starts[..., None] + np.arange(ln)).reshape(n_boot, nb * ln)[:, :n] % s.size
     signs = rng.choice(np.array([-1.0, 1.0]), size=(n_boot, nb))
-    sg = np.repeat(signs, ln, axis=1)[:, :n]
-    out: np.ndarray = (s[idx] * sg).mean(axis=1)
+    # sums of the circular blocks starting at every position: full length ln, and the last (partial) block's length
+    ext = np.concatenate([[0.0], np.cumsum(np.concatenate([s, s[:ln]]))])
+    j = np.arange(s.size)
+    full = ext[j + ln] - ext[j]
+    last = n - (nb - 1) * ln
+    part = ext[j + last] - ext[j]
+    tot = (signs[:, :-1] * full[starts[:, :-1]]).sum(axis=1) + signs[:, -1] * part[starts[:, -1]]
+    out: np.ndarray = tot / n
     return out
 
 
@@ -536,6 +620,17 @@ class SelectionModel:
     wcorr_se: float
     n_runs: int
     runs: list[dict[str, str]] = field(default_factory=list)
+    #: theta0_D and its Monte Carlo SE of every statistic of :data:`DECISION_STATS` ("r": theta0, theta0_se).
+    theta0_stats: dict[str, list[float]] = field(default_factory=dict)
+    #: The member's parameters as locked in the plan's model set (and recorded by every one of its model runs).
+    params: dict[str, Any] = field(default_factory=dict)
+
+    def centre(self, stat: str) -> tuple[float, float]:
+        """(theta0_D, its SE) of a decision-cell statistic."""
+        if stat == "r":
+            return self.theta0, self.theta0_se
+        t = self.theta0_stats.get(stat)
+        return (float(t[0]), float(t[1])) if t else (0.0, 0.0)
 
     def envelope(self, n: int) -> tuple[float, float]:
         """Two-sided (1 - MODEL_CHECK_ALPHA) range of the mean wcorr of a run of n pairs under this model (the
@@ -559,17 +654,29 @@ class SelectionModel:
             float(d["wcorr_se"]),
             int(d["n_runs"]),
             [dict(x) for x in d.get("runs", [])],
+            {str(k): [float(x) for x in v] for k, v in (d.get("theta0_stats") or {}).items()},
+            dict(d.get("params") or {}),
         )
 
 
-def selection_model(name: str, tables: Sequence[EpisodeTable], run_ids: Sequence[str] | None = None) -> SelectionModel:
+def selection_model(
+    name: str,
+    tables: Sequence[EpisodeTable],
+    run_ids: Sequence[str] | None = None,
+    params: Mapping[str, Any] | None = None,
+) -> SelectionModel:
     """Aggregate the model runs of one model (arms named in the clear): theta per run = mean of the H_decision pair
-    statistic (A1 in block k against A2 in block k + 1); wcorr from the (A3, A3b) pairs."""
+    statistic (A1 in block k against A2 in block k + 1), and the same for every statistic of
+    :data:`DECISION_STATS`; wcorr from the (A3, A3b) pairs."""
     thetas, wmeans, npairs = [], [], []
+    per_stat: dict[str, list[float]] = {st: [] for st in DECISION_STATS}
     for t in tables:
         ix, iy = pair_rows(t, *MODEL_DECISION_PAIR, 1)
-        v = pair_stat(t, ix, iy, "r")
-        thetas.append(float(np.nanmean(v)) if v.size else np.nan)
+        for st in DECISION_STATS:
+            v = pair_stat(t, ix, iy, st)
+            v = v[np.isfinite(v)]
+            per_stat[st].append(float(v.mean()) if v.size else np.nan)
+        thetas.append(per_stat["r"][-1])
         ix, iy = pair_rows(t, *MODEL_WCORR_PAIR, 0)
         w = pair_stat(t, ix, iy, "wcorr")
         w = w[np.isfinite(w)]
@@ -582,6 +689,11 @@ def selection_model(name: str, tables: Sequence[EpisodeTable], run_ids: Sequence
     if th.size < 2 or wm.size < 2:
         raise ValueError(f"model {name!r}: at least two usable model runs are needed")
     ids = list(run_ids) if run_ids is not None else [str(i) for i in range(len(tables))]
+    stats_d = {}
+    for st, vals in per_stat.items():
+        a = np.asarray(vals)
+        a = a[np.isfinite(a)]
+        stats_d[st] = [float(a.mean()), float(a.std(ddof=1) / math.sqrt(a.size))] if a.size >= 2 else [0.0, 0.0]
     return SelectionModel(
         name,
         float(th.mean()),
@@ -592,15 +704,31 @@ def selection_model(name: str, tables: Sequence[EpisodeTable], run_ids: Sequence
         float(wm.std(ddof=1) / math.sqrt(wm.size)),
         int(th.size),
         [{"run_id": i, "data_sha256": t.sha256()} for i, t in zip(ids, tables, strict=True)],
+        stats_d,
+        json.loads(json.dumps(dict(params or {}), sort_keys=True)),
     )
 
 
-def model_check(w_mean: float, n: int, models: Sequence[SelectionModel]) -> bool:
-    """True when the observed mean wcorr of n sealed-control pairs lies inside the envelope of at least one model of
-    the set (the model set reproduces the within-episode correlation of the controls)."""
+def member_consistent(w_mean: float, n: int, model: SelectionModel) -> bool:
+    """True when the observed mean wcorr of n sealed-control pairs lies inside this member's envelope."""
     if not np.isfinite(w_mean) or n <= 0:
         return False
-    return any(lo <= w_mean <= hi for lo, hi in (m.envelope(n) for m in models))
+    lo, hi = model.envelope(n)
+    return bool(lo <= w_mean <= hi)
+
+
+def model_check(w_mean: float, n: int, models: Sequence[SelectionModel]) -> bool:
+    """True when the observed mean wcorr lies inside the envelope of at least one member (some member reproduces the
+    within-episode correlation of the controls). The decision rule uses the members one by one
+    (:func:`consistent_members`)."""
+    return any(member_consistent(w_mean, n, m) for m in models)
+
+
+def consistent_members(cal: Calibration, w_conf: float, n_conf: int) -> list[SelectionModel]:
+    """The members of the model set that reproduce the sealed controls of *both* the calibration block and the
+    confirmatory run. A member whose envelope excludes either is dropped before the worst case is taken: its
+    theta0_D comes from a drift model the data refute. No member left: the model check failed."""
+    return [m for m in cal.models if cal.model_ok_members.get(m.name, False) and member_consistent(w_conf, n_conf, m)]
 
 
 # --- Calibration ------------------------------------------------------------------------------------------------------
@@ -625,6 +753,10 @@ class Calibration:
     models: list[SelectionModel]
     model_ok: bool
     wcorr: float
+    #: Per member: the calibration block's wcorr inside the member's envelope.
+    model_ok_members: dict[str, bool] = field(default_factory=dict)
+    #: Per primary geometry: the bootstrap block length of the calibration series (:func:`block_length_for`).
+    block_len: dict[int, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -640,6 +772,8 @@ class Calibration:
             "boot_seed": self.boot_seed,
             "models": [m.to_dict() for m in self.models],
             "model_ok": self.model_ok,
+            "model_ok_members": dict(self.model_ok_members),
+            "block_len": {str(k): v for k, v in self.block_len.items()},
             "wcorr": self.wcorr,
             "series": {f"{k[0]}:{k[1]}": [float(x) for x in v] for k, v in self.series.items()},
         }
@@ -663,6 +797,8 @@ class Calibration:
             [SelectionModel.from_dict(m) for m in d["models"]],
             bool(d["model_ok"]),
             float(d["wcorr"]),
+            {str(k): bool(v) for k, v in (d.get("model_ok_members") or {}).items()},
+            {int(k): int(v) for k, v in (d.get("block_len") or {}).items()},
         )
 
     def sha256(self) -> str:
@@ -703,11 +839,30 @@ def derive_calibration(table: EpisodeTable, models: Sequence[SelectionModel], n_
                 f"model {m.name!r}: theta0_D SE {m.theta0_se:.3g} exceeds {THETA0_SE_MAX_FRACTION} x the lag-1 "
                 f"margin {margin[1]:.3g}: more model runs are needed"
             )
+    names = [m.name for m in models]
+    if len(set(names)) != len(names):
+        raise ValueError("model names in the set must be unique")
     w = series[(0, "wcorr")]
     w = w[np.isfinite(w)]
     w_mean = float(w.mean()) if w.size else float("nan")
-    ok = model_check(w_mean, int(w.size), models)
-    return Calibration(series, margin, sd_mean, sigma, vif, c_ref, N_CONF, int(h[:15], 16), h, list(models), ok, w_mean)
+    members = {m.name: member_consistent(w_mean, int(w.size), m) for m in models}
+    blen = {lag: block_length_for(series[(lag, "r")]) for lag in CAL_PAIRS}
+    return Calibration(
+        series,
+        margin,
+        sd_mean,
+        sigma,
+        vif,
+        c_ref,
+        N_CONF,
+        int(h[:15], 16),
+        h,
+        list(models),
+        any(members.values()),
+        w_mean,
+        members,
+        blen,
+    )
 
 
 # --- Blinded analysis -------------------------------------------------------------------------------------------------
@@ -783,14 +938,16 @@ class BlindedAnalysis:
         return None
 
 
-def _centres(cal: Calibration, lag: int, n_boot: int) -> dict[str, tuple[float, np.ndarray]]:
-    """Centre name -> (value, Monte Carlo noise added to the null draws)."""
+def _centres(cal: Calibration, lag: int, n_boot: int, stat: str = "r") -> dict[str, tuple[float, np.ndarray]]:
+    """Centre name -> (value, Monte Carlo noise added to the null draws). Lag-1 cells of a statistic of
+    :data:`DECISION_STATS` get every member's theta0_D of that statistic as well."""
     out: dict[str, tuple[float, np.ndarray]] = {"0": (0.0, np.zeros(n_boot))}
-    if lag == 1:
+    if lag == 1 and stat in DECISION_STATS:
         for i, m in enumerate(cal.models):
-            rng = np.random.default_rng(cal.boot_seed + 1 + i)
-            noise = rng.normal(0.0, m.theta0_se, size=n_boot) if m.theta0_se > 0 else np.zeros(n_boot)
-            out[f"theta0:{m.name}"] = (m.theta0, noise)
+            th, se = m.centre(stat)
+            rng = np.random.default_rng(cal.boot_seed + 1 + i + 1000 * DECISION_STATS.index(stat))
+            noise = rng.normal(0.0, se, size=n_boot) if se > 0 else np.zeros(n_boot)
+            out[f"theta0:{m.name}"] = (th, noise)
     return out
 
 
@@ -841,9 +998,9 @@ def analyse(
         return null_cache[key]
 
     cells: list[CellResult] = []
-    r_vals: dict[tuple[int, str], np.ndarray] = {}
+    #: (lag, stat, geometry, "x|y") -> the cell's finite pair values (the concurrent nulls of the other cells)
+    vals_of: dict[tuple[int, str, str, str], np.ndarray] = {}
     for lag in (0, 1):
-        centres = _centres(cal, lag, n_boot)
         for x in codes:
             for y in codes:
                 if x == y or (lag == 0 and x > y):
@@ -864,27 +1021,25 @@ def analyse(
                         scale_p = math.nan
                         if st not in UNTESTED_STATS:
                             margin = cal.margin[lag] if st == "r" else float("nan")
-                            tests = _cell_tests(vals, null_for(lag, st, n), margin, centres)
+                            tests = _cell_tests(vals, null_for(lag, st, n), margin, _centres(cal, lag, n_boot, st))
                             cs = cal.series[(lag, st)]
                             cs = cs[np.isfinite(cs)]
                             scale_p = float(stats.levene(fv, cs, center="median").pvalue) if n > 2 else math.nan
-                        if st == "r" and geometry == "hash":
-                            r_vals[(lag, f"{x}|{y}")] = fv
+                            vals_of[(lag, st, geometry, f"{x}|{y}")] = fv
                         cells.append(CellResult(x, y, lag, st, geometry, n, float(fv.mean()), tests, scale_p))
-    # concurrent nulls: every primary-statistic cell against every other cell of the same geometry of this run
-    cross_cache: dict[tuple[int, str, int], np.ndarray] = {}
+    # concurrent nulls: every tested cell against every other cell of the same lag, statistic and geometry of this run
+    cross_cache: dict[tuple[int, str, str, str, int], np.ndarray] = {}
     for c in cells:
-        if c.stat != "r" or c.geometry != "hash":
+        if c.stat in UNTESTED_STATS:
             continue
-        centres = _centres(cal, c.lag, n_boot)
-        for name, (centre, extra) in centres.items():
+        for name, (centre, extra) in _centres(cal, c.lag, n_boot, c.stat).items():
             cp = {}
-            for (lag, key), other in r_vals.items():
-                if lag != c.lag or key == f"{c.x}|{c.y}":
+            for (lag, st, geo, key), other in vals_of.items():
+                if (lag, st, geo) != (c.lag, c.stat, c.geometry) or key == f"{c.x}|{c.y}":
                     continue
-                ck = (lag, key, c.n)
+                ck = (lag, st, geo, key, c.n)
                 if ck not in cross_cache:
-                    rng = np.random.default_rng(_seed(cal.boot_seed, "cross", lag, key, c.n))
+                    rng = np.random.default_rng(_seed(cal.boot_seed, "cross", lag, st, geo, key, c.n))
                     cross_cache[ck] = null_means(other, c.n, n_boot, rng)
                 cp[key] = empirical_p(c.mean - centre, cross_cache[ck] + extra)
             c.tests[name]["cross_p"] = cp
@@ -953,6 +1108,7 @@ class Report:
     calibration: dict[str, Any]
     analysis_sha256: str
     registered_runs: list[dict[str, Any]] = field(default_factory=list)
+    manipulation: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -963,7 +1119,7 @@ class Report:
         lines += [
             "Positive claim: Holm (FWER 0.05) against the calibration controls and against the run's own sealed "
             "controls. Null claim: TOST at the frozen margin and a stable null. H_decision: worst case over the "
-            "theta0_D model set, and only with a passed model check.",
+            "members of the theta0_D model set that reproduce the sealed controls, and only if at least one does.",
             "",
         ]
         lines += [
@@ -973,7 +1129,7 @@ class Report:
         lines += ["| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
         for k, r in self.primary.items():
             if r.get("missing"):
-                lines.append(f"| {k} | missing | | | | | | | | | inconclusive |")
+                lines.append(f"| {k} | missing | | | | | | | | | {r.get('conclusion', 'inconclusive')} |")
                 continue
             lines.append(
                 f"| {k} | {r.get('n', '')} | {r.get('d', float('nan')):.4g} | "
@@ -984,29 +1140,66 @@ class Report:
         mc = self.model_check
         lines += [
             "",
-            f"Model check (H_decision): calibration {'passed' if mc['calibration'] else 'FAILED'}, confirmatory "
-            f"sealed controls {'passed' if mc['confirmatory'] else 'FAILED'} (wcorr {mc['wcorr']:.4g}).",
+            f"Model check (H_decision and the decision secondaries): members reproducing the sealed controls of the "
+            f"calibration block and of the confirmatory run: {', '.join(mc['consistent']) or 'none'} (of "
+            f"{', '.join(mc['members'])}); confirmatory wcorr {mc['wcorr']:.4g}.",
         ]
         lines += ["", f"Null stability: {'stable' if self.stability['stable'] else 'NOT stable'}", ""]
         for g, s in self.stability["cells"].items():
             lines.append(f"- {g}: location p {s['p']:.4g}, scale p {s['scale_p']:.4g}")
-        lines += ["", "## Secondary family (Holm, FWER 0.05)", "", "| outcome | n | estimate | p | Holm |"]
-        lines += ["| --- | --- | --- | --- | --- |"]
+        lines += ["", "## Secondary family (Holm, FWER 0.05, calibration and concurrent nulls)", ""]
+        lines += ["| outcome | n | estimate | p (calibration) | p (concurrent) | rejected |"]
+        lines += ["| --- | --- | --- | --- | --- | --- |"]
         for k, r in self.secondary.items():
             est = r.get("mean", float("nan"))
-            lines.append(f"| {k} | {r.get('n', '')} | {est:.4g} | {r['p']:.4g} | {r['holm_rejected']} |")
-        lines += ["", "## Every other cell (exploratory)", "", "| x | y | lag | stat | n | mean | p |"]
-        lines += ["| --- | --- | --- | --- | --- | --- | --- |"]
+            lines.append(
+                f"| {k} | {r.get('n', '')} | {est:.4g} | {r['p']:.4g} | {r.get('p_concurrent', float('nan')):.4g} | "
+                f"{r['rejected']} |"
+            )
+        lines += ["", "## Manipulation check", ""]
+        for k, r in self.manipulation.items():
+            lines.append(f"- {k}: estimate {r.get('mean', float('nan')):.4g}, p {r['p']:.4g}, passed {r['passed']}")
+        lines += ["", "## Every other cell (exploratory)", "", "| x | y | lag | stat | n | mean | p | name |"]
+        lines += ["| --- | --- | --- | --- | --- | --- | --- | --- |"]
         for e in self.exploratory:
             lines.append(
-                f"| {e['x']} | {e['y']} | {e['lag']} | {e['stat']} | {e['n']} | {e['mean']:.4g} | {e['p']:.4g} |"
+                f"| {e['x']} | {e['y']} | {e['lag']} | {e['stat']} | {e['n']} | {e['mean']:.4g} | {e['p']:.4g} "
+                f"| {e.get('name', '')} |"
             )
         if self.registered_runs:
-            lines += ["", "## Every registered run under the lock", "", "| run | mode | series | events |"]
+            lines += ["", "## Every registered run under the lock", "", "| run | mode | series | events (commit) |"]
             lines += ["| --- | --- | --- | --- |"]
             for rr in self.registered_runs:
-                lines.append(f"| {rr['run_id']} | {rr['mode']} | {rr['series']} | {', '.join(rr['events'])} |")
+                commits = rr.get("commits", {})
+                evs = ", ".join(f"{ev} ({str(c)[:12]})" for ev, c in commits.items()) or ", ".join(rr["events"])
+                lines.append(f"| {rr['run_id']} | {rr['mode']} | {rr['series']} | {evs} |")
         return "\n".join(lines) + "\n"
+
+
+def _rule(
+    ba: BlindedAnalysis,
+    inv: Mapping[str, str],
+    spec: CellSpec,
+    concurrent: CellSpec | None,
+    centres: Sequence[str],
+) -> dict[str, Any]:
+    """Read a cell at every centre and keep the worst case: the largest p against the calibration null and against
+    the concurrent null (NaN anywhere -> NaN), equivalence only at every centre."""
+    if not centres:
+        r = _read(ba, inv, spec, "0")
+        return {**r, "missing": True, "p": float("nan"), "p_concurrent": float("nan"), "no_centre": True}
+    reads = [_read(ba, inv, spec, c) for c in centres]
+    if any(r.get("missing") or "d" not in r for r in reads):
+        return {**reads[0], "missing": True, "p": float("nan"), "p_concurrent": float("nan")}
+    for r in reads:
+        r["p_concurrent"] = _cross(r, inv, concurrent) if concurrent is not None else float("nan")
+    i_w = int(np.argmax([np.nan_to_num(r["p"], nan=np.inf) for r in reads]))
+    res = {k: v for k, v in reads[i_w].items() if k != "cross_p"}
+    res["p"] = _worst([r["p"] for r in reads])
+    res["p_concurrent"] = _worst([r["p_concurrent"] for r in reads])
+    res["equivalent"] = all(r["equivalent"] for r in reads)
+    res["centre"] = centres[i_w]
+    return res
 
 
 def unblind(
@@ -1025,46 +1218,62 @@ def unblind(
     # wcorr is symmetric in the two arms: the stored orientation of the lag-0 cell does not matter (no sign)
     found = ba.cell(inv[MODEL_CHECK.x], inv[MODEL_CHECK.y], MODEL_CHECK.lag, MODEL_CHECK.stat)
     w_conf, n_w = (found[0].mean, found[0].n) if found is not None else (float("nan"), 0)
-    conf_ok = model_check(w_conf, n_w, cal.models)
-    mcheck = {"calibration": bool(cal.model_ok), "confirmatory": bool(conf_ok), "wcorr": w_conf}
-    centres = {"H_decision": [f"theta0:{m.name}" for m in cal.models], "H_observer": ["0"]}
+    consistent = consistent_members(cal, w_conf, n_w)
+    model_ok = bool(consistent)
+    mcheck = {
+        "calibration": bool(cal.model_ok),
+        "confirmatory": model_check(w_conf, n_w, cal.models),
+        "members": [m.name for m in cal.models],
+        "consistent": [m.name for m in consistent],
+        "passed": model_ok,
+        "wcorr": w_conf,
+    }
+    dec_centres = [f"theta0:{m.name}" for m in consistent]
+    centres = {"H_decision": dec_centres, "H_observer": ["0"]}
     primary: dict[str, dict[str, Any]] = {}
     for h, spec in PRIMARY.items():
-        reads = [_read(ba, inv, spec, c) for c in centres[h]]
-        if any(r.get("missing") or "d" not in r for r in reads):
-            primary[h] = {**reads[0], "missing": True, "p": float("nan"), "p_concurrent": float("nan")}
-            continue
-        for r in reads:
-            r["p_concurrent"] = _cross(r, inv, CONCURRENT[h])
-        # worst case over the model set: the least favourable centre (largest p; NaN anywhere -> NaN)
-        i_w = int(np.argmax([np.nan_to_num(r["p"], nan=np.inf) for r in reads]))
-        res = {k: v for k, v in reads[i_w].items() if k != "cross_p"}
-        res["p"] = _worst([r["p"] for r in reads])
-        res["p_concurrent"] = _worst([r["p_concurrent"] for r in reads])
-        res["equivalent"] = all(r["equivalent"] for r in reads)
-        res["centre"] = centres[h][i_w]
-        lag = spec.lag
-        res["margin"] = cal.margin[lag]
-        res["margin_over_c_ref"] = cal.margin[lag] / cal.c_ref if cal.c_ref else float("nan")
+        res = _rule(ba, inv, spec, CONCURRENT[h], centres[h])
+        res["margin"] = cal.margin[spec.lag]
+        res["margin_over_c_ref"] = cal.margin[spec.lag] / cal.c_ref if cal.c_ref else float("nan")
         primary[h] = res
     rej_cal = holm({k: v["p"] for k, v in primary.items()}, ALPHA)
     rej_conc = holm({k: v.get("p_concurrent", float("nan")) for k, v in primary.items()}, ALPHA)
     for k, v in primary.items():
-        model_ok = bool(mcheck["calibration"] and mcheck["confirmatory"]) if k == "H_decision" else True
+        ok = model_ok if k == "H_decision" else True
         v["holm_rejected"] = rej_cal[k]
         v["concurrent_rejected"] = rej_conc[k]
-        v["model_ok"] = model_ok
+        v["model_ok"] = ok
         v["stable"] = stable
-        v["rejected"] = bool(rej_cal[k] and rej_conc[k] and model_ok and not v.get("missing"))
+        v["rejected"] = bool(rej_cal[k] and rej_conc[k] and ok and not v.get("missing"))
         v.setdefault("equivalent", False)
-        v["conclusion"] = (
-            "inconclusive" if v.get("missing") else conclusion(v["rejected"], v["equivalent"], stable, model_ok)
-        )
-    # theta0_D is the model's prediction for the primary statistic only; secondary cells are centred at zero
-    secondary = {k: _read(ba, inv, s, "0") for k, s in SECONDARY.items()}
-    srej = holm({k: v["p"] for k, v in secondary.items()}, ALPHA)
+        if not ok:
+            v["conclusion"] = conclusion(False, False, stable, False)
+        elif v.get("missing"):
+            v["conclusion"] = "inconclusive"
+        else:
+            v["conclusion"] = conclusion(v["rejected"], v["equivalent"], stable, ok)
+    # secondaries: the same complete rule; decision cells at every consistent member's theta0_D of their statistic
+    secondary: dict[str, dict[str, Any]] = {}
+    for k, spec in SECONDARY.items():
+        dec = spec.lag == 1 and spec.stat in DECISION_STATS
+        secondary[k] = _rule(ba, inv, spec, SECONDARY_CONCURRENT[k], dec_centres if dec else ["0"])
+        secondary[k]["model_ok"] = model_ok if dec else True
+    s_cal = holm({k: v["p"] for k, v in secondary.items()}, ALPHA)
+    s_conc = holm({k: v.get("p_concurrent", float("nan")) for k, v in secondary.items()}, ALPHA)
     for k, v in secondary.items():
-        v["holm_rejected"] = srej[k]
+        v["holm_rejected"] = s_cal[k]
+        v["concurrent_rejected"] = s_conc[k]
+        v["rejected"] = bool(s_cal[k] and s_conc[k] and v["model_ok"] and not v.get("missing"))
+    manipulation = {}
+    for k, spec in MANIPULATION.items():
+        r = _read(ba, inv, spec, "0")
+        r["passed"] = bool(not r.get("missing") and r["p"] <= ALPHA and r.get("mean", 0.0) > 0)
+        manipulation[k] = r
+    named = {}
+    for k, spec in EXPLORATORY_NAMED.items():
+        found_n = ba.cell(inv[spec.x], inv[spec.y], spec.lag, spec.stat, spec.geometry)
+        if found_n is not None:
+            named[id(found_n[0])] = k
     explo = []
     for c in ba.cells:
         if c.stat in UNTESTED_STATS:
@@ -1078,6 +1287,7 @@ def unblind(
                 "n": c.n,
                 "mean": c.mean,
                 "p": c.tests["0"]["p"],
+                "name": named.get(id(c), ""),
             }
         )
     cal_d = {k: v for k, v in cal.to_dict().items() if k != "series"}
@@ -1090,7 +1300,36 @@ def unblind(
         cal_d,
         ba.sha256(),
         [dict(r) for r in registered_runs],
+        manipulation,
     )
+
+
+def series_claim(reports: Mapping[str, Report | None]) -> dict[str, str]:
+    """The claim of each primary over the run series (PREREG-001 section 9). ``reports`` maps every series of
+    :data:`SERIES` to its unblinded report (None: aborted, missing or not completed). A positive claim needs
+    "effect detected" with the same sign in every series; a null claim needs a null claim in every series;
+    otherwise, and whenever a series has no completed analysis or a series outside :data:`SERIES` is given, there is
+    no claim."""
+    out: dict[str, str] = {}
+    extra = sorted(set(reports) - set(SERIES))
+    for h in PRIMARY:
+        if extra:
+            out[h] = f"no claim: series {', '.join(extra)} are not series of the plan"
+            continue
+        missing = [s for s in SERIES if reports.get(s) is None]
+        if missing:
+            out[h] = f"no claim: series {', '.join(missing)} has no completed analysis"
+            continue
+        rs = [r.primary[h] for s in SERIES if (r := reports[s]) is not None]
+        concl = [str(r.get("conclusion", "")) for r in rs]
+        signs = {math.copysign(1.0, float(r.get("d", 0.0))) for r in rs}
+        if all(c == "effect detected" for c in concl) and len(signs) == 1:
+            out[h] = "effect detected in the original and the replication"
+        elif all(c.startswith("null") for c in concl):
+            out[h] = "null in the original and the replication: any effect is smaller than the margin"
+        else:
+            out[h] = "no claim: the series do not agree"
+    return out
 
 
 # --- Engineering comparisons (M7 controllers, E5) ---------------------------------------------------------------------
@@ -1180,6 +1419,8 @@ def frozen_constants() -> dict[str, Any]:
         "OFF_LINE_WIDTHS": OFF_LINE_WIDTHS,
         "ENG_N": ENG_N,
         "ENG_N_CONTROL": ENG_N_CONTROL,
+        "SERIES": list(SERIES),
+        "DECISION_STATS": list(DECISION_STATS),
     }
 
 
@@ -1190,28 +1431,45 @@ def required_files(root: Path = REPO_ROOT) -> list[str]:
     return sorted(p.resolve().relative_to(root.resolve()).as_posix() for p in files)
 
 
+def _normalise(x: Any) -> Any:
+    return json.loads(json.dumps(x, sort_keys=True))
+
+
 def create_plan_lock(
     extra_modules: Sequence[str] = (),
     configs: Sequence[Path | str] = (),
     extra_files: Sequence[Path | str] = (),
     root: Path = REPO_ROOT,
+    *,
+    model_set: Mapping[str, Mapping[str, Any]] | None = None,
+    frozen_model: str | None = None,
 ) -> Lock:
     """The plan lock: the plan, the module closure of this script, of the arms and of ``extra_modules`` (the
     acquisition or runner script, the controller, the measurement and the frozen model a run uses), the
     ``configs`` and ``extra_files`` (e.g. the sham distribution), the environment pins, the frozen constants, and
-    append-only pins of the deviations log and the run registry."""
-    files = plan_files(
-        PLAN_DOC, [SCRIPT_MODULE, "glowbox.analysis.arms", *extra_modules], configs, extra_files, root=root
-    )
-    return Lock.create(
-        PLAN, files, {"analysis": frozen_constants()}, DEVIATIONS_PATH, root=root, registry=REGISTRY_PATH
-    )
+    append-only pins of the deviations log and the run registry.
+
+    ``model_set`` (member name -> its parameters) is the pre-registered theta0_D model set: every model run records
+    its member and parameters, and the calibration refuses missing, extra or mismatched members. ``frozen_model`` is
+    ``"<repo-relative path>.py:<factory>"``, the frozen physics model of the locked reduction: ``factory(record)``
+    (record = the run's prereg record) returns a :class:`FrozenModel`; the file is locked and executed from its
+    locked bytes. Both are required by the analysis pipeline (:func:`check_plan`)."""
+    extra = list(extra_files)
+    if frozen_model is not None:
+        extra.append(frozen_model.split(":", 1)[0])
+    files = plan_files(PLAN_DOC, [SCRIPT_MODULE, "glowbox.analysis.arms", *extra_modules], configs, extra, root=root)
+    constants: dict[str, Any] = {"analysis": frozen_constants()}
+    if model_set is not None:
+        constants["model_set"] = _normalise({str(k): dict(v) for k, v in model_set.items()})
+    if frozen_model is not None:
+        constants["frozen_model"] = frozen_model
+    return Lock.create(PLAN, files, constants, DEVIATIONS_PATH, root=root, registry=REGISTRY_PATH)
 
 
 def verify_lock(lock: Lock, root: Path = REPO_ROOT) -> None:
     """Refuse to start unless the lock names this plan, contains every required file (:func:`required_files`) and
-    pins the deviations log and the run registry, every file still matches, and the frozen constants are this
-    script's."""
+    pins the deviations log and the run registry, every file still matches, the frozen constants are this
+    script's, a model set (if any) is a non-empty mapping and the frozen model's file (if any) is locked."""
     probs = []
     if lock.name != PLAN:
         probs.append(f"lock is for {lock.name!r}, not {PLAN}")
@@ -1222,6 +1480,12 @@ def verify_lock(lock: Lock, root: Path = REPO_ROOT) -> None:
         probs.append("the lock does not pin the deviations log")
     if lock.registry is None or lock.registry.path != REGISTRY_PATH:
         probs.append("the lock does not pin the run registry")
+    ms = lock.constants.get("model_set")
+    if ms is not None and (not isinstance(ms, dict) or not ms):
+        probs.append("the lock's model set must be a non-empty mapping of member -> parameters")
+    fm = lock.constants.get("frozen_model")
+    if fm is not None and (":" not in str(fm) or str(fm).split(":", 1)[0] not in lock.files):
+        probs.append(f"the frozen model {fm!r} is not '<locked file>:<factory>'")
     if probs:
         raise LockMismatchError(probs)
     lock.verify(root)
@@ -1230,11 +1494,17 @@ def verify_lock(lock: Lock, root: Path = REPO_ROOT) -> None:
 
 
 def check_plan(lock_path: Path, root: Path = REPO_ROOT) -> Lock:
-    """Load and verify the plan lock (:func:`verify_lock`), require it committed and published under
-    :data:`LOCK_TAG`, and require the run registry committed. Returns the lock."""
+    """Load and verify the plan lock (:func:`verify_lock`), require it to name the model set and the frozen model,
+    to be committed and published under :data:`LOCK_TAG`, and require the run registry committed with an
+    append-only history. Returns the lock."""
     lock = Lock.load(lock_path)
     verify_lock(lock, root)
-    probs = published_lock_problems(lock_path, LOCK_TAG, root) + committed_unchanged(root / REGISTRY_PATH, root)
+    probs = []
+    for k in ("model_set", "frozen_model"):
+        if not lock.constants.get(k):
+            probs.append(f"the lock does not name its {k.replace('_', ' ')}")
+    probs += published_lock_problems(lock_path, LOCK_TAG, root) + committed_unchanged(root / REGISTRY_PATH, root)
+    probs += Registry(root / REGISTRY_PATH, root).history()[0]
     if probs:
         raise LockMismatchError(probs)
     return lock
@@ -1253,9 +1523,83 @@ def _check_run(run_dir: Path, lock: Lock, mode: str, registry: Registry, root: P
     info = _load_info(run_dir)
     check_run_record(info, lock, mode, root)
     run_id = str(info.get("run_id"))
-    if probs := registry.run_problems(run_id, info, lock):
+    probs = registry.run_problems(run_id, info, lock)
+    if info["prereg"].get("series") not in SERIES:
+        probs.append(f"series {info['prereg'].get('series')!r} is not a series of the plan {list(SERIES)}")
+    if probs:
         raise LockMismatchError(probs)
     return info, run_id
+
+
+def load_frozen_model(lock: Lock, rec: Mapping[str, Any], root: Path = REPO_ROOT) -> FrozenModel:
+    """The frozen model of a run: the lock's ``frozen_model`` factory, executed from the locked file's bytes
+    (checked against the lock first), called with the run's prereg record."""
+    entry = str(lock.constants["frozen_model"])
+    rel, fn = entry.split(":", 1)
+    path = root / rel
+    data = path.read_bytes()
+    if sha256_bytes(data) != lock.files.get(rel):
+        raise LockMismatchError([f"{rel}: the frozen model differs from the locked one"])
+    namespace: dict[str, Any] = {"__name__": f"_prereg_frozen_model_{sha256_bytes(data)[:12]}", "__file__": str(path)}
+    exec(compile(data, str(path), "exec"), namespace)  # the locked file, verified above
+    model: FrozenModel = namespace[fn](dict(rec))
+    return model
+
+
+def run_table(
+    run_dir: Path, run_id: str, rec: Mapping[str, Any], lock: Lock, registry: Registry, keys: KeyStore, root: Path
+) -> tuple[EpisodeTable, dict[str, Any]]:
+    """Stage 0 for a registered run: the episode table rebuilt with the locked reduction from the run's sealed
+    artifact files, exactly as registered at the end of acquisition. Refuses unless the run has exactly one
+    committed ``end`` entry and every listed file has its registered sha256; the sealing key is released only
+    then (logged) and checked against its commitment; the exclusion flags are the registered ones (never read from
+    a file of the run directory). Returns the table and the end entry."""
+    ends = registry.events(run_id, "end")
+    if len(ends) != 1:
+        raise LockMismatchError([f"run {run_id} has {len(ends)} registered end entries (needs exactly 1)"])
+    end = ends[0]
+    arts = dict(end.get("artifacts") or {})
+    probs = []
+    if not arts:
+        probs.append(f"run {run_id}: the end entry lists no sealed artifact files")
+    for rel, want in arts.items():
+        f = run_dir / rel
+        if not f.is_file():
+            probs.append(f"run {run_id}: sealed artifact {rel} is missing")
+        elif sha256_file(f) != want:
+            probs.append(f"run {run_id}: sealed artifact {rel} differs from the one registered at the end of the run")
+    if probs:
+        raise LockMismatchError(probs)
+    seal = keys.release(run_id, "seal", "locked reduction (stage 0)")
+    if sha256_bytes(seal) != rec["keys"]["seal_sha256"]:
+        raise LockMismatchError([f"run {run_id}: the released sealing key does not match its commitment"])
+    eps = [e for rel in sorted(arts) for e in read_artifacts(run_dir / rel)]
+    if not eps:
+        raise LockMismatchError([f"run {run_id}: no episodes in the sealed artifacts"])
+    labels = sorted({e.label for e in eps})
+    n_arms = len(labels)
+    code, block, pos, acts, offs, cnts = [], [], [], [], [], []
+    for e in eps:
+        y = unseal_outcomes(e, seal)  # (T, B, W)
+        if y.ndim != 3 or y.shape[1] != 1 or np.asarray(e.actions).shape[:2] != y.shape[:2]:
+            raise LockMismatchError([f"run {run_id}: episode {e.label}/{e.block} is not one device (B = 1)"])
+        code.append(e.label)
+        block.append(e.block)
+        pos.append(int(np.asarray(e.slot).ravel()[0]) - e.block * n_arms)
+        acts.append(np.asarray(e.actions)[:, 0])
+        offs.append(e.offset_hz(seal))
+        cnts.append(y[:, 0, :])
+    model = load_frozen_model(lock, rec, root)
+    flags = {int(k): str(v) for k, v in (end.get("flags") or {}).items()}
+    t = build_episode_table(code, block, pos, np.stack(acts), offs, np.stack(cnts), model, flags=flags)
+    return t, end
+
+
+def _first_commit(registry: Registry, run_id: str, event: str) -> str:
+    cs = registry.commit_of(run_id, event)
+    if not cs or cs[0] is None:
+        raise LockMismatchError([f"the {event} entry of {run_id} is not committed"])
+    return cs[0]
 
 
 CAL_LOCK_NAME = f"{PLAN}-calibration"
@@ -1268,40 +1612,59 @@ def freeze_calibration(
     out_dir: Path,
     root: Path = REPO_ROOT,
     n_boot: int = N_BOOT,
+    keys: KeyStore | None = None,
 ) -> Lock:
-    """Stage 1. ``model_runs`` maps each model of the pre-registered set to its run directories (mode "model");
-    they must be *all* registered model runs of the calibration run's series, and every one must have started its
-    data before the calibration block did. Writes ``<out_dir>/calibration.json`` and the calibration lock
+    """Stage 1. ``model_runs`` maps each member of the lock's model set to its run directories (mode "model");
+    they must be exactly the lock's members and *all* registered model runs of the calibration run's series, every
+    one must record its member's locked parameters, and every one must have ended (its end entry committed) before
+    the calibration block was registered. Every table is rebuilt from its run's registered sealed artifacts
+    (:func:`run_table`). Writes ``<out_dir>/calibration.json`` and the calibration lock
     ``<out_dir>/calibration.lock.yaml`` (files: the calibration; constants: the plan lock sha256, the calibration
-    run, its data sha256 and start time, the model runs and their data sha256), appends a ``calibration`` event to
-    the registry, and returns the calibration lock. Commit both files and the registry before the confirmatory run
-    starts."""
+    run, its data sha256 and artifact hashes, the model runs and their data sha256), appends a ``calibration``
+    event to the registry, and returns the calibration lock. Commit both files and the registry before the
+    confirmatory run starts."""
+    keys = keys or KeyStore(root / "keystore")
     lock = check_plan(lock_path, root)
-    registry = Registry(root / REGISTRY_PATH)
+    registry = Registry(root / REGISTRY_PATH, root)
     info, run_id = _check_run(cal_run, lock, "calibration", registry, root)
     rec = info["prereg"]
     series = rec["series"]
-    registered = {e["run_id"] for e in registry.runs(lock.sha256(), "model", series)}
+    model_set: dict[str, Any] = dict(lock.constants["model_set"])
+    probs = []
+    if set(model_runs) != set(model_set):
+        probs.append(f"model runs given for {sorted(model_runs)}; the locked model set is {sorted(model_set)}")
+    reg_models = registry.runs(lock.sha256(), "model", series)
+    stray = sorted({str(e.get("model")) for e in reg_models} - set(model_set))
+    if stray:
+        probs.append(f"registered model runs of members outside the locked model set: {stray}")
+    if probs:
+        raise LockMismatchError(probs)
+    c_cal_start = _first_commit(registry, run_id, "start")
+    registered = {e["run_id"] for e in reg_models}
     models, given, model_prov = [], set(), []
     for name, dirs in model_runs.items():
         tables, ids = [], []
         for d in dirs:
             mi, mid = _check_run(d, lock, "model", registry, root)
-            if mi["prereg"].get("model") != name:
-                raise LockMismatchError([f"model run {mid} is of model {mi['prereg'].get('model')!r}, not {name!r}"])
-            if str(mi["prereg"]["data_started_utc"]) >= str(rec["data_started_utc"]):
-                raise LockMismatchError([f"model run {mid} did not start before the calibration block"])
-            t = EpisodeTable.load(d / "episodes.parquet")
+            mrec = mi["prereg"]
+            if mrec.get("model") != name:
+                raise LockMismatchError([f"model run {mid} is of model {mrec.get('model')!r}, not {name!r}"])
+            if _normalise(mrec.get("model_params", {})) != model_set[name]:
+                raise LockMismatchError([f"model run {mid} did not run with the locked parameters of {name!r}"])
+            c_end = _first_commit(registry, mid, "end")
+            if not is_ancestor(c_end, c_cal_start, root, proper=True):
+                raise LockMismatchError([f"model run {mid} did not end before the calibration block was registered"])
+            t, _ = run_table(d, mid, mrec, lock, registry, keys, root)
             tables.append(t)
             ids.append(mid)
             given.add(mid)
             model_prov.append({"run_id": mid, "model": name, "data_sha256": t.sha256()})
-        models.append(selection_model(name, tables, ids))
+        models.append(selection_model(name, tables, ids, model_set[name]))
     if given != registered:
         raise LockMismatchError(
             [f"model runs given {sorted(given)} are not all the registered model runs {sorted(registered)}"]
         )
-    table = EpisodeTable.load(cal_run / "episodes.parquet")
+    table, end = run_table(cal_run, run_id, rec, lock, registry, keys, root)
     cal = derive_calibration(table, models, n_boot)
     out_dir.mkdir(parents=True, exist_ok=True)
     cal_path = out_dir / "calibration.json"
@@ -1312,6 +1675,7 @@ def freeze_calibration(
         "calibration_run_id": run_id,
         "calibration_series": series,
         "calibration_data_sha256": table.sha256(),
+        "calibration_artifacts": dict(end["artifacts"]),
         "calibration_data_started_utc": str(rec["data_started_utc"]),
         "model_runs": model_prov,
     }
@@ -1342,6 +1706,8 @@ def _check_calibration(
         probs.append("the calibration's content differs from the one frozen in its lock")
     if cal.data_sha256 != cal_lock.constants.get("calibration_data_sha256"):
         probs.append("the calibration was not derived from the calibration run's data")
+    if sorted(m.name for m in cal.models) != sorted(lock.constants.get("model_set") or {}):
+        probs.append("the calibration's model set is not the locked one")
     ev = [
         e
         for e in registry.events(str(cal_lock.constants.get("calibration_run_id")), "calibration")
@@ -1362,38 +1728,47 @@ def analyse_run(
     out: Path,
     root: Path = REPO_ROOT,
     n_boot: int = N_BOOT,
+    keys: KeyStore | None = None,
 ) -> BlindedAnalysis:
     """Stage 2: the blinded analysis of a confirmatory run against its frozen calibration. Refuses unless the plan
     lock verifies and is published; the calibration lock is committed, registered, belongs to this plan lock and
-    matches its calibration file; the calibration run passes its checks again and its data are the calibration's;
-    the confirmatory run passes its checks, names this calibration lock, is in the calibration's series, and
-    started after the calibration was registered. Writes the blinded output and appends its sha256 to the registry
-    (commit both before the blinding key is released)."""
+    matches its calibration file; the calibration run passes its checks again and its rebuilt data are the
+    calibration's; the confirmatory run passes its checks (the only confirmatory run of its series), names this
+    calibration lock, is in the calibration's series, and was registered on a commit that descends from the
+    commit of the calibration event, which descends from the calibration block's end entry. The table is rebuilt
+    from the run's registered sealed artifacts (:func:`run_table`). Writes the blinded output and appends its sha256
+    to the registry (commit both before the blinding key is released)."""
+    keys = keys or KeyStore(root / "keystore")
     lock = check_plan(lock_path, root)
-    registry = Registry(root / REGISTRY_PATH)
+    registry = Registry(root / REGISTRY_PATH, root)
     cal_lock, cal, _ = _check_calibration(cal_lock_path, lock, registry, root)
     cal_info, cal_id = _check_run(cal_run, lock, "calibration", registry, root)
     probs = []
     if cal_id != cal_lock.constants.get("calibration_run_id"):
         probs.append("the calibration run is not the one frozen in the calibration lock")
-    if EpisodeTable.load(cal_run / "episodes.parquet").sha256() != cal.data_sha256:
-        probs.append("the calibration run's data differ from the frozen calibration's")
     info, run_id = _check_run(conf_run, lock, "confirmatory", registry, root)
     rec = info["prereg"]
     if rec.get("calibration_lock_sha256") != cal_lock.sha256():
         probs.append("the confirmatory run was made under a different calibration")
     if rec.get("series") != cal_lock.constants.get("calibration_series"):
         probs.append("the confirmatory run is not in the calibration's series")
-    cal_ev = registry.events(cal_id, "calibration")
-    if not cal_ev or str(cal_ev[0]["utc"]) > str(rec.get("data_started_utc")):
-        probs.append("the confirmatory run started before its calibration was frozen and registered")
+    c_cal_end = _first_commit(registry, cal_id, "end")
+    c_cal_event = _first_commit(registry, cal_id, "calibration")
+    c_start = _first_commit(registry, run_id, "start")
+    if not is_ancestor(c_cal_end, c_cal_event, root, proper=True):
+        probs.append("the calibration was registered before the calibration block's end entry")
+    if not is_ancestor(c_cal_event, c_start, root, proper=True):
+        probs.append("the confirmatory run was registered before its calibration was frozen and registered")
     if str(cal_info["prereg"]["data_started_utc"]) >= str(rec.get("data_started_utc")):
         probs.append("the calibration block did not run before the confirmatory run")
     if registry.events(run_id, "blinded"):
         probs.append("this run already has a registered blinded analysis")
     if probs:
         raise LockMismatchError(probs)
-    table = EpisodeTable.load(conf_run / "episodes.parquet")
+    cal_table, _ = run_table(cal_run, cal_id, cal_info["prereg"], lock, registry, keys, root)
+    if cal_table.sha256() != cal.data_sha256:
+        raise LockMismatchError(["the calibration run's data differ from the frozen calibration's"])
+    table, _ = run_table(conf_run, run_id, rec, lock, registry, keys, root)
     prov = {
         "run_id": run_id,
         "lock_sha256": lock.sha256(),
@@ -1414,12 +1789,16 @@ def unblind_run(
     blind_key: bytes,
     out: Path,
     root: Path = REPO_ROOT,
+    keys: KeyStore | None = None,
 ) -> Report:
     """Stage 3. Refuses unless the plan lock verifies and is published, the blinded output is committed and its
-    sha256 is the registered one (registry committed), it names this plan lock, calibration lock, script and run,
-    and its data hash is the run's table. The report lists every registered run under the lock."""
+    sha256 is the registered one (registry committed, the blinded entry on a commit after the run's end entry), it
+    names this plan lock, calibration lock, script and run, and its data hash is the run's table rebuilt from the
+    registered artifacts. The report (markdown, and JSON next to it) lists every registered run under the lock
+    with the commit of each event."""
+    keys = keys or KeyStore(root / "keystore")
     lock = check_plan(lock_path, root)
-    registry = Registry(root / REGISTRY_PATH)
+    registry = Registry(root / REGISTRY_PATH, root)
     cal_lock, cal, _ = _check_calibration(cal_lock_path, lock, registry, root)
     info, run_id = _check_run(conf_run, lock, "confirmatory", registry, root)
     probs = committed_unchanged(analysis, root)
@@ -1427,6 +1806,9 @@ def unblind_run(
     ev = registry.events(run_id, "blinded")
     if len(ev) != 1 or ev[0].get("analysis_sha256") != ba.sha256():
         probs.append("the blinded analysis is not the one registered for this run")
+    elif not is_ancestor(_first_commit(registry, run_id, "end"), _first_commit(registry, run_id, "blinded"), root,
+                         proper=True):  # fmt: skip
+        probs.append("the blinded analysis was registered before the run's end entry")
     if ba.run_id != run_id:
         probs.append("the blinded analysis is of another run")
     if ba.lock_sha256 != lock.sha256():
@@ -1435,18 +1817,21 @@ def unblind_run(
         probs.append("the blinded analysis was made against a different calibration")
     if ba.script_sha256 != sha256_file(root / SCRIPT_PATH):
         probs.append("the blinded analysis was made by a different script")
-    if ba.data_sha256 != EpisodeTable.load(conf_run / "episodes.parquet").sha256():
-        probs.append("the blinded analysis was made on different data")
     if probs:
         raise LockMismatchError(probs)
+    table, _ = run_table(conf_run, run_id, info["prereg"], lock, registry, keys, root)
+    if ba.data_sha256 != table.sha256():
+        raise LockMismatchError(["the blinded analysis was made on different data"])
     mapping = unblind_codes(blind_key, info["prereg"]["keys"]["blind_sha256"], CONFIRMATORY_ARMS)
     rep = unblind(ba, mapping, cal, registry.summary(lock.sha256()))
     out.write_text(rep.to_markdown())
+    out.with_suffix(".json").write_text(json.dumps(rep.to_dict(), sort_keys=True, indent=1, default=float))
     return rep
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    p.add_argument("--keystore", type=Path, default=None, help="key store directory (default <repo>/keystore)")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("calibrate", help="freeze the calibration block and the theta0_D model set")
     c.add_argument("--run", required=True, type=Path)
@@ -1467,19 +1852,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     u.add_argument("--blind-key-hex", required=True)
     u.add_argument("--out", required=True, type=Path)
     args = p.parse_args(argv)
+    ks = KeyStore(args.keystore) if args.keystore else None
     if args.cmd == "calibrate":
         runs: dict[str, list[Path]] = {}
         for item in args.model_runs:
             name, _, d = item.partition("=")
             runs.setdefault(name, []).append(Path(d))
-        cl = freeze_calibration(args.run, runs, args.lock, args.out_dir)
+        cl = freeze_calibration(args.run, runs, args.lock, args.out_dir, keys=ks)
         print(f"calibration lock sha256 {cl.sha256()}: commit it, the calibration and the registry")
     elif args.cmd == "analyse":
-        ba = analyse_run(args.run, args.calibration_run, args.lock, args.calibration_lock, args.out)
+        ba = analyse_run(args.run, args.calibration_run, args.lock, args.calibration_lock, args.out, keys=ks)
         print(f"blinded analysis sha256 {ba.sha256()}: commit it and the registry before the blinding key is released")
     else:
         unblind_run(
-            args.analysis, args.run, args.lock, args.calibration_lock, bytes.fromhex(args.blind_key_hex), args.out
+            args.analysis,
+            args.run,
+            args.lock,
+            args.calibration_lock,
+            bytes.fromhex(args.blind_key_hex),
+            args.out,
+            keys=ks,
         )
         print(f"unblinded report: {args.out} (written {dt.datetime.now(dt.UTC).isoformat(timespec='seconds')})")
 
