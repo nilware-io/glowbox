@@ -411,6 +411,7 @@ class AdaptiveTask:
                     }
                 )
             out[f"{name}_rmse_ut"] = float(rm[-1])
+            out[f"{name}_median_err_ut"] = float(np.median(np.sqrt(lg.sq_err[-1]))) * 1e6
             out[f"{name}_skill"] = 1.0 - float(rm[-1]) / prior_ut
             for t in self.curve_steps:
                 out[f"{name}_rmse_ut_t{t}"] = float(rm[t])
@@ -433,6 +434,7 @@ class AdaptiveTask:
                     )
                 if seed == 0:
                     np.save(self.data_dir / f"actions_s0_{cond.name}_{name}.npy", lg.actions)
+            np.save(self.data_dir / f"sq_err_s{seed}_{cond.name}_{name}.npy", lg.sq_err[-1])
         for t in self.curve_steps:
             out[f"sweep_full_rmse_ut_t{t}"] = full[t]
             out[f"cnn_rmse_ut_t{t}"] = cnn[t]

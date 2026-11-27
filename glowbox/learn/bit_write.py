@@ -126,7 +126,13 @@ def evaluate_codebook(
     post = bitwise_map(counts, shots, templates.double(), patterns.double().to(templates.device))
     pred = (post > 0.5).long().cpu().numpy()
     true = patterns[idx.cpu()].cpu().numpy()
-    return recall_metrics(pred, true)
+    out = recall_metrics(pred, true)
+    # L + E[log2 P(written pattern | readout)]: the learners' training objective (an information lower bound on
+    # the whole pattern; recalled_bits instead treats the bits as separate hard-decision channels)
+    lp = pattern_log_posterior((counts / shots)[None], templates[None].double(), shots)[0]
+    lp_true = lp[torch.arange(lp.shape[0], device=lp.device), idx]
+    out["pattern_info_bits"] = float(patterns.shape[1] + (lp_true / math.log(2.0)).clamp_min(-20.0).mean())
+    return out
 
 
 def template_separation_sigma(templates: torch.Tensor, shots: float) -> float:
