@@ -23,6 +23,39 @@ GPU-machine workflow: [docs/dev.md](docs/dev.md). Physics spec: [docs/physics.md
 
 ## Status
 
+**Milestone 5 done** (adaptive Bayesian measurement and a PPO agent choose the measurements for Task 1; a PPO
+agent learns the write pulses of Task 2; the quantum test for both). Reports:
+[docs/results/m5-adaptive-field.md](docs/results/m5-adaptive-field.md),
+[docs/results/m5-rl-bit-write.md](docs/results/m5-rl-bit-write.md).
+
+![Task 1: field error vs total shots for fixed sweeps, information-greedy design and the RL agent](docs/results/figures/m5-adaptive-field-shots-to-accuracy.png)
+
+*Task 1: each step is a block of 400 shots of one pulsed-ODMR measurement (MW frequency x pulse duration) chosen
+by the policy; every policy updates the same particle posterior over the field. Mean over 5 seeds with 95 % t CIs;
+detuned 400 MHz on the right.*
+
+- Task 1, 40000 shots, calibrated device: RL agent (PPO) 11.8 [10.9, 12.7] uT, information-greedy design 13.1
+  [9.8, 16.4], fixed interleaved pi-pulse sweep 41.3 [37.7, 44.9], random measurements 82.2, milestone 2's CNN on
+  the fixed sweep 56.9; the agent ties the greedy design (RL - EIG -1.3 [-4.2, 1.6] uT). Both search with the pi
+  pulse and then spend 80-87 % of their blocks on a 400 ns (~4 pi) pulse; shifting every duration by 50 ns
+  multiplies their error 19-35 fold (Rabi-scale pulse areas). Detuned, all stay at the prior (~810 vs 829 uT);
+  gaps RL 794 [781, 807], EIG 796 [786, 805] uT.
+- Task 2, 4 bits at 10^4 shots: the PPO-learned write recalls 3.01 [2.72, 3.30] bits, the write trained by
+  gradient through the surrogate 3.65 [3.44, 3.86], the fixed random encoder 0.86 [0.38, 1.33]; detuned every
+  write < 0.01 bits. The learned write relies on its rotation angles (+-50 ns: -1.6 bits even with the readout
+  recalibrated) and on coherent segment phases.
+- QuTiP reference through `Simulator.run()`: measurement means within 6.4e-4 (Task 1) and templates within 6.8e-4
+  (Task 2) of the signal spread.
+- Code: `glowbox/learn/measurement.py` (measurements as actions, emulator table), `glowbox/learn/adaptive.py`
+  (particle posterior, expected information gain), `glowbox/learn/rl.py` (PPO, gymnasium-style environments with
+  a `Simulator.run()` backend for hardware later), `glowbox/learn/bit_write.py`. Notes:
+  [docs/notes/adaptive-rl.md](docs/notes/adaptive-rl.md).
+
+Run (RTX 5070 Ti: Task 1 ~4.5 h, Task 2 ~1.6 h; `--quick` for a smoke run):
+
+    uv run python -m glowbox.experiments.m5_adaptive_field --quick
+    uv run python -m glowbox.experiments.m5_rl_bit_write --quick
+
 **Milestone 4 done** (a learned pulse encoder trained end to end through the differentiable surrogate; Task 4,
 compress-and-reconstruct; Task 1 re-run with a learned sensor protocol; the quantum test for both). Reports:
 [docs/results/m4-autoencoder.md](docs/results/m4-autoencoder.md),
@@ -161,5 +194,5 @@ Run milestone 1:
 
 Tests: `uv run pytest` (about 2-3 minutes; CUDA tests are skipped without a GPU, slow ones need `-m slow`).
 
-Next: the remaining phase-2 learners (the RL agent, adaptive measurement), Tasks 2-3 with learned encodings, and
-the phase-3 DeepDream experiments, each with the quantum test.
+Next: Task 3 with a learned encoding, a nuisance-aware adaptive posterior, and the phase-3 DeepDream experiments,
+each with the quantum test.
