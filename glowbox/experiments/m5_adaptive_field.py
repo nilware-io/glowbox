@@ -240,15 +240,9 @@ class AdaptiveTask:
             idx = torch.randint(0, tr_f.shape[0], (n,), generator=gen, device=self.device)
             return tr_f[idx], TableBackend(tr_m[idx], gen)
 
+        train_post = dataclasses.replace(self.post_cfg, n_particles=int(rc["train_particles"]))
         env = FieldSearchEnv(
-            table,
-            self.prior,
-            sampler,
-            int(rc["num_envs"]),
-            self.n_steps,
-            self.shots,
-            self.post_cfg,
-            self._gen(seed, 20),
+            table, self.prior, sampler, int(rc["num_envs"]), self.n_steps, self.shots, train_post, self._gen(seed, 20)
         )
         torch.manual_seed((self.base_seed + 31 * seed) % (2**31))
         pol = SetPolicy(env.n_features, 2, int(rc["hidden"])).to(self.device)
@@ -267,7 +261,7 @@ class AdaptiveTask:
         def log(it: int, st: dict[str, float]) -> None:
             row = {"cond": cond.name, "seed": seed, "iteration": it, **st}
             self.train_rows.append(row)
-            if it % 25 == 0 or it == pcfg.iterations:
+            if it % 5 == 0 or it == pcfg.iterations:
                 rm = math.sqrt(st.get("sq_err", float("nan"))) * 1e6
                 print(
                     f"[m5-field] rl {cond.name} s{seed} it {it}: return {st['return']:.2f} rmse {rm:.0f} uT", flush=True
@@ -381,9 +375,10 @@ class AdaptiveTask:
             "rl_init": RLDesign(agent0, self.prior_rmse_t / math.sqrt(3.0)),
             "random": RandomDesign(spec, self._gen(seed, 9)),
         }
-        for d in range(spec.n_dur):
-            if d != di:
-                policies[f"fixed_d{d}"] = FixedSweep(spec, d)
+        if not cond.detuned:  # the sweep at the other durations: resonant only
+            for d in range(spec.n_dur):
+                if d != di:
+                    policies[f"fixed_d{d}"] = FixedSweep(spec, d)
         for k, (name, pol) in enumerate(policies.items()):
             logs[name] = self.episodes(pol, test_means, test, table, self._gen(seed, 100 + k))
         # the fixed sweep covering the whole band at each budget
@@ -885,7 +880,8 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
     L.append(
         f"- RL: PPO, {rc['num_envs']} parallel episodes per iteration, {rc['iterations']} iterations, lr {rc['lr']}, "
         f"{rc['epochs']} epochs x {rc['minibatches']} minibatches, clip {rc['clip']}, entropy {rc['ent_coef']}, GAE "
-        f"lambda {rc['gae_lambda']}, gamma 1; per-action set policy (hidden {rc['hidden']}); training fields from "
+        f"lambda {rc['gae_lambda']}, gamma 1; per-action set policy (hidden {rc['hidden']}); {rc['train_particles']} "
+        "posterior particles while training; training fields from "
         f"the seed's pool of {c['data']['n_pool']}, test fields unseen."
     )
     cc = c["cnn"]

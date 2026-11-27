@@ -8,7 +8,8 @@ learned sensor protocol).
 ## Sequence layout (`Layout`)
 
 Every sequence starts with the fixed MW-free initialisation (laser, dark settle), simulated once per static field.
-The encoder writes the suffix: `n_blocks` x [MW block of `n_segments` slots] [readout laser] [optional dark gap].
+The encoder writes the suffix: `n_blocks` x [MW block of `n_segments` slots] [optional dark delay, `delay_ns`: the
+storage time of Task 2 in milestone 5] [readout laser] [optional dark gap].
 The decoder sees either one gated count per readout (the first `gate_ns` of the laser, a gated photon counter; the
 rest of the laser re-polarises the spins) or the readout split into `window_ns` windows (time-resolved).
 

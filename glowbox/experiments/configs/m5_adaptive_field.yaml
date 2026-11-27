@@ -41,9 +41,9 @@ budget:
 posterior:                    # glowbox.learn.adaptive.PosteriorConfig
   n_particles: 512
   ess_frac: 0.5
-  mh_steps: 4
+  mh_steps: 3
   mh_scale: 0.6
-  n_predict: 128
+  n_predict: 64
 
 data:
   n_test: 200                 # true fields per seed (the same in both arms)
@@ -55,11 +55,12 @@ policies:
   eig_method: gaussian
 
 rl:                           # glowbox.learn.rl (PPO)
-  num_envs: 32
-  iterations: 250
+  num_envs: 256               # episodes per iteration (all in parallel on the GPU)
+  iterations: 40
+  train_particles: 256        # posterior particles while training (evaluation: posterior.n_particles)
   lr: 1.0e-3
   epochs: 4
-  minibatches: 8
+  minibatches: 16
   clip: 0.2
   gae_lambda: 0.95
   ent_coef: 0.003
@@ -80,7 +81,7 @@ cnn:                          # milestone 2's CNN on the fixed sweep (both windo
   mix_channels: 8
 
 timing:
-  shifts_ns: [-50, -20, 20, 50]   # every MW duration shifted in the truth (the learners' model unaware)
+  shifts_ns: [-50, 50]        # every MW duration shifted in the truth (the learners' model unaware)
 
 reference:
   n_fields: 2                 # QuTiP reference: the seed-0 RL agent through SimulatorBackend (run())
@@ -109,6 +110,7 @@ quick:
   rl:
     num_envs: 8
     iterations: 3
+    train_particles: 64
   cnn:
     steps: 30
     eval_every: 15
