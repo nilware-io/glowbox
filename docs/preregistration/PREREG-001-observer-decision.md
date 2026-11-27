@@ -432,3 +432,17 @@ excluded; the full size (R = 4000) narrows that to about 0.06.
   ENG_N_CONTROL = 20.
 - **The model set** for theta0_D and the model check's statistic (within-episode correlation at lags 1-3).
 - **The decision process** of the stage-S validation (a stand-in) versus the M5 policy for the full-size run.
+- **Failed stage-S criteria** (docs/results/prereg-calibration.md, R = 1000; the plan is not ready to lock until
+  they are resolved or the owner accepts them):
+  - The calibration null *alone* is slightly liberal: H_observer p <= 0.05 in 0.065 [0.051, 0.082], its 95 %
+    interval covers 0 in 0.935 [0.918, 0.949]. The complete positive rule (which adds the concurrent null) keeps the
+    primary family at 0.045 [0.033, 0.060]. A likely cause: the bootstrap block length (4 pairs) is shorter than
+    the drift correlation time (about 10 blocks), and one 200-block calibration realisation estimates the null's
+    spread with about 20 % error.
+  - The secondary family S1-S3 uses the calibration null alone: any Holm rejection in 0.075 [0.059, 0.093].
+    Proposed fix: the concurrent rule for S2 and S3 (sealed-control cells exist), and either a sealed sham
+    control for S1 or S1 moved to exploratory.
+  - Null claims for H_decision: 0.877 [0.855, 0.897] against the target 0.90 (TOST alone 0.930; the stability
+    gate and the model check each remove a few per cent). Options: a target for TOST alone, as in version 1, or a
+    larger N.
+
