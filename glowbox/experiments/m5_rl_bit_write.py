@@ -7,7 +7,8 @@ segments (one per device line), held through a dark delay and recalled from the 
 Bayes-optimal readout of the codebook. The write of each pattern is
 
 * ``rl``: chosen by a PPO agent (glowbox.learn.rl.CodebookEnv: one-step episodes, reward = L + log2 P(pattern |
-  readout) under the codebook's Bayes-optimal readout), the policy's mean action at test; ``rl_init``: the same
+  readout) under the codebook's Bayes-optimal readout), the policy's mean action at test; ``rl_sample``: one
+  codebook drawn from the final (stochastic) policy, the kind the reward was measured on; ``rl_init``: the same
   policy before training (control);
 * ``gradient``: the same parametrisation and objective trained by gradient through the differentiable surrogate
   (milestone 4's learner);
@@ -78,13 +79,14 @@ from glowbox.sim.surrogate.model import ModelOptions
 
 DEFAULT_CONFIG = Path(__file__).with_name("configs") / "m5_rl_bit_write.yaml"
 REPORT_NAME = "m5-rl-bit-write"
-ENCODERS = ("rl", "gradient", "random", "rl_init")
-COLORS = {"rl": "#eb6834", "gradient": "#2a78d6", "random": "#8a8985", "rl_init": "#f2b48f"}
+ENCODERS = ("rl", "rl_sample", "gradient", "random", "rl_init")
+COLORS = {"rl": "#eb6834", "rl_sample": "#c0392b", "gradient": "#2a78d6", "random": "#8a8985", "rl_init": "#f2b48f"}
 LABELS = {
     "rl": "RL agent (PPO, black box)",
     "gradient": "gradient through the surrogate (M4 learner)",
     "random": "fixed random encoder (M3/M4 reservoir)",
     "rl_init": "RL policy before training",
+    "rl_sample": "RL, one codebook sampled from the final policy",
 }
 
 
@@ -179,7 +181,10 @@ class WriteTask:
         )
 
         def log(it: int, st: dict[str, float]) -> None:
-            self.train_rows.append({"cond": cond.name, "seed": seed, "learner": "rl", "step": it, "bits": st["return"]})
+            std = float(torch.exp(pol.log_std.detach()).mean())
+            self.train_rows.append(
+                {"cond": cond.name, "seed": seed, "learner": "rl", "step": it, "bits": st["return"], "policy_std": std}
+            )
             if it % 50 == 0 or it == pcfg.iterations:
                 print(f"[m5-write] rl {cond.name} s{seed} it {it}: bits {st['return']:.3f}", flush=True)
 
@@ -244,6 +249,15 @@ class WriteTask:
             books = {
                 "rl": action_to_params(pol.mean(u), self.layout, base),
                 "rl_init": action_to_params(pol0.mean(u), self.layout, base),
+                "rl_sample": action_to_params(
+                    pol.mean(u)
+                    + torch.exp(pol.log_std)
+                    * torch.randn(
+                        u.shape[0], self.n_action(), generator=_tgen(self.device, seed, 14), device=self.device
+                    ),
+                    self.layout,
+                    base,
+                ),
                 "gradient": enc(u),
                 "random": rnd(u),
             }
@@ -268,6 +282,7 @@ class WriteTask:
                 out[f"{name}_bits_{tag}"] = met["recalled_bits"]
                 out[f"{name}_bitacc_{tag}"] = met["bit_acc"]
                 out[f"{name}_patacc_{tag}"] = met["pattern_acc"]
+                out[f"{name}_info_{tag}"] = met["pattern_info_bits"]
                 self.rows.append({"cond": cond.name, "seed": seed, "encoder": name, "shots": s, **met})
             out[f"{name}_sep_sigma"] = template_separation_sigma(tmpl, self.headline)
             if not cond.detuned:
@@ -288,6 +303,7 @@ class WriteTask:
         for name in books:
             out[f"{name}_bits"] = out[f"{name}_bits_{h}"]
             out[f"{name}_bitacc"] = out[f"{name}_bitacc_{h}"]
+            out[f"{name}_info"] = out[f"{name}_info_{h}"]
         if not cond.detuned:
             self.timing_probe(seed, ch_eval, books)
         print(
@@ -316,6 +332,7 @@ class WriteTask:
                     ("frozen", shifted, tmpl),
                     ("recalibrated", shifted, shifted),
                     ("area", area, tmpl),
+                    ("area_recalibrated", area, area),
                 ):
                     bits = evaluate_codebook(
                         cal, self.patterns, self.headline, draws, _tgen(self.device, seed, 52), data
@@ -397,6 +414,30 @@ def run_reference_check(task: WriteTask) -> dict[str, Any]:
         "bits_reference_data_surrogate_calibration": cross,
         "seconds": time.perf_counter() - t0,
     }
+
+
+def log_example_traces(task: WriteTask) -> None:
+    """Raw traces (10 shots, full surrogate through ``run()``) of the seed-0 RL and gradient writes of the first and
+    last pattern, both conditions."""
+    from glowbox.learn.reservoir import init_prefix
+    from glowbox.sim.surrogate import SurrogateSimulator
+
+    sim = SurrogateSimulator(task.device, task.sys_eval.options)
+    rng = np.random.default_rng([task.base_seed, 3])
+    env = task.env(0)
+    sc = task.cfg["system"]
+    pre = init_prefix(int(sc["init_ns"]), int(sc["settle_ns"]), grid_ns=task.layout.grid_ns)
+    off = float(task.cfg["detuned_offset_hz"])
+    for cname, offset in (("resonant", 0.0), ("detuned", off)):
+        for name in ("rl", "gradient"):
+            p = task.codebooks.get((0, cname, name))
+            if p is None:
+                continue
+            rows = suffix_to_numpy(p, task.layout, offset_hz=offset).unbatch()
+            for j in (0, len(rows) - 1):
+                seq = full_sequence(pre, rows[j])
+                tr = sim.run(seq, env, shots=10, rng=rng)
+                task.run.log_trace(tr, seq, condition=cname, write=name, pattern=int(j))
 
 
 # --- plots -----------------------------------------------------------------------------------------------------------
@@ -511,7 +552,7 @@ def timing_verdicts(task: WriteTask) -> dict[str, Any]:
     for name in ("rl", "gradient", "random"):
         r: dict[str, Any] = {}
         base = float(_sel(df, encoder=name).groupby("seed").bits0.first().mean())
-        for probe in ("frozen", "recalibrated", "area"):
+        for probe in ("frozen", "recalibrated", "area", "area_recalibrated"):
             d = _sel(df, encoder=name, probe=probe)
             d = d[d.shift_ns.abs() == big]
             per = d.groupby("seed").apply(lambda x: float((x.bits - x.bits0).mean()))
@@ -525,6 +566,7 @@ def timing_verdicts(task: WriteTask) -> dict[str, Any]:
         r["relies_on_pulse_timing"] = bool(r["frozen"][2] < thr)
         r["information_needs_timing"] = bool(r["recalibrated"][2] < thr)
         r["area_explains"] = bool(r["area"][0] <= 0.5 * r["frozen"][0])
+        r["area_explains_recalibrated"] = bool(r["area_recalibrated"][0] <= 0.5 * r["recalibrated"][0])
         r["uses_phases"] = bool(r["phase_frozen"][2] < thr)
         ar = pd.DataFrame(task.area_rows)
         a = _sel(ar, encoder=name)
@@ -549,14 +591,18 @@ def report_body(task: WriteTask, qt: QuantumTestResult, tv: dict[str, Any], ref:
     )
     L += ["", "## Result", ""]
     L.append(f"Recalled bits (of {task.n_bits}) at {h} shots per recall, mean over {len(qt.seeds)} seeds [95 % t CI]:")
-    L += ["", "| write | resonant | detuned | gap (resonant - detuned) | gap significant | bit accuracy, resonant |"]
-    L.append("| --- | --- | --- | --- | --- | --- |")
+    L += [
+        "",
+        "| write | resonant | detuned | gap (resonant - detuned) | gap significant | bit accuracy, resonant "
+        "| pattern information (bits), resonant |",
+    ]
+    L.append("| --- | --- | --- | --- | --- | --- | --- |")
     for n in ENCODERS:
         s = qt.summary(f"{n}_bits")
         L.append(
             f"| {LABELS[n]} | {_ci(s['resonant'])} | {_ci(s['detuned'])} | {_ci(s['gap'])} | "
             f"{'yes' if qt.gap_significant(f'{n}_bits') else 'no'} | "
-            f"{_ci(t_ci(qt.values['resonant'][f'{n}_bitacc']))} |"
+            f"{_ci(t_ci(qt.values['resonant'][f'{n}_bitacc']))} | {_ci(t_ci(qt.values['resonant'][f'{n}_info']))} |"
         )
     L.append("")
 
@@ -568,7 +614,7 @@ def report_body(task: WriteTask, qt: QuantumTestResult, tv: dict[str, Any], ref:
     L.append(
         "- Paired differences in recalled bits, resonant: RL - random "
         f"{paired('rl', 'random')}; gradient - RL {paired('gradient', 'rl')}; RL - RL before training "
-        f"{paired('rl', 'rl_init')}."
+        f"{paired('rl', 'rl_init')}; RL mean - RL sampled codebook {paired('rl', 'rl_sample')}."
     )
     sig = [n for n in ENCODERS if qt.gap_significant(f"{n}_bits")]
     det = [t_ci(qt.values["detuned"][f"{n}_bits"])[0] for n in ENCODERS]
@@ -610,15 +656,16 @@ def report_body(task: WriteTask, qt: QuantumTestResult, tv: dict[str, Any], ref:
     )
     L += [
         "",
-        "| write | bits | frozen | recalibrated | equal area | phases scrambled (frozen) | phases scrambled (recal.) "
-        "| median area (pi) | areas in (pi/4, 4 pi) |",
+        "| write | bits | frozen | recalibrated | equal area (frozen) | equal area (recal.) "
+        "| phases scrambled (frozen) | phases scrambled (recal.) | median area (pi) | areas in (pi/4, 4 pi) |",
     ]
-    L.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    L.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for n in ("rl", "gradient", "random"):
         r = tv[n]
         L.append(
             f"| {LABELS[n]} | {r['bits0']:.3g} | {_ci(r['frozen'], '{:+.2f}')} | {_ci(r['recalibrated'], '{:+.2f}')} | "
-            f"{_ci(r['area'], '{:+.2f}')} | {_ci(r['phase_frozen'], '{:+.2f}')} | "
+            f"{_ci(r['area'], '{:+.2f}')} | {_ci(r['area_recalibrated'], '{:+.2f}')} | "
+            f"{_ci(r['phase_frozen'], '{:+.2f}')} | "
             f"{_ci(r['phase_recalibrated'], '{:+.2f}')} | {_ci(r['median_area_pi'], '{:.2f}')} | "
             f"{_ci(r['frac_rabi'], '{:.2f}')} |"
         )
@@ -630,8 +677,8 @@ def report_body(task: WriteTask, qt: QuantumTestResult, tv: dict[str, Any], ref:
             f"- {LABELS[n]}: relies on its pulse timing (frozen, > 10 % fewer bits, CI): "
             f"{yn[r['relies_on_pulse_timing']]}; the information needs it (recalibrated still > 10 % fewer): "
             f"{yn[r['information_needs_timing']]}; the equal-area control costs at least half as much (pulse area, "
-            f"not timing as such): {yn[r['area_explains']]}; coherent phases matter (frozen, scrambled): "
-            f"{yn[r['uses_phases']]}."
+            f"not timing as such): {yn[r['area_explains']]} (recalibrated: {yn[r['area_explains_recalibrated']]}); "
+            f"coherent phases matter (frozen, scrambled): {yn[r['uses_phases']]}."
         )
     L.append(
         "- `strategy_learns_timing` (RL relies on its pulse timing, Rabi-scale areas) = "
@@ -647,7 +694,11 @@ def report_body(task: WriteTask, qt: QuantumTestResult, tv: dict[str, Any], ref:
         f"{ref['bits_reference_data_surrogate_calibration']:.3f} ({ref['seconds']:.0f} s)."
     )
     L += ["", "## Quantum test", ""]
-    L.append(qt.to_markdown([f"{n}_bits" for n in ENCODERS] + [f"{n}_bitacc" for n in ENCODERS]))
+    L.append(
+        qt.to_markdown(
+            [f"{n}_bits" for n in ENCODERS] + [f"{n}_bitacc" for n in ENCODERS] + [f"{n}_info" for n in ENCODERS]
+        )
+    )
     L += ["", "## Setup", ""]
     c = task.cfg
     rc, gc = c["rl"], c["gradient"]
@@ -699,6 +750,7 @@ def main(
         qt.higher_is_better = {m: True for m in qt.metrics()}
         print("[m5-write] reference check", flush=True)
         ref = run_reference_check(task)
+        log_example_traces(task)
         tv = timing_verdicts(task)
         for name, rows in (
             ("recall", task.rows),

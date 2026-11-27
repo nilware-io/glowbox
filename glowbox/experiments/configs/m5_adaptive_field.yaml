@@ -44,6 +44,8 @@ posterior:                    # glowbox.learn.adaptive.PosteriorConfig
   mh_steps: 3
   mh_scale: 0.6
   n_predict: 64
+  restart_at: [10, 25, 50, 75, 100]   # annealed restarts from the prior through all data (lost-mode rescue)
+  restart_margin: 1.0
 
 data:
   n_test: 200                 # true fields per seed (the same in both arms)
@@ -57,7 +59,7 @@ policies:
 rl:                           # glowbox.learn.rl (PPO)
   num_envs: 256               # episodes per iteration (all in parallel on the GPU)
   iterations: 40
-  train_particles: 256        # posterior particles while training (evaluation: posterior.n_particles)
+  train_particles: 256        # posterior particles while training (evaluation: posterior.n_particles); no restarts
   lr: 1.0e-3
   epochs: 4
   minibatches: 16
@@ -103,6 +105,7 @@ quick:
   posterior:
     n_particles: 128
     n_predict: 32
+    restart_at: [5, 10, 20]
   data:
     n_test: 16
     n_pool: 96

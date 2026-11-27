@@ -87,6 +87,13 @@ class PosteriorConfig:
     n_predict: int = 128
     #: Most tempering stages per block (see :meth:`FieldPosterior.update`).
     max_stages: int = 12
+    #: After these numbers of blocks, an independent particle set is annealed from the prior through all data so
+    #: far and replaces the running one where it reaches a better posterior density (:meth:`FieldPosterior.restart`).
+    restart_at: tuple[int, ...] = (10, 25, 50)
+    #: Nats by which the restarted set's best particle must beat the running set's best to replace it.
+    restart_margin: float = 1.0
+    #: Most tempering stages of a restart.
+    restart_stages: int = 40
 
 
 def _ess(logw: torch.Tensor) -> torch.Tensor:
@@ -125,6 +132,9 @@ class FieldPosterior:
         self.counts = torch.zeros(n_episodes, spec.n_actions, spec.n_windows, dtype=torch.float64, device=dev)
         self.shots = torch.zeros(n_episodes, spec.n_actions, dtype=torch.float64, device=dev)
         self.n_moves = 0
+        self.n_updates = 0
+        self.n_restarts = 0
+        self.n_replaced = 0
         self.accept: list[float] = []
         #: The block being folded in (actions, counts, shots, phi) of the selected episodes during an update.
         self._pending: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
@@ -175,17 +185,7 @@ class FieldPosterior:
             todo = phi < 1.0
             if not bool(todo.any()):
                 break
-            rem = 1.0 - phi
-            full_ok = _ess(self.logw + rem[:, None] * inc) >= thr
-            lo = torch.zeros_like(phi)
-            hi = rem.clone()
-            for _ in range(30):
-                mid = 0.5 * (lo + hi)
-                ok = _ess(self.logw + mid[:, None] * inc) >= thr
-                lo, hi = torch.where(ok, mid, lo), torch.where(ok, hi, mid)
-            # Always make progress (a stage of at least 1e-4 of the block or the rest).
-            d = torch.where(full_ok, rem, torch.maximum(lo, torch.minimum(rem, torch.full_like(rem, 1e-4))))
-            d = torch.where(todo, d, torch.zeros_like(d))
+            d = torch.where(todo, self._bisect(self.logw, inc, 1.0 - phi, thr), torch.zeros_like(phi))
             self.logw = self.logw + d[:, None] * inc
             self.logw = self.logw - self.logw.max(-1, keepdim=True).values
             phi = phi + d
@@ -205,6 +205,71 @@ class FieldPosterior:
         self.counts[e, a] += y
         self.shots[e, a] += s
         self.maybe_resample()
+        self.n_updates += 1
+        if self.n_updates in self.cfg.restart_at:
+            self.restart()
+
+    def _bisect(self, logw: torch.Tensor, inc: torch.Tensor, rem: torch.Tensor, thr: float) -> torch.Tensor:
+        """Largest step d in (0, rem] per episode with ESS(logw + d inc) >= thr (at least 1e-4 or the rest)."""
+        full_ok = _ess(logw + rem[:, None] * inc) >= thr
+        lo, hi = torch.zeros_like(rem), rem.clone()
+        for _ in range(30):
+            mid = 0.5 * (lo + hi)
+            ok = _ess(logw + mid[:, None] * inc) >= thr
+            lo, hi = torch.where(ok, mid, lo), torch.where(ok, hi, mid)
+        return torch.where(full_ok, rem, torch.maximum(lo, torch.minimum(rem, torch.full_like(rem, 1e-4))))
+
+    def restart(self, which: torch.Tensor | None = None) -> torch.Tensor:
+        """Anneal a fresh particle set from the prior through every block so far (tempered likelihood L^phi, phi
+        0 -> 1 in ESS-controlled stages, resample-move after each; L^phi of Poisson counts is the likelihood of
+        the counts and shots scaled by phi) and adopt it in the episodes where its best particle's posterior
+        density beats the running set's best by ``restart_margin`` nats.
+
+        Why: a particle filter can lose the true mode for good early on (a few particles survive the first
+        informative blocks, the true configuration of lines among them by chance or not); every later design then
+        refines a wrong mode, since the truth has no particle. An independent second pass over the same data rarely
+        fails the same way, and keeping the better of the two by posterior density is safe (on a correct running
+        set the restart changes nothing). Returns the episodes replaced (E,) bool."""
+        e_all = self.n_episodes
+        sel = torch.ones(e_all, dtype=torch.bool, device=self.device) if which is None else which
+        sel = sel & (self.shots.sum(-1) > 0)
+        idx_e = torch.nonzero(sel).reshape(-1)
+        replaced = torch.zeros(e_all, dtype=torch.bool, device=self.device)
+        if idx_e.numel() == 0:
+            return replaced
+        sub = FieldPosterior(self.table, self.prior, int(idx_e.numel()), self.cfg, self.gen)
+        c_all, s_all = self.counts[idx_e], self.shots[idx_e]
+        thr = self.cfg.ess_frac * sub.particles.shape[1]
+        phi = torch.zeros(idx_e.numel(), dtype=torch.float64, device=self.device)
+        for _ in range(self.cfg.restart_stages):
+            todo = phi < 1.0
+            if not bool(todo.any()):
+                break
+            sub.counts, sub.shots = c_all, s_all
+            inc = sub.log_likelihood(sub.particles)
+            d = torch.where(todo, sub._bisect(sub.logw, inc, 1.0 - phi, thr), torch.zeros_like(phi))
+            sub.logw = sub.logw + d[:, None] * inc
+            sub.logw = sub.logw - sub.logw.max(-1, keepdim=True).values
+            phi = torch.where(phi + d > 1.0 - 1e-12, torch.ones_like(phi), phi + d)
+            low = (sub.ess() < thr * 1.0001) & todo
+            if bool(low.any()):
+                sub.counts, sub.shots = c_all * phi[:, None, None], s_all * phi[:, None]
+                sub.resample_move(low)
+        sub.counts, sub.shots = c_all, s_all
+        if bool((phi < 1.0).any()):
+            sub.logw = sub.logw + (1.0 - phi)[:, None] * sub.log_likelihood(sub.particles)
+        old = self.particles[idx_e]
+        lp_old = (self.prior.log_density(old) + sub.log_likelihood(old)).max(-1).values
+        lp_new = (self.prior.log_density(sub.particles) + sub.log_likelihood(sub.particles)).max(-1).values
+        better = lp_new > lp_old + self.cfg.restart_margin
+        if bool(better.any()):
+            rows = idx_e[better]
+            self.particles[rows] = sub.particles[better]
+            self.logw[rows] = sub.logw[better] - sub.logw[better].max(-1, keepdim=True).values
+            replaced[rows] = True
+        self.n_restarts += 1
+        self.n_replaced += int(better.sum())
+        return replaced
 
     def log_likelihood(self, b: torch.Tensor) -> torch.Tensor:
         """Log-likelihood of every block so far for fields b (E, n, 3), (E, n) (constants dropped), plus the
@@ -450,5 +515,5 @@ def run_episodes(
         np.stack(sd),
         np.stack(acts) if acts else np.zeros((0, e), np.int64),
         time.perf_counter() - t0,
-        {"moves": float(post.n_moves), "mh_accept": acc},
+        {"moves": float(post.n_moves), "mh_accept": acc, "restart_replaced": float(post.n_replaced)},
     )

@@ -42,7 +42,7 @@ task:
   draws_per_pattern: 512
 
 rl:                           # PPO on the codebook bandit (glowbox.learn.rl.CodebookEnv)
-  iterations: 400
+  iterations: 800
   codebooks: 16               # codebooks sampled per iteration (16 x 2^L actions)
   n_noise: 8                  # noise draws per pattern for the reward
   lr: 3.0e-3
