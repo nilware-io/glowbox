@@ -1,4 +1,4 @@
-# Milestone 5, Task 2 with a learned write: an RL agent (PPO, black box) chooses the write pulses of every L-bit
+# Milestone 5, Task 2 with a learned write: an RL agent (PPO, gradient-free) chooses the write pulses of every L-bit
 # pattern; compared with the same parametrisation trained by gradient through the differentiable surrogate
 # (milestone 4's learner) and fixed at random (milestone 3/4's reservoir). Recall: the Bayes-optimal readout of each
 # codebook after a dark storage delay. Quantum test: every MW frequency + 400 MHz, everything retrained.

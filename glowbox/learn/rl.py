@@ -315,7 +315,11 @@ class CodebookEnv:
 
     ``counts_fn(z)`` maps actions (N, n_action) to noiseless mean counts per shot (N, K) (the surrogate channel,
     or a ``run()``-based one); ``patterns`` (P, L) in {0, 1}. Observation: u = 2 b - 1 of every pattern, repeated
-    for ``n_codebooks`` codebooks."""
+    for ``n_codebooks`` codebooks.
+
+    The reward decodes with exact templates: the readout of each sampled write is its noiseless means from
+    ``counts_fn`` (calibration of every candidate write assumed free; on hardware they would be estimated from
+    noisy calibration shots first). The learner is gradient-free, not model-free in its reward."""
 
     def __init__(
         self,

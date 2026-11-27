@@ -11,7 +11,8 @@ As in milestone 3, the 2^L patterns form a codebook: each pattern's noiseless re
 fixed random encoder, the write block's pulse parameters (amplitude, phase, frequency within a few MHz of a device
 line, duration, per segment) are chosen per pattern by
 
-* an RL agent (:class:`~glowbox.learn.rl.CodebookEnv` + PPO): black box, reward = bits recovered per pattern;
+* an RL agent (:class:`~glowbox.learn.rl.CodebookEnv` + PPO): gradient-free, reward = bits recovered per pattern
+  (decoded with each write's exact templates);
 * gradient descent through the differentiable surrogate (:func:`train_gradient`, the milestone-4 learner), on the
   same objective: the expected log posterior of the written pattern under the Bayes-optimal readout, with
   reparametrised Gaussian shot noise;

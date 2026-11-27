@@ -1,6 +1,6 @@
 # Milestone 5, Task 2: an RL agent learns the write pulses of a bit pattern
 
-**Task 2 with a learned write.** 4-bit patterns are written by 8 MW segments (one per device line, 100 ns slots), held for a 1000 ns dark delay and recalled from a 1000 ns time-resolved readout by the Bayes-optimal readout of the codebook. The write of every pattern is chosen by a PPO agent (black box), by gradient through the differentiable surrogate, or fixed at random. Simulation only; no claim of quantum advantage: a gap only says that the performance depends on driving the spin resonance.
+**Task 2 with a learned write.** 4-bit patterns are written by 8 MW segments (one per device line, 100 ns slots), held for a 1000 ns dark delay and recalled from a 1000 ns time-resolved readout by the Bayes-optimal readout of the codebook. The write of every pattern is chosen by a PPO agent (gradient-free; its reward decodes with exact templates), by gradient through the differentiable surrogate, or fixed at random. Simulation only; no claim of quantum advantage: a gap only says that the performance depends on driving the spin resonance.
 
 ## Result
 
@@ -8,7 +8,7 @@ Recalled bits (of 4) at 10000 shots per recall, mean over 5 seeds [95 % t CI]:
 
 | write | resonant | detuned | gap (resonant - detuned) | gap significant | bit accuracy, resonant | pattern information (bits), resonant |
 | --- | --- | --- | --- | --- | --- | --- |
-| RL agent (PPO, black box) | 3.01 [2.72, 3.3] | 0.0053 [0.000965, 0.00964] | 3.01 [2.72, 3.3] | yes | 0.956 [0.941, 0.971] | 3.68 [3.57, 3.78] |
+| RL agent (PPO, gradient-free) | 3.01 [2.72, 3.3] | 0.0053 [0.000965, 0.00964] | 3.01 [2.72, 3.3] | yes | 0.956 [0.941, 0.971] | 3.68 [3.57, 3.78] |
 | RL, one codebook sampled from the final policy | 2.42 [2.13, 2.71] | 0.0038 [0.000991, 0.0066] | 2.42 [2.12, 2.71] | yes | 0.916 [0.895, 0.938] | 3.44 [3.3, 3.57] |
 | gradient through the surrogate (M4 learner) | 3.65 [3.44, 3.86] | 0.00618 [0.0019, 0.0105] | 3.65 [3.44, 3.86] | yes | 0.988 [0.98, 0.997] | 3.91 [3.85, 3.96] |
 | fixed random encoder (M3/M4 reservoir) | 0.856 [0.378, 1.33] | 0.000581 [4.17e-05, 0.00112] | 0.855 [0.377, 1.33] | yes | 0.752 [0.69, 0.815] | 2.17 [1.81, 2.53] |
@@ -20,7 +20,7 @@ Recalled bits (of 4) at 10000 shots per recall, mean over 5 seeds [95 % t CI]:
 
 ## Interpretation
 
-- **A black-box agent learns a good write.** PPO, seeing only the reward (bits recovered by the Bayes-optimal
+- **A gradient-free agent learns a good write.** PPO, seeing only the reward (bits recovered by the Bayes-optimal
   readout), reaches 3.01 [2.72, 3.30] recalled bits of 4 at 10000 shots: 3.5x the fixed random encoder of
   milestones 3-4 (RL - random 2.16 [1.62, 2.69] bits) and 82 % of the white-box write trained by gradient through
   the differentiable surrogate (3.65; gradient - RL 0.64 [0.35, 0.94] bits). Bit accuracy 0.956 vs 0.988
@@ -47,7 +47,11 @@ Recalled bits (of 4) at 10000 shots per recall, mean over 5 seeds [95 % t CI]:
 - One static field per run (eight lines), nuisance drawn per seed and known to the readout (calibrated device);
   4-bit patterns, 1 us storage delay.
 - The task is a one-step contextual bandit (context = the bit pattern): PPO's advantage estimation is trivial here;
-  the agent is a black-box optimiser of the same objective the gradient learner uses.
+  the agent is a gradient-free optimiser of the same objective the gradient learner uses.
+- The agent is gradient-free, not model-free in its reward: each sampled write's readout templates are its exact
+  noiseless means from the simulator (`CodebookEnv.step`: the recalls are drawn from those means and decoded with
+  them), so calibrating the templates of every candidate write is assumed free. On hardware each candidate would
+  first need its templates estimated from noisy calibration shots; that cost is not counted here.
 - Training uses 8 T2* quadrature nodes, evaluation 32 (the reference check confirms the evaluated templates).
 - PPO budget: 800 iterations x 16 codebooks per seed and condition (63 of 94 min wall time).
 
@@ -55,7 +59,7 @@ Recalled bits (of 4) at 10000 shots per recall, mean over 5 seeds [95 % t CI]:
 
 Recalled bits, resonant / detuned, mean [95 % t CI]:
 
-| shots | RL agent (PPO, black box) | RL, one codebook sampled from the final policy | gradient through the surrogate (M4 learner) | fixed random encoder (M3/M4 reservoir) | RL policy before training |
+| shots | RL agent (PPO, gradient-free) | RL, one codebook sampled from the final policy | gradient through the surrogate (M4 learner) | fixed random encoder (M3/M4 reservoir) | RL policy before training |
 | --- | --- | --- | --- | --- | --- |
 | 1000 | 1.18 [0.969, 1.39] / 0.00106 [0.000226, 0.00189] | 1.24 [1.17, 1.31] / 0.000932 [0.00017, 0.00169] | 1.17 [0.936, 1.4] / 0.000886 [0.000212, 0.00156] | 0.373 [0.125, 0.621] / 0.000118 [-3.74e-05, 0.000273] | 0.000736 [-0.000171, 0.00164] / 0.000211 [-5.23e-05, 0.000474] |
 | 10000 | 3.01 [2.72, 3.3] / 0.0053 [0.000965, 0.00964] | 2.42 [2.13, 2.71] / 0.0038 [0.000991, 0.0066] | 3.65 [3.44, 3.86] / 0.00618 [0.0019, 0.0105] | 0.856 [0.378, 1.33] / 0.000581 [4.17e-05, 0.00112] | 0.00293 [-9.26e-05, 0.00596] / 0.000271 [0.000164, 0.000379] |
@@ -69,11 +73,11 @@ Change in recalled bits at the largest shift (+-50 ns, mean of both signs) [t CI
 
 | write | bits | frozen | recalibrated | equal area (frozen) | equal area (recal.) | phases scrambled (frozen) | phases scrambled (recal.) | median area (pi) | areas in (pi/4, 4 pi) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| RL agent (PPO, black box) | 3.01 | -2.86 [-3.20, -2.52] | -1.60 [-1.96, -1.24] | -2.83 [-3.19, -2.47] | -1.71 [-2.35, -1.06] | -1.92 [-2.46, -1.38] | -0.39 [-0.62, -0.16] | 0.39 [0.32, 0.45] | 0.60 [0.56, 0.64] |
+| RL agent (PPO, gradient-free) | 3.01 | -2.86 [-3.20, -2.52] | -1.60 [-1.96, -1.24] | -2.83 [-3.19, -2.47] | -1.71 [-2.35, -1.06] | -1.92 [-2.46, -1.38] | -0.39 [-0.62, -0.16] | 0.39 [0.32, 0.45] | 0.60 [0.56, 0.64] |
 | gradient through the surrogate (M4 learner) | 3.66 | -3.57 [-3.78, -3.35] | -2.47 [-2.73, -2.21] | -3.58 [-3.76, -3.39] | -2.77 [-3.11, -2.43] | -2.59 [-3.03, -2.15] | -1.37 [-1.87, -0.88] | 0.36 [0.35, 0.37] | 0.66 [0.64, 0.67] |
 | fixed random encoder (M3/M4 reservoir) | 0.865 | -0.85 [-1.33, -0.37] | -0.31 [-0.70, +0.08] | -0.86 [-1.33, -0.38] | -0.34 [-0.73, +0.05] | -0.60 [-0.92, -0.28] | +0.04 [-0.31, +0.38] | 0.33 [0.19, 0.46] | 0.66 [0.45, 0.88] |
 
-- RL agent (PPO, black box): relies on its pulse timing (frozen, > 10 % fewer bits, CI): yes; the information needs it (recalibrated still > 10 % fewer): yes; the equal-area control costs at least half as much (pulse area, not timing as such): yes (recalibrated: yes); coherent phases matter (frozen, scrambled): yes.
+- RL agent (PPO, gradient-free): relies on its pulse timing (frozen, > 10 % fewer bits, CI): yes; the information needs it (recalibrated still > 10 % fewer): yes; the equal-area control costs at least half as much (pulse area, not timing as such): yes (recalibrated: yes); coherent phases matter (frozen, scrambled): yes.
 - gradient through the surrogate (M4 learner): relies on its pulse timing (frozen, > 10 % fewer bits, CI): yes; the information needs it (recalibrated still > 10 % fewer): yes; the equal-area control costs at least half as much (pulse area, not timing as such): yes (recalibrated: yes); coherent phases matter (frozen, scrambled): yes.
 - `strategy_learns_timing` (RL relies on its pulse timing, Rabi-scale areas) = **True**.
 

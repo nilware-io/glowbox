@@ -82,7 +82,7 @@ REPORT_NAME = "m5-rl-bit-write"
 ENCODERS = ("rl", "rl_sample", "gradient", "random", "rl_init")
 COLORS = {"rl": "#eb6834", "rl_sample": "#c0392b", "gradient": "#2a78d6", "random": "#8a8985", "rl_init": "#f2b48f"}
 LABELS = {
-    "rl": "RL agent (PPO, black box)",
+    "rl": "RL agent (PPO, gradient-free)",
     "gradient": "gradient through the surrogate (M4 learner)",
     "random": "fixed random encoder (M3/M4 reservoir)",
     "rl_init": "RL policy before training",
@@ -585,9 +585,9 @@ def report_body(task: WriteTask, qt: QuantumTestResult, tv: dict[str, Any], ref:
         f"**Task 2 with a learned write.** {task.n_bits}-bit patterns are written by {ly.n_segments} MW segments (one "
         f"per device line, {ly.slot_ns} ns slots), held for a {ly.delay_ns} ns dark delay and recalled from a "
         f"{ly.readout_ns} ns time-resolved readout by the Bayes-optimal readout of the codebook. The write of every "
-        "pattern is chosen by a PPO agent (black box), by gradient through the differentiable surrogate, or fixed at "
-        "random. Simulation only; no claim of quantum advantage: a gap only says that the performance depends on "
-        "driving the spin resonance."
+        "pattern is chosen by a PPO agent (gradient-free; its reward decodes with exact templates), by gradient "
+        "through the differentiable surrogate, or fixed at random. Simulation only; no claim of quantum advantage: "
+        "a gap only says that the performance depends on driving the spin resonance."
     )
     L += ["", "## Result", ""]
     L.append(f"Recalled bits (of {task.n_bits}) at {h} shots per recall, mean over {len(qt.seeds)} seeds [95 % t CI]:")
