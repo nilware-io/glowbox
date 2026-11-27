@@ -395,11 +395,14 @@ def _analyse_rep(job: dict[str, Any]) -> dict[str, Any]:
         "stable": rep.stability["stable"],
         "model_ok_cal": rep.model_check["calibration"],
         "model_ok_conf": rep.model_check["confirmatory"],
+        "model_ok": rep.model_check["passed"],
+        "consistent": ",".join(rep.model_check["consistent"]),
         "margin0": cal.margin[0],
         "margin1": cal.margin[1],
         "sd_mean0": cal.sd_mean[0],
         "sd_mean1": cal.sd_mean[1],
         "c_ref": cal.c_ref,
+        "block_len0": cal.block_len.get(0, float("nan")),
     }
     for h, r in rep.primary.items():
         out[f"{h}_p"] = r["p"]
@@ -414,15 +417,37 @@ def _analyse_rep(job: dict[str, Any]) -> dict[str, Any]:
         out[f"{h}_nw_rej"] = bool(r.get("nw_p", 1.0) <= pa.ALPHA)
         out[f"{h}_conclusion"] = r["conclusion"]
     for s, r in rep.secondary.items():
-        out[f"{s}_rej"] = bool(r["holm_rejected"])
+        out[f"{s}_rej"] = bool(r["rejected"])
+        out[f"{s}_rej_cal"] = bool(r["holm_rejected"])
+    for s, r in rep.manipulation.items():
+        out[f"{s}_passed"] = bool(r["passed"])
     return out
+
+
+#: Keys of a model's config entry that are not nuisance parameters: ``decision: offline`` makes the model's runs
+#: replay offline sequences in the decision arm's slot (a model in which the decision process cannot select on the
+#: drift: theta0_D = 0 whatever the drift).
+MODEL_KEYS = ("decision",)
 
 
 def nuisance(cfg: dict[str, Any], *overrides: dict[str, Any] | None) -> dict[str, float]:
     nu = {"within_sigma": 0.0, "within_rho": 0.0, **{k: float(v) for k, v in cfg["nuisance"].items()}}
     for o in overrides:
-        nu.update({k: float(v) for k, v in (o or {}).items()})
+        nu.update({k: float(v) for k, v in (o or {}).items() if k not in MODEL_KEYS})
     return nu
+
+
+#: The confirmatory design of a ``decision: offline`` model run: the decision arm's slot replays offline sequence k,
+#: the yoked arms replay offline sequence k - 1 (the decision arm's sequence one block later, as in the design).
+NOSELECT_MODEL_ARMS = (
+    ArmSpec("A1", "replay", observed=True, source="offline", lag=0),
+    ArmSpec("A2", "replay", observed=True, source="offline", lag=1),
+    ArmSpec("A3", "replay", observed=False, source="offline", lag=1),
+    ArmSpec("A3b", "replay", observed=False, source="offline", lag=1),
+    ArmSpec("A3L", "replay", observed=False, source="offline", lag=2),
+    ArmSpec("A4", "sham", observed=True),
+    ArmSpec("A5", "replay", observed=True, source="offline", lag=1, variant="detuned"),
+)
 
 
 def simulate_batch(
@@ -505,9 +530,11 @@ def simulate_batch(
     if phase == "model":
         sch = np.stack([block_schedule(k.order, conf_design.names, n_conf) for k in keys])
         dev = device(sch.shape[1] * sch.shape[2], base)
+        noselect = cfg["models"][condition].get("decision") == "offline"
+        design = ProtocolDesign(NOSELECT_MODEL_ARMS, t_n) if noselect else conf_design
         data = run_design(
-            conf_design, n_conf, sch, ctrl, dev, seal_key, blind_key, decoy_rng, sham_rng, off_actions, pool,
-            arms=MODEL_ARMS,
+            design, n_conf, sch, ctrl, dev, seal_key, blind_key, decoy_rng, sham_rng, off_actions, pool,
+            offline=off_actions if noselect else None, arms=MODEL_ARMS,
         )  # fmt: skip
         names = {a: a for a in MODEL_ARMS}
         return [
@@ -647,7 +674,7 @@ def validation_lock(run_dir: Path, config_path: Path, cfg: dict[str, Any]) -> tu
     configs: list[Path] = [eff]
     if config_path.resolve().is_relative_to(REPO_ROOT.resolve()):
         configs.append(config_path)
-    lock = pa.create_plan_lock(["glowbox.experiments.prereg_calibration"], configs)
+    lock = pa.create_plan_lock(["glowbox.experiments.prereg_calibration"], configs, model_set=cfg["models"])
     path = lock.write(run_dir / "validation.lock.yaml")
     pa.verify_lock(lock)
     return lock, path
@@ -678,25 +705,62 @@ def fmt_rate(x: tuple[float, float, float, int]) -> str:
     return f"{x[0]:.3f} [{x[1]:.3f}, {x[2]:.3f}] (n = {x[3]})"
 
 
+#: Upper bound of the decisive error rate (the nominal primary family) at the documented full size.
+DECISIVE_TOLERANCE = 0.06
+#: The documented full size: nominal null replicates and replicates per stress condition.
+FULL_NULL_RUNS = 4000
+FULL_STRESS_RUNS = 1000
+
+
 @dataclass
 class Criterion:
-    """A pass criterion of the plan (section 12), stated on the Clopper-Pearson 95 % interval of a rate."""
+    """A pass criterion of the plan (section 12), stated on the Clopper-Pearson 95 % interval of a rate.
+
+    ``rule``: "lo<=x" (descriptive error rate: the interval is not above x), "hi>=x" (coverage, power or claim
+    rate: the interval is not below x), "hi<=x" (decisive error rate: the interval's upper bound is at most x; it can
+    show that a test is calibrated, and is judged only at the documented full size: ``full`` False -> PENDING)."""
 
     what: str
     value: tuple[float, float, float, int]
-    rule: str  # "lo<=x": the interval's lower bound is at most x (not above x); "hi>=x": upper bound at least x
+    rule: str
     x: float
+    full: bool = True
+
+    @property
+    def pending(self) -> bool:
+        return self.rule == "hi<=x" and not self.full
 
     @property
     def passed(self) -> bool:
         _, lo, hi, n = self.value
-        if n == 0:
+        if n == 0 or self.pending:
             return False
-        return lo <= self.x if self.rule == "lo<=x" else hi >= self.x
+        if self.rule == "lo<=x":
+            return lo <= self.x
+        if self.rule == "hi<=x":
+            return hi <= self.x
+        return hi >= self.x
+
+    @property
+    def status(self) -> str:
+        return "PENDING (full size)" if self.pending else ("PASS" if self.passed else "FAIL")
 
     def line(self) -> str:
-        cmp = f"not above {self.x:g}" if self.rule == "lo<=x" else f"not below {self.x:g}"
-        return f"| {self.what} | {fmt_rate(self.value)} | {cmp} | {'PASS' if self.passed else 'FAIL'} |"
+        cmp = {
+            "lo<=x": f"not above {self.x:g}",
+            "hi>=x": f"not below {self.x:g}",
+            "hi<=x": f"upper bound <= {self.x:g} at the full size",
+        }[self.rule]
+        return f"| {self.what} | {fmt_rate(self.value)} | {cmp} | {self.status} |"
+
+
+def verdict(crit: list[Criterion]) -> str:
+    """The report's overall line."""
+    if any(not c.passed and not c.pending for c in crit):
+        return "FAIL"
+    if any(c.pending for c in crit):
+        return "every criterion judged at this size passes; the decisive criterion needs the full-size run"
+    return "PASS"
 
 
 def _any(res: list[dict[str, Any]], keys: list[str]) -> list[dict[str, Any]]:
@@ -707,32 +771,45 @@ def _not(res: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     return [{"x": not r[key]} for r in res]
 
 
+#: Stress conditions with a pass criterion (primary family, any positive claim); others are reported only.
+STRESS_CRITERIA = ("drift_covered", "drift_unmodelled", "nonstationary", "drift_wrong_member")
+
+
 def criteria(
     null: dict[str, list[dict[str, Any]]],
     pos: dict[str, list[dict[str, Any]]],
     eng: dict[str, list[dict[str, Any]]],
+    full: bool = False,
 ) -> list[Criterion]:
     a, pw = pa.ALPHA, pa.POWER
     nom = null["nominal"]
-    sec = [f"{k}_rej" for k in pa.SECONDARY if k != "S4_quantum_test"]
+    sec = [f"{k}_rej" for k in pa.SECONDARY]
     both = ["H_decision_rej", "H_observer_rej"]
 
-    def err(what: str, res: list[dict[str, Any]], key: str) -> Criterion:
-        return Criterion(what, rate(res, key), "lo<=x", a)
+    def err(what: str, res: list[dict[str, Any]], key: str, x: float = a) -> Criterion:
+        return Criterion(what, rate(res, key), "lo<=x", x)
 
     def at_least(what: str, res: list[dict[str, Any]], key: str, x: float) -> Criterion:
         return Criterion(what, rate(res, key), "hi>=x", x)
 
     out = [
+        Criterion(
+            "nominal: primary family, any positive claim (complete rule) [decisive]",
+            rate(_any(nom, both), "x"),
+            "hi<=x",
+            DECISIVE_TOLERANCE,
+            full,
+        ),
         err("nominal: H_decision, p <= 0.05 against the calibration null", nom, "H_decision_raw_rej"),
         err("nominal: H_observer, p <= 0.05 against the calibration null", nom, "H_observer_raw_rej"),
         err("nominal: primary family, any positive claim (complete rule)", _any(nom, both), "x"),
-        err("nominal: secondary family S1-S3, any Holm rejection", _any(nom, sec), "x"),
+        err("nominal: secondary family S2-S3, any rejection (complete rule)", _any(nom, sec), "x"),
         at_least("nominal: H_decision 95 % interval covers 0", nom, "H_decision_cover", 0.95),
         at_least("nominal: H_observer 95 % interval covers 0", nom, "H_observer_cover", 0.95),
         at_least("nominal: H_decision null claim", nom, "H_decision_null_claim", pw),
         at_least("nominal: H_observer null claim", nom, "H_observer_null_claim", pw),
         err("nominal: null-stability check flags the run", _not(nom, "stable"), "x"),
+        at_least("nominal: manipulation check S4 passes", nom, "S4_quantum_test_passed", 0.95),
         at_least("nominal: arm names absent from every blinded output", nom, "names_hidden", 1.0),
     ]
     for plant, h in (("decision", "H_decision"), ("observer", "H_observer")):
@@ -742,9 +819,17 @@ def criteria(
             at_least(f"positive {plant}, 1 x margin: attributed", res, "identified", pw),
             at_least(f"positive {plant}, 1 x margin: not equivalent", _not(res, f"{h}_eq"), "x", pw),
         ]
-    for cond in ("drift_covered", "drift_unmodelled", "nonstationary"):
+    for cond in STRESS_CRITERIA:
         if null.get(cond):
             out.append(err(f"{cond}: primary family, any positive claim", _any(null[cond], both), "x"))
+    for plant, h in (("decision", "H_decision"), ("observer", "H_observer")):
+        res = pos.get(f"nonstationary:{plant}:1", [])
+        if res:
+            out.append(
+                err(
+                    f"nonstationary, {plant} effect = 1 x margin: false null claim", res, f"{h}_null_claim", pa.ALPHA_EQ
+                )
+            )
     for name, res in eng.items():
         if name.startswith("null"):
             out.append(err(f"engineering test, {name}: rejection rate", res, "rej"))
@@ -772,7 +857,10 @@ def summary_markdown(
     m1 = np.array([r["margin1"] for r in nom])
     sd0 = np.array([r["sd_mean0"] for r in nom])
     cref = np.array([r["c_ref"] for r in nom])
-    crit = criteria(null, pos, eng)
+    full = len(nom) >= FULL_NULL_RUNS and all(
+        len(v) >= FULL_STRESS_RUNS for k, v in null.items() if k != "nominal" and v
+    )
+    crit = criteria(null, pos, eng, full)
     lines = [
         "Stage-S validation of the PREREG-001 pipeline (docs/preregistration/PREREG-001-observer-decision.md). The "
         "simulator has no decision or observer effect by construction: these numbers say whether the frozen procedure "
@@ -791,8 +879,9 @@ def summary_markdown(
         "",
         "## Frozen quantities (nominal condition; median over the null replicates, each replicate freezes its own)",
         "",
-        "- Margin rule (section 5): Delta = Q_{1-alpha/2}(|D|) + Q_{0.90}(|D|), D the control-vs-control null of "
-        f"the mean of N = {pa.N_CONF} pairs (the shift detected with power {pa.MARGIN_POWER} at Holm's first level).",
+        "- Margin rule (section 5): Delta = Q_{1-alpha/2}(|D|) + Q_{2 MARGIN_POWER - 1}(|D|), D the "
+        f"control-vs-control null of the mean of N = {pa.N_CONF} pairs (the shift detected with power "
+        f"{pa.MARGIN_POWER} at Holm's first level; MARGIN_POWER = 1 - alpha_eq).",
         f"- Margin, lag 0 (H_observer): {_median_iqr(m0)}; lag 1 (H_decision): {_median_iqr(m1)}, in units of the "
         "referenced fluorescence r = N_sig / N_ref.",
         f"- Control-vs-control SD of the mean of N pairs (lag 0): {_median_iqr(sd0)}; margin / SD: "
@@ -806,20 +895,24 @@ def summary_markdown(
         th = ", ".join(f"{m.theta0:.3g} +- {m.theta0_se:.2g}" for m in per_field.values())
         wc = ", ".join(f"{m.wcorr_mean:.3g}" for m in per_field.values())
         n_r = sum(m.n_runs for m in per_field.values())
-        lines.append(f"  - {name} ({n_r} runs): theta0_D per field {th}; predicted wcorr per field {wc}.")
+        params = cfg["models"][name] or "nominal"
+        lines.append(f"  - {name} ({params}; {n_r} runs): theta0_D per field {th}; predicted wcorr per field {wc}.")
     lines += [
         "",
         "## Pass criteria (plan section 12)",
         "",
-        "Each criterion is a rule on the Clopper-Pearson 95 % interval of a rate: an error rate passes when the "
-        "interval is not above alpha (its lower bound <= alpha), a coverage, power or claim rate when the interval "
-        "is not below its target (upper bound >= target).",
+        "Each criterion is a rule on the Clopper-Pearson 95 % interval of a rate. The decisive error rate (the "
+        f"nominal primary family) passes when the upper bound is at most {DECISIVE_TOLERANCE} at the documented full "
+        f"size (R = {FULL_NULL_RUNS} nominal, {FULL_STRESS_RUNS} per stress condition): a rule that can show the test "
+        "is calibrated; below the full size it is PENDING. Descriptive error rates pass when the interval is not "
+        "above their level (lower bound <= level), coverage, power and claim rates when it is not below their "
+        "target (upper bound >= target).",
         "",
         "| criterion | rate [95 % interval] | rule | result |",
         "| --- | --- | --- | --- |",
         *[c.line() for c in crit],
         "",
-        f"All criteria: {'PASS' if all(c.passed for c in crit) else 'FAIL'}.",
+        f"All criteria: {verdict(crit)}.",
         "",
         "## Null calibration (no effect), nominal condition",
         "",
@@ -842,26 +935,47 @@ def summary_markdown(
         "",
         f"- Model check passed: calibration block {fmt_rate(rate(nom, 'model_ok_cal'))}, confirmatory sealed controls "
         f"{fmt_rate(rate(nom, 'model_ok_conf'))}.",
-        "- The quantum test S4 (detuned vs resonant task error) rejects in "
-        f"{fmt_rate(rate(nom, 'S4_quantum_test_rej'))}.",
+        "- Manipulation check S4 (the detuned arm loses the task): passes in "
+        f"{fmt_rate(rate(nom, 'S4_quantum_test_passed'))}.",
+        "- Secondary family (S2, S3: decision cells at every consistent member's theta0_D of their statistic, every "
+        "cell against the calibration and the concurrent null): any rejection "
+        f"{fmt_rate(rate(_any(nom, [f'{k}_rej' for k in pa.SECONDARY]), 'x'))}; against the calibration null alone "
+        f"{fmt_rate(rate(_any(nom, [f'{k}_rej_cal' for k in pa.SECONDARY]), 'x'))}.",
         "",
         "## Stress conditions (no effect)",
         "",
-        "| condition | what differs | positive claim, H_decision | positive claim, H_observer | H_decision p <= 0.05 "
-        "(calibration null alone) | H_observer p <= 0.05 (calibration null alone) | model check passed "
-        "(both) | null stable |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| condition | what differs | model set | positive claim, H_decision | positive claim, H_observer | "
+        "H_decision p <= 0.05 (calibration null alone) | H_observer p <= 0.05 (calibration null alone) | model "
+        "check passed (a member reproduces both blocks) | null stable |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for cond, res in null.items():
         if cond == "nominal" or not res:
             continue
         desc = cfg["conditions"][cond].get("description", "")
-        both = [{"x": r["model_ok_cal"] and r["model_ok_conf"]} for r in res]
+        mset = ", ".join(cfg["conditions"][cond]["models"])
         lines.append(
-            f"| {cond} | {desc} | {fmt_rate(rate(res, 'H_decision_rej'))} | {fmt_rate(rate(res, 'H_observer_rej'))} | "
-            f"{fmt_rate(rate(res, 'H_decision_raw_rej'))} | {fmt_rate(rate(res, 'H_observer_raw_rej'))} | "
-            f"{fmt_rate(rate(both, 'x'))} | {fmt_rate(rate(res, 'stable'))} |"
+            f"| {cond} | {desc} | {mset} | {fmt_rate(rate(res, 'H_decision_rej'))} | "
+            f"{fmt_rate(rate(res, 'H_observer_rej'))} | {fmt_rate(rate(res, 'H_decision_raw_rej'))} | "
+            f"{fmt_rate(rate(res, 'H_observer_raw_rej'))} | {fmt_rate(rate(res, 'model_ok'))} | "
+            f"{fmt_rate(rate(res, 'stable'))} |"
         )
+    ns = {k.split(":")[1]: v for k, v in pos.items() if k.startswith("nonstationary:")}
+    if ns:
+        lines += [
+            "",
+            "Nonstationary confirmatory run with an effect of exactly the frozen margin (null claims under "
+            "nonstationarity: a null claim here is a false equivalence):",
+            "",
+            "| planted | positive claim | false null claim | stability check flags the run |",
+            "| --- | --- | --- | --- |",
+        ]
+        for plant, res in ns.items():
+            h = "H_decision" if plant == "decision" else "H_observer"
+            lines.append(
+                f"| {plant} | {fmt_rate(rate(res, f'{h}_rej'))} | {fmt_rate(rate(res, f'{h}_null_claim'))} | "
+                f"{fmt_rate(rate(_not(res, 'stable'), 'x'))} |"
+            )
     lines += [
         "",
         "## Positive control (effect planted in the simulated device)",
@@ -882,6 +996,8 @@ def summary_markdown(
         "criteria_total": float(len(crit)),
     }
     for key, res in pos.items():
+        if key.startswith("nonstationary:"):
+            continue
         plant, frac = key.split(":")
         h = "H_decision" if plant == "decision" else "H_observer"
         lines.append(
@@ -915,8 +1031,19 @@ def summary_markdown(
         "drift missing from the model set) shows the calibration null alone rejecting too often, and the model check "
         "refusing H_decision instead. In drift_covered the same drift is in the model set: theta0_D is non-zero and "
         "the worst-case test keeps its level.",
+        "- The model rule: members whose wcorr envelope excludes the sealed controls of the calibration block or of "
+        "the confirmatory run are dropped, and the worst case is taken over the rest. drift_wrong_member adds a "
+        "member whose drift matches the device (wcorr) but whose selection effect is wrong (its decision arm cannot "
+        "select: theta0_D = 0); with the right member also in the set, the worst case keeps the level. "
+        "drift_only_wrong_member (no criterion) shows the limit of any model check on wcorr: when the set holds only "
+        "the wrong member and one the controls refute, H_decision is tested at a wrong centre. The set must contain "
+        "the true selection effect; that is why it is locked with the plan and reviewed before sign-off.",
         "- The Newey-West robustness check is liberal at N = 100 (above 0.05 in the null), one reason it is not the "
         "decisive test.",
+        "- The bootstrap block length is the larger of the Newey-West rule and twice the integrated correlation time "
+        "of the calibration series (Politis-White flat-top window). In this simulation the control pairs are "
+        "uncorrelated (the slow drift cancels within a block), so it stays at the Newey-West rule: "
+        f"median {np.median([r.get('block_len0', np.nan) for r in nom]):.0f} (lag 0).",
         "- One sealing key and one meta-sealing key per batch of replicates instead of per replicate (speed); every "
         "outcome is still sealed and unsealed through the same code. Blinding keys and order seeds are per replicate.",
         "- The stand-in decision process is not the M5 policy, and theta0_D depends on the policy: the M5 policy as a "
@@ -928,7 +1055,8 @@ def summary_markdown(
         f"{rc['model_runs']} model runs per model; engineering {rc['engineering']} per condition. The documented full "
         "size (several hours on this CPU; any machine, no GPU needed):",
         "",
-        "    uv run python -m glowbox.experiments.prereg_calibration --replicates 4000 --stress-replicates 1000",
+        f"    uv run python -m glowbox.experiments.prereg_calibration --replicates {FULL_NULL_RUNS} "
+        f"--stress-replicates {FULL_STRESS_RUNS}",
         "",
         f"Wall time here: {seconds / 60:.1f} min on a CPU.",
     ]
@@ -992,7 +1120,11 @@ def main(argv: list[str] | None = None) -> None:
         for name in needed:
             runs = run_phase(cfg, pool, "model", name, int(rc["model_runs"]))
             fields = sorted({r["field"] for r in runs})
-            models[name] = {f: pa.selection_model(name, [r["table"] for r in runs if r["field"] == f]) for f in fields}
+            params = cfg["models"][name]
+            models[name] = {
+                f: pa.selection_model(name, [r["table"] for r in runs if r["field"] == f], params=params)
+                for f in fields
+            }
             del runs
         null: dict[str, list[dict[str, Any]]] = {}
         pos: dict[str, list[dict[str, Any]]] = {}
@@ -1000,6 +1132,10 @@ def main(argv: list[str] | None = None) -> None:
             ms = {f: [models[m][f] for m in cc["models"]] for f in range(pool.nom.shape[0])}
             n = int(rc["null_runs"]) if cond == "nominal" else int(rc["stress_runs"])
             null[cond] = run_phase(cfg, pool, "null", cond, n, models=ms)
+            if cond == "nonstationary" and int(rc.get("stress_positive", 0)):
+                for plant in ("decision", "observer"):
+                    n_p = int(rc["stress_positive"])
+                    pos[f"nonstationary:{plant}:1"] = run_phase(cfg, pool, "positive", cond, n_p, plant, 1.0, ms)
             if cond != "nominal":
                 continue
             for plant in ("decision", "observer"):

@@ -114,9 +114,29 @@ def test_miniature_pipeline(cfg, pool, monkeypatch):
     assert np.mean([r["identified"] for r in pos]) >= 0.5  # the toy model check (8 model runs per field) is noisy
 
 
+def test_noselect_model_replays_offline_sequences(cfg, pool, monkeypatch):
+    """The wcorr-matched member with a wrong theta0_D: its decision slot replays offline sequences, so the decision
+    pair still exists (A1 in block k, A2 in block k + 1, the same sequence) but nothing selects on the drift."""
+    monkeypatch.setattr(pa, "N_CONF", 12)
+    runs = pc.simulate_batch(copy.deepcopy(cfg), pool, np.arange(4), "model", "within_noselect", None, 0.0, None, 2)
+    t = runs[0]["table"]
+    ix, _ = pa.pair_rows(t, "A1", "A2", 1)
+    assert ix.size >= 8
+    m = pa.selection_model("within_noselect", [r["table"] for r in runs], params=cfg["models"]["within_noselect"])
+    assert m.params["decision"] == "offline" and set(m.theta0_stats) == set(pa.DECISION_STATS)
+
+
 def test_criteria_rules():
     lo = pc.Criterion("x", (0.06, 0.045, 0.08, 1000), "lo<=x", 0.05)
     assert lo.passed and "PASS" in lo.line()
     assert not pc.Criterion("x", (0.08, 0.065, 0.1, 1000), "lo<=x", 0.05).passed
     assert pc.Criterion("x", (0.88, 0.85, 0.91, 400), "hi>=x", 0.90).passed
     assert not pc.Criterion("x", (0.8, 0.76, 0.84, 400), "hi>=x", 0.90).passed
+    # the decisive rule: a rate of 0.07 passes the lower-bound rule at n = 300, but not the upper-bound rule
+    assert pc.Criterion("x", (0.07, 0.044, 0.105, 300), "lo<=x", 0.05).passed
+    dec = pc.Criterion("x", (0.045, 0.039, 0.052, 4000), "hi<=x", pc.DECISIVE_TOLERANCE)
+    assert dec.passed and not pc.Criterion("x", (0.07, 0.044, 0.105, 300), "hi<=x", 0.06).passed
+    pend = pc.Criterion("x", (0.045, 0.033, 0.060, 1000), "hi<=x", 0.06, full=False)
+    assert pend.pending and not pend.passed and "PENDING" in pend.line()
+    assert pc.verdict([lo, pend]).startswith("every criterion judged") and pc.verdict([lo, dec]) == "PASS"
+    assert pc.verdict([lo, pend, pc.Criterion("x", (0.08, 0.065, 0.1, 1000), "lo<=x", 0.05)]) == "FAIL"

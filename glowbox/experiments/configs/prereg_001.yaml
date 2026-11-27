@@ -3,7 +3,7 @@
 # The simulator has no decision or observer effect by construction: these runs only check that the whole
 # pipeline (arms, schedule, sealing, blinding, calibration block, frozen analysis, unblinding) keeps the
 # false-positive rate at alpha and has the planned power. They are not evidence for or against any hypothesis.
-# Run: uv run python -m glowbox.experiments.prereg_calibration   (CPU, about 20 minutes; --quick: a few minutes)
+# Run: uv run python -m glowbox.experiments.prereg_calibration   (CPU, about 30 minutes; --quick: a few minutes)
 name: prereg-001-calibration
 seed: 20261127
 detuned_offset_hz: 4.0e+8
@@ -46,6 +46,9 @@ nuisance:                     # drift between and within episodes (indexed by th
 models:                       # the theta0_D model set: nuisance overrides of each model's runs (phase "model")
   nominal: {}
   within_drift: {within_sigma: 0.3, within_rho: 0.9}
+  # the same drift, but the decision arm's slot replays offline sequences: the decision process cannot select on
+  # the drift, so theta0_D = 0 while wcorr matches the drifting device (a wcorr-matched member with a wrong theta0_D)
+  within_noselect: {within_sigma: 0.3, within_rho: 0.9, decision: offline}
 
 conditions:                   # stage-S validation conditions, none with an effect except the planted positive controls
   nominal:
@@ -63,6 +66,14 @@ conditions:                   # stage-S validation conditions, none with an effe
     description: confirmatory drift 3x larger and 3x faster than in the calibration block
     confirmatory: {laser_rel_sigma: 0.06, laser_tau_slots: 6.67, contrast_rel_sigma: 0.15, contrast_tau_slots: 23.3}
     models: [nominal]
+  drift_wrong_member:
+    description: within-episode drift; the set holds the right member and a wcorr-matched member with theta0_D = 0
+    device: {within_sigma: 0.3, within_rho: 0.9}
+    models: [within_drift, within_noselect]
+  drift_only_wrong_member:
+    description: within-episode drift; the set holds the wcorr-matched wrong member and a refuted one (no criterion)
+    device: {within_sigma: 0.3, within_rho: 0.9}
+    models: [nominal, within_noselect]
 
 controller:                   # stand-in decision process (same feedback structure as the M5 learners)
   threshold_below_baseline: 0.03   # "in a dip" when r < baseline - this
@@ -74,6 +85,7 @@ replicates:
   model_runs: 500             # per model of the theta0_D set, before anything else
   null_runs: 1000             # nominal condition
   stress_runs: 300            # per stress condition
+  stress_positive: 300        # nonstationary condition, per hypothesis, effect = the frozen margin (false null claims)
   positive: 400               # per hypothesis, effect = the replicate's frozen margin
   curve: 100                  # per hypothesis and fraction: the power curve below the margin (no pass criterion)
   curve_fractions: [0.5, 0.75]
@@ -87,6 +99,7 @@ quick:
     model_runs: 160
     null_runs: 40
     stress_runs: 20
+    stress_positive: 20
     positive: 20
     curve: 0
     engineering: 200
