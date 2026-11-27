@@ -397,7 +397,8 @@ class AxisTable:
 
     def _stencil(self, fields_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Flat grid indices (..., 4 axes, 32) and weights (..., 4, 32) (orientation population included)."""
-        q = axis_coordinates(fields_t.to(self.device, torch.float64), self.env.mw_field_direction)
+        # float32 is ample (fields ~1e-3 T, grid steps >= 1e-5 T) and much faster than float64 on consumer GPUs
+        q = axis_coordinates(fields_t.to(self.device, torch.float32), self.env.mw_field_direction)
         p0, dp = float(self.b_par_t[0]), float(self.b_par_t[1] - self.b_par_t[0])
         dq = float(self.b_perp_t[1] - self.b_perp_t[0])
         npar, nperp, naz = self.b_par_t.size, self.b_perp_t.size, self.n_az
@@ -406,10 +407,10 @@ class AxisTable:
         v = torch.clamp(q[..., 1] / dq, 0.0, nperp - 1 - 1e-9)
         w = q[..., 2] / (math.pi / naz)
         i1, j0, k1 = torch.floor(u).long(), torch.floor(v).long(), torch.floor(w).long()
-        wp = _catmull_rom((u - i1).float())  # (..., 4, 4)
-        fv = (v - j0).float()
+        wp = _catmull_rom(u - i1)  # (..., 4, 4)
+        fv = v - j0
         wq = torch.stack([1 - fv, fv], -1)  # (..., 4, 2)
-        wa = _catmull_rom((w - k1).float())  # (..., 4, 4)
+        wa = _catmull_rom(w - k1)  # (..., 4, 4)
         ip = i1[..., None] + torch.arange(-1, 3, device=dev)
         jq = torch.clamp(j0[..., None] + torch.arange(2, device=dev), max=nperp - 1)
         ka = torch.remainder(k1[..., None] + torch.arange(-1, 3, device=dev), naz)
@@ -444,14 +445,15 @@ class AxisTable:
         particles at that row's actions; cheaper than :meth:`means` when U << A)."""
         e = self.env
         flat = self.table.reshape(-1, self.spec.n_actions, self.spec.n_windows)
-        idx, w = self._stencil(fields_t)
-        act = actions.to(self.device)[:, None, :]
-        out = torch.zeros((*fields_t.shape[:2], actions.shape[1], self.spec.n_windows), device=self.device)
-        for k in range(4):
-            if e.orientation_populations[k] == 0:
-                continue
-            for q in range(idx.shape[-1]):
-                out = out + flat[idx[..., k, q][..., None], act] * w[..., k, q, None, None]
+        idx, w = self._stencil(fields_t)  # (E, n, 4, 32)
+        ne, n = idx.shape[:2]
+        act = actions.to(self.device)[:, None, None, :]  # (E, 1, 1, U)
+        out = torch.empty((ne, n, actions.shape[1], self.spec.n_windows), device=self.device)
+        step = max(1, (1 << 24) // max(1, 128 * actions.shape[1] * self.spec.n_windows))
+        for i in range(0, n, step):  # one gather per chunk of particles (memory bound)
+            sl = slice(i, i + step)
+            g = flat[idx[:, sl].flatten(2)[..., None], act]  # (E, m, 128, U, W)
+            out[:, sl] = torch.einsum("emquw,emq->emuw", g, w[:, sl].flatten(2))
         bg = torch.as_tensor(self.spec.background_counts(e), dtype=torch.float32, device=self.device)
         return e.collection_efficiency * e.n_nv * out + bg
 
@@ -461,12 +463,8 @@ class AxisTable:
         flat = self.table.reshape(-1, self.spec.n_actions, self.spec.n_windows)
         idx, w = self._stencil(fields_t)
         act = actions.to(self.device)
-        out = torch.zeros((*act.shape, self.spec.n_windows), device=self.device)
-        for k in range(4):
-            if e.orientation_populations[k] == 0:
-                continue
-            for q in range(idx.shape[-1]):
-                out = out + flat[idx[..., k, q], act] * w[..., k, q, None]
+        g = flat[idx.flatten(-2), act[..., None]]  # (..., 128, W): one gather
+        out = torch.einsum("...qw,...q->...w", g, w.flatten(-2))
         bg = torch.as_tensor(self.spec.background_counts(e), dtype=torch.float32, device=self.device)
         return e.collection_efficiency * e.n_nv * out + bg
 
