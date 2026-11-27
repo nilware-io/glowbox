@@ -449,7 +449,7 @@ class AxisTable:
         ne, n = idx.shape[:2]
         act = actions.to(self.device)[:, None, None, :]  # (E, 1, 1, U)
         out = torch.empty((ne, n, actions.shape[1], self.spec.n_windows), device=self.device)
-        step = max(1, (1 << 24) // max(1, 128 * actions.shape[1] * self.spec.n_windows))
+        step = max(1, (1 << 24) // max(1, ne * idx.shape[-2] * idx.shape[-1] * actions.shape[1] * self.spec.n_windows))
         for i in range(0, n, step):  # one gather per chunk of particles (memory bound)
             sl = slice(i, i + step)
             g = flat[idx[:, sl].flatten(2)[..., None], act]  # (E, m, 128, U, W)
