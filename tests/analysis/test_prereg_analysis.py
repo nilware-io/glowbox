@@ -640,8 +640,20 @@ class Chain:
         return models, cal_dir
 
 
+#: The chain tests check how the lock, registry, calibration lock, blinded analysis and unblinding are bound
+#: together, not sizes: they run at a smaller confirmatory N than the plan's (speed). The other tests use pa.N_CONF.
+CHAIN_N_CONF = 100
+
+
 @pytest.fixture(scope="module")
-def chain(tmp_path_factory):
+def chain_size():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pa, "N_CONF", CHAIN_N_CONF)
+        yield
+
+
+@pytest.fixture(scope="module")
+def chain(tmp_path_factory, chain_size):
     """The honest chain, run once: model runs, calibration, confirmatory run, blinded analysis, unblinding."""
     c = Chain(tmp_path_factory.mktemp("chain"))
     models, cal_dir = c.honest_until_calibration()
@@ -775,7 +787,7 @@ def test_chain_refuses_changed_package_init_and_missing_tag(chain):
 
 
 @pytest.fixture
-def fresh(tmp_path):
+def fresh(tmp_path, chain_size):
     return Chain(tmp_path / "repo")
 
 
@@ -858,7 +870,7 @@ def test_chain_one_confirmatory_run_per_series_and_plan_series_only(fresh):
             fresh.root, keys=fresh.keystore)  # fmt: skip
 
 
-def test_chain_model_set_is_locked(tmp_path):
+def test_chain_model_set_is_locked(tmp_path, chain_size):
     """Regression: any model name with registered runs joined the theta0_D set (40 runs of an invented 'made_up'
     member were accepted). The lock names the members and their parameters; the calibration refuses missing,
     extra and mismatched members."""
