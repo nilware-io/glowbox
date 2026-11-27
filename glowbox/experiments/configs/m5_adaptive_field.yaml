@@ -1,0 +1,120 @@
+# Milestone 5, Task 1: the learner picks the measurements. One calibrated device (EnvParams defaults = the
+# milestone-2 prior midpoints, E = 0), hidden field from milestone 2's prior; each step is a block of `shots` shots of
+# one pulsed-ODMR measurement (MW frequency x pulse duration). Policies: fixed sweeps (milestone 2/4 protocol, Bayesian
+# posterior), greedy expected information gain (adaptive Bayesian design), a PPO agent, random; plus milestone 2's
+# CNN decoder on the fixed sweep. Quantum test: every MW frequency + 400 MHz, everything re-run (and retrained).
+# Run: uv run python -m glowbox.experiments.m5_adaptive_field  (--quick: a smoke run, ~10 min on a 32-core CPU)
+name: m5-adaptive-field
+seed: 20261127
+seeds: [0, 1, 2, 3, 4]
+detuned_offset_hz: 4.0e+8
+
+prior:
+  b_min_t: 0.5e-3
+  b_max_t: 3.0e-3
+
+measurement:                  # glowbox.learn.measurement.MeasurementSpec
+  f_start_hz: 2.77e+9
+  f_stop_hz: 2.97e+9
+  step_hz: 2.0e+6             # 100 frequencies
+  durations_ns: [50, 100, 200, 400]   # ~pi/2, pi, 2 pi, 4 pi at amplitude 0.6 (f_R = 4.9 MHz)
+  amplitude: 0.6              # milestone 4's tuned pulsed-ODMR amplitude
+  init_ns: 1500
+  settle_ns: 1000
+  windows_ns: [300, 300]
+
+numerics:                     # truths and the emulator table (milestone 2/4 bank numerics)
+  n_detuning: 32
+  detuning_rule: uniform
+  detuning_spacing: 2.0
+  table_d_par_t: 1.0e-5       # emulator grid: 10 uT along B_par (cubic), 100 uT along B_perp (linear)
+  table_d_perp_t: 1.0e-4
+  table_b_max_t: 3.1e-3
+
+budget:
+  n_steps: 100                # blocks per episode
+  shots: 400                  # shots per block: 40000 shots in total (milestone 4: 40 points x 1000)
+  curve_steps: [5, 10, 25, 50, 100]
+  thresholds_ut: [200, 100, 50]
+
+posterior:                    # glowbox.learn.adaptive.PosteriorConfig
+  n_particles: 512
+  ess_frac: 0.5
+  mh_steps: 4
+  mh_scale: 0.6
+  n_predict: 128
+
+data:
+  n_test: 200                 # true fields per seed (the same in both arms)
+  n_pool: 3000                # training fields per seed: the RL agent's episodes and the CNN's bank
+  n_val: 512
+
+policies:
+  fixed_dur_index: 1          # the fixed sweep's pulse (100 ns: ~pi, milestone 4's tuned pulse)
+  eig_method: gaussian
+
+rl:                           # glowbox.learn.rl (PPO)
+  num_envs: 32
+  iterations: 250
+  lr: 1.0e-3
+  epochs: 4
+  minibatches: 8
+  clip: 0.2
+  gae_lambda: 0.95
+  ent_coef: 0.003
+  hidden: 64
+  target_kl: 0.05
+
+cnn:                          # milestone 2's CNN on the fixed sweep (both windows per frequency)
+  steps: 2500
+  batch: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  eval_every: 250
+  shots_min: 10
+  shots_max: 2000
+  channels: [32, 64, 128]
+  hidden: 256
+  kernel: 7
+  mix_channels: 8
+
+timing:
+  shifts_ns: [-50, -20, 20, 50]   # every MW duration shifted in the truth (the learners' model unaware)
+
+reference:
+  n_fields: 2                 # QuTiP reference: the seed-0 RL agent through SimulatorBackend (run())
+
+quick:
+  seeds: [0, 1, 2, 3, 4]
+  measurement:
+    step_hz: 1.0e+7
+    durations_ns: [100, 200]
+  numerics:
+    n_detuning: 4
+    table_d_par_t: 2.0e-5
+    table_d_perp_t: 2.5e-4
+  budget:
+    n_steps: 20
+    shots: 1000
+    curve_steps: [5, 10, 20]
+  posterior:
+    n_particles: 128
+    n_predict: 32
+  data:
+    n_test: 16
+    n_pool: 96
+    n_val: 32
+  rl:
+    num_envs: 8
+    iterations: 3
+  cnn:
+    steps: 30
+    eval_every: 15
+    channels: [8, 16]
+    hidden: 32
+  timing:
+    shifts_ns: [-50, 50]
+  policies:
+    fixed_dur_index: 0
+  reference:
+    n_fields: 1
