@@ -1031,7 +1031,8 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
     )
     L.append(
         f"- QuTiP reference as the device through `Simulator.run()` (`SimulatorBackend`), seed-0 agent and EIG, "
-        f"{ref['n_fields']} test fields (one of them the field where the emulator is worst): noiseless means of "
+        f"{ref['n_fields']} test field{'s' if ref['n_fields'] != 1 else ''} (including the one where the emulator "
+        "is worst): noiseless means of "
         f"every action measured within {ref['rl_max_diff_rel_signal']:.2g} (RL) and "
         f"{ref['eig_max_diff_rel_signal']:.2g} (EIG) of the signal spread "
         f"({ref['rl_ref_calls'] + ref['eig_ref_calls']} reference runs, {ref['seconds']:.0f} s). The end-to-end RMSE "
