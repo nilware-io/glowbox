@@ -1,5 +1,7 @@
 """Decision, yoked, sealed and sham arms and the block-randomised protocol (glowbox.analysis.arms)."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -50,12 +52,22 @@ def _decoy() -> am.Decoy:
     return am.poisson_decoy(np.random.default_rng(99), 5.0)
 
 
+BLIND = RunKeys.from_seed("arms-test").blind
+
+
+def _meta(ep: am.Episode) -> am.EpisodeMeta:
+    return ep.unseal_meta(BLIND)
+
+
 def test_decision_arm_applies_proposals():
     key = RunKeys.generate().seal
     ctrl, dev = Recorder(), Device()
-    ep = am.run_episode(am.ArmSpec("A1", "decision"), 0, ctrl, dev, 6, 2, Sealer(key), np.zeros(2, int))
-    np.testing.assert_array_equal(ep.actions, ep.proposals)
-    assert ep.plaintext_reads == 6
+    ep = am.run_episode(
+        am.ArmSpec("A1", "decision"), 0, ctrl, dev, 6, 2, Sealer(key), np.zeros(2, int), meta_sealer=Sealer(BLIND)
+    )
+    np.testing.assert_array_equal(ep.actions, _meta(ep).proposals)
+    assert _meta(ep).plaintext_reads == 6
+    assert _meta(ep).compute_s.shape == (6,) and np.all(_meta(ep).compute_s >= 0)
     np.testing.assert_array_equal(np.stack(ctrl.seen), am.unseal_outcomes(ep, key))
 
 
@@ -64,13 +76,23 @@ def test_yoked_replay_is_exact_and_controller_still_runs():
     table = np.random.default_rng(1).integers(0, 50, size=(8, 3))
     ctrl, dev = Recorder(), Device()
     ep = am.run_episode(
-        am.ArmSpec("A2", "replay"), 1, ctrl, dev, 8, 3, Sealer(key), np.zeros(3, int), table=table, decoy=_decoy()
+        am.ArmSpec("A2", "replay"),
+        1,
+        ctrl,
+        dev,
+        8,
+        3,
+        Sealer(key),
+        np.zeros(3, int),
+        table=table,
+        decoy=_decoy(),
+        meta_sealer=Sealer(BLIND),
     )
     np.testing.assert_array_equal(ep.actions, table)
     assert am.action_hash(ep.actions[:, 0]) == am.action_hash(table[:, 0])
     assert len(ctrl.seen) == 8  # the decision process ran on the live outcomes, its output was discarded
     np.testing.assert_array_equal(np.stack(ctrl.seen), am.unseal_outcomes(ep, key))
-    assert not np.array_equal(ep.proposals, table)
+    assert not np.array_equal(_meta(ep).proposals, table)
 
 
 def test_sealed_arm_never_shows_outcomes():
@@ -90,9 +112,10 @@ def test_sealed_arm_never_shows_outcomes():
         table=table,
         decoy=_decoy(),
         monitors=[lambda ctx, a, y: shown.append(y)],
+        meta_sealer=Sealer(BLIND),
     )
     real = am.unseal_outcomes(ep, key)
-    assert ep.plaintext_reads == 0
+    assert _meta(ep).plaintext_reads == 0
     np.testing.assert_array_equal(ep.actions, table)
     assert len(ctrl.seen) == 10 and len(shown) == 10
     # the controller and the monitor saw a decoy of the same shape, not the outcomes (the real step column is t)
@@ -103,10 +126,11 @@ def test_sealed_arm_never_shows_outcomes():
 
 def test_arm_argument_checks():
     s = Sealer(RunKeys.generate().seal)
+    m = Sealer(BLIND)
     with pytest.raises(ValueError, match="table"):
-        am.run_episode(am.ArmSpec("A2", "replay"), 0, Recorder(), Device(), 2, 1, s, np.zeros(1, int))
+        am.run_episode(am.ArmSpec("A2", "replay"), 0, Recorder(), Device(), 2, 1, s, np.zeros(1, int), meta_sealer=m)
     with pytest.raises(ValueError, match="sampler"):
-        am.run_episode(am.ArmSpec("A4", "sham"), 0, Recorder(), Device(), 2, 1, s, np.zeros(1, int))
+        am.run_episode(am.ArmSpec("A4", "sham"), 0, Recorder(), Device(), 2, 1, s, np.zeros(1, int), meta_sealer=m)
     with pytest.raises(ValueError, match="decoy"):
         am.run_episode(
             am.ArmSpec("A3", "replay", observed=False),
@@ -118,6 +142,7 @@ def test_arm_argument_checks():
             s,
             np.zeros(1, int),
             table=np.zeros((2, 1), int),
+            meta_sealer=m,
         )
     with pytest.raises(ValueError, match="lag"):
         am.ProtocolDesign((am.ArmSpec("A1", "decision"), am.ArmSpec("A2", "replay", lag=0)), 3)
@@ -138,13 +163,23 @@ DESIGN = am.ProtocolDesign(
 )
 
 
-def _protocol(batch: int, n_blocks: int = 5):
+def _protocol(batch: int, n_blocks: int = 5, codes=None):
     key = RunKeys.generate().seal
     keys = [RunKeys.from_seed(i) for i in range(batch)]
     sch = np.stack([block_schedule(k.order, DESIGN.names, n_blocks) for k in keys])
     dev = Device()
     sham = am.empirical_sham(np.random.default_rng(3), np.arange(40, 50))
-    res = am.run_protocol(DESIGN, sch if batch > 1 else sch[0], Recorder(), dev, Sealer(key), _decoy(), sham)
+    res = am.run_protocol(
+        DESIGN,
+        sch if batch > 1 else sch[0],
+        Recorder(),
+        dev,
+        Sealer(key),
+        _decoy(),
+        sham,
+        blind_sealer=Sealer(BLIND),
+        codes=codes,
+    )
     return res, sch, dev, key
 
 
@@ -158,12 +193,12 @@ def test_protocol_yoking_structure(batch):
             e = ep[(arm, k)]
             if k >= lag:
                 np.testing.assert_array_equal(e.actions, ep[("A1", k - lag)].actions)
-                assert not e.fallback
+                assert not _meta(e).fallback
             else:
-                assert e.fallback  # warm-up: no source yet
+                assert _meta(e).fallback  # warm-up: no source yet
         assert np.all((ep[("A4", k)].actions >= 40) & (ep[("A4", k)].actions < 50))
-        assert ep[("A3", k)].plaintext_reads == 0 and ep[("A3L", k)].plaintext_reads == 0
-        assert ep[("A2", k)].plaintext_reads == 5
+        assert _meta(ep[("A3", k)]).plaintext_reads == 0 and _meta(ep[("A3L", k)]).plaintext_reads == 0
+        assert _meta(ep[("A2", k)]).plaintext_reads == 5
         # time slots follow each element's schedule
         for arm in DESIGN.names:
             want = k * len(DESIGN.names) + np.argmax(sch[:, k] == arm, axis=1)
@@ -188,8 +223,58 @@ def test_protocol_streams_episodes():
     sch = block_schedule(RunKeys.from_seed(0).order, DESIGN.names, 4)
     got: list[am.Episode] = []
     sham = am.empirical_sham(np.random.default_rng(3), np.arange(40, 50))
-    res = am.run_protocol(DESIGN, sch, Recorder(), Device(), Sealer(key), _decoy(), sham, on_episode=got.append)
+    res = am.run_protocol(
+        DESIGN,
+        sch,
+        Recorder(),
+        Device(),
+        Sealer(key),
+        _decoy(),
+        sham,
+        on_episode=got.append,
+        blind_sealer=Sealer(BLIND),
+    )
     assert not res.episodes and len(got) == 4 * len(DESIGN.names)
+
+
+ALLOWED_ARTIFACT_KEYS = {"label", "block", "slot", "actions", "outcomes", "meta"}
+
+
+@pytest.mark.parametrize("with_codes", [False, True])
+def test_sealed_artifacts_carry_no_arm_names_or_separating_fields(with_codes):
+    """Regression: record ids carried the arm name in the clear, and plaintext_reads / proposals / fallback told
+    observed from sealed arms. On disk an episode now holds only its code (or a random token), its block, slots,
+    applied actions and sealed records; the separating fields are sealed with the blinding key."""
+    codes = {a: f"Q{i}ZX" for i, a in enumerate(DESIGN.names)} if with_codes else None
+    res, _, _, key = _protocol(1, 4, codes)
+    arts = [am.sealed_artifact(e) for e in res.episodes]
+    text = json.dumps(arts)
+    for name in DESIGN.names:
+        assert f'"{name}"' not in text and f"/{name}/" not in text
+    for a in arts:
+        assert set(a) == ALLOWED_ARTIFACT_KEYS
+        assert all(len(r["ct"]) == len(arts[0]["outcomes"][0]["ct"]) for r in a["outcomes"])
+    for e in res.episodes:
+        label = e.sealed[0].record_id.split("/")[1]
+        assert label == (codes[e.arm] if codes else e.label) and label != e.arm
+        with pytest.raises(Exception, match="authentication"):
+            e.unseal_meta(key)  # the meta record needs the blinding key, not the sealing key
+    # the meta records of observed and sealed arms have the same structure once unsealed with the blinding key
+    metas = {e.arm: _meta(e) for e in res.episodes if e.block == 3}
+    assert metas["A2"].plaintext_reads > 0 and metas["A3"].plaintext_reads == 0
+    assert metas["A2"].proposals.shape == metas["A3"].proposals.shape
+
+
+def test_model_decoy_follows_the_model_at_the_applied_action():
+    rng = np.random.default_rng(0)
+    decoy = am.model_decoy(rng, lambda a, ctx: np.stack([a * 100.0, np.full(a.shape, 50.0)], axis=1))
+    a = np.array([1, 5, 9] * 2000)
+    ctx = am.StepContext(0, "A3", "nominal", 0, np.zeros(a.size, int))
+    y = decoy(a, ctx, (a.size, 2), np.dtype(np.int64))
+    assert y.dtype == np.int64
+    for v in (1, 5, 9):
+        assert y[a == v, 0].mean() == pytest.approx(100.0 * v, rel=0.03)
+    assert y[:, 1].mean() == pytest.approx(50.0, rel=0.03)
 
 
 class FakeSim:

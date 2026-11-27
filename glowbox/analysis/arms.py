@@ -18,16 +18,27 @@ Arm kinds (:class:`ArmSpec`), all running the same controller code with the same
 * ``sham``: applied actions are drawn from a fixed distribution (``sham(step, batch)``), proposals discarded.
 
 ``observed=False`` makes an arm *sealed*: its outcomes go only to the :class:`~glowbox.analysis.prereg.Sealer`;
-the controller and every monitor receive a decoy of the same shape from a separate generator, and the episode's
-``plaintext_reads`` stays 0. Every arm seals every outcome (the same workload in every arm); the analysis gets the
-outcomes only by unsealing them after the run (:func:`unseal_outcomes`).
+the controller and every monitor receive a decoy from a separate generator (:func:`model_decoy`: counts drawn from
+the frozen model at the applied action, so the controller's inputs have the structure of real outcomes), and the
+episode's count of plaintext deliveries stays 0. Every arm seals every outcome (the same workload in every arm); the
+analysis gets the outcomes only by unsealing them after the run (:func:`unseal_outcomes`).
+
+Nothing that tells the arms apart travels in the clear. Outcome records are labelled by the arm's blinding *code*
+(or a random token), never by its name. What differs between observed and sealed arms by construction (the count
+of plaintext deliveries, the controller's proposals, which in an observed arm are a function of the real outcomes,
+the warm-up fallback flag and the controller's compute time per step) is sealed with the *blinding* key
+(:class:`EpisodeMeta`), released only after the blinded analysis is committed. :func:`sealed_artifact` is what an
+episode writes to disk.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import json
+import secrets
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 
@@ -62,17 +73,31 @@ class Measure(Protocol):
 
 #: A live reader of results (a display, a monitor, a person-facing log): ``monitor(ctx, actions, outcomes)``.
 Monitor = Callable[[StepContext, np.ndarray, np.ndarray], None]
-#: Decoy outcomes for sealed arms: ``decoy(shape, dtype) -> array``.
-Decoy = Callable[[tuple[int, ...], np.dtype], np.ndarray]
+#: Decoy outcomes for sealed arms: ``decoy(actions, ctx, shape, dtype) -> array`` (the applied actions and the step
+#: context are given so the decoy can follow the frozen model; it never sees the real outcomes).
+Decoy = Callable[[np.ndarray, StepContext, tuple[int, ...], np.dtype], np.ndarray]
 #: Sham actions: ``sham(step, batch) -> actions``.
 Sham = Callable[[int, int], np.ndarray]
 
 
 def poisson_decoy(rng: np.random.Generator, mean: float) -> Decoy:
-    """Decoy outcomes: Poisson counts of a fixed mean (plausible counts that carry no information)."""
+    """Decoy outcomes: Poisson counts of one fixed mean in every window (unit tests only: the structure differs from
+    real outcomes, so a controller's code paths could differ between observed and sealed arms; use
+    :func:`model_decoy` in a plan)."""
 
-    def decoy(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    def decoy(actions: np.ndarray, ctx: StepContext, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
         return rng.poisson(mean, size=shape).astype(dtype)
+
+    return decoy
+
+
+def model_decoy(rng: np.random.Generator, expected: Callable[[np.ndarray, StepContext], np.ndarray]) -> Decoy:
+    """Decoy outcomes from the frozen model: Poisson counts with the model's expected counts per window at the
+    applied action (``expected(actions, ctx) -> (B, W)``), drawn from ``rng`` (a generator of its own)."""
+
+    def decoy(actions: np.ndarray, ctx: StepContext, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+        lam = np.broadcast_to(np.asarray(expected(actions, ctx), dtype=np.float64), shape)
+        return rng.poisson(lam).astype(dtype)
 
     return decoy
 
@@ -104,27 +129,89 @@ class ArmSpec:
     variant: str = "nominal"
 
 
+@dataclass(frozen=True)
+class EpisodeMeta:
+    """What differs between observed and sealed arms by construction: sealed with the blinding key."""
+
+    #: (T, B, ...) the controller's own proposals (applied only in the decision arm).
+    proposals: np.ndarray
+    #: Deliveries of real outcomes to the controller or a monitor (0 in a sealed arm).
+    plaintext_reads: int
+    #: True when the replay source did not exist yet (warm-up) and the sham supplied the actions.
+    fallback: bool
+    #: (T,) seconds the controller spent per step (propose + observe).
+    compute_s: np.ndarray
+
+    def to_bytes(self) -> bytes:
+        p = np.asarray(self.proposals)
+        d = {
+            "proposals": p.tolist(),
+            "proposals_dtype": p.dtype.str,
+            "plaintext_reads": int(self.plaintext_reads),
+            "fallback": bool(self.fallback),
+            "compute_s": [float(x) for x in self.compute_s],
+        }
+        return json.dumps(d).encode()
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> EpisodeMeta:
+        d = json.loads(data)
+        return cls(
+            np.asarray(d["proposals"], dtype=np.dtype(d["proposals_dtype"])),
+            int(d["plaintext_reads"]),
+            bool(d["fallback"]),
+            np.asarray(d["compute_s"], dtype=np.float64),
+        )
+
+
 @dataclass
 class Episode:
-    """One episode of one arm in one block (all batch elements)."""
+    """One episode of one arm in one block (all batch elements). ``arm`` is the arm's name, known only inside the
+    acquisition process; nothing written to disk carries it (:func:`sealed_artifact`)."""
 
     arm: str
     block: int
     #: (T, B, ...) actions applied.
     actions: np.ndarray
-    #: (T, B, ...) the controller's own proposals (applied only in the decision arm).
-    proposals: np.ndarray
-    #: One sealed record per step: the (B, W) outcomes.
+    #: One sealed record per step: the (B, W) outcomes (sealing key).
     sealed: list[SealedRecord]
-    #: Deliveries of real outcomes to the controller or a monitor (0 in a sealed arm).
-    plaintext_reads: int
+    #: :class:`EpisodeMeta`, sealed with the blinding key.
+    meta: SealedRecord
     #: (B,) time slot of the episode.
     slot: np.ndarray
-    #: True when the replay source did not exist yet (warm-up) and the sham supplied the actions.
-    fallback: bool = False
+    #: The label of the episode's records: the arm's blinding code, or a random token.
+    label: str = ""
 
     def outcomes(self, key: bytes) -> np.ndarray:
         return unseal_outcomes(self, key)
+
+    def unseal_meta(self, blind_key: bytes) -> EpisodeMeta:
+        return EpisodeMeta.from_bytes(unseal(blind_key, self.meta).tobytes())
+
+
+def sealed_artifact(ep: Episode) -> dict[str, Any]:
+    """The on-disk form of an episode: its label (code or token), block, time slots, applied actions, the sealed
+    outcome records and the sealed meta record. No arm name and no field that differs between observed and sealed
+    arms is in the clear."""
+
+    def rec(r: SealedRecord) -> dict[str, Any]:
+        return {
+            "id": r.record_id,
+            "nonce": r.nonce.hex(),
+            "dtype": r.dtype,
+            "shape": list(r.shape),
+            "ct": r.ciphertext.hex(),
+            "tag": r.tag.hex(),
+        }
+
+    return {
+        "label": ep.label,
+        "block": int(ep.block),
+        "slot": np.asarray(ep.slot).tolist(),
+        "actions": np.asarray(ep.actions).tolist(),
+        "outcomes": [rec(r) for r in ep.sealed],
+        "meta": rec(ep.meta),
+    }
 
 
 def unseal_outcomes(ep: Episode, key: bytes) -> np.ndarray:
@@ -152,20 +239,28 @@ def run_episode(
     sham: Sham | None = None,
     decoy: Decoy | None = None,
     monitors: Sequence[Monitor] = (),
+    *,
+    meta_sealer: Sealer,
+    label: str | None = None,
+    fallback: bool = False,
 ) -> Episode:
     """Run one episode. ``table`` (T, B, ...) is required for replays, ``sham`` for sham arms, ``decoy`` for sealed
-    arms."""
+    arms. ``meta_sealer`` holds the blinding key; ``label`` (the arm's blinding code) labels the sealed records, a
+    random token when None."""
     if arm.kind == "replay" and table is None:
         raise ValueError(f"{arm.name}: a replay needs a table")
     if arm.kind == "sham" and sham is None:
         raise ValueError(f"{arm.name}: a sham arm needs a sampler")
     if not arm.observed and decoy is None:
         raise ValueError(f"{arm.name}: a sealed arm needs a decoy source")
+    tag = label if label is not None else secrets.token_hex(4)
     controller.reset(batch)
-    acts, props, sealed = [], [], []
+    acts, props, sealed, compute = [], [], [], []
     reads = 0
     for t in range(n_steps):
+        t0 = time.perf_counter()
         proposal = np.asarray(controller.propose(t))
+        c_s = time.perf_counter() - t0
         if arm.kind == "decision":
             applied = proposal
         elif arm.kind == "replay":
@@ -176,20 +271,24 @@ def run_episode(
             applied = np.asarray(sham(t, batch))
         ctx = StepContext(block, arm.name, arm.variant, t, slot)
         y = np.asarray(measure(applied, ctx))
-        sealed.append(sealer.seal(f"{block}/{arm.name}/{t}", y))
+        sealed.append(sealer.seal(f"{block}/{tag}/{t}", y))
         if arm.observed:
             seen = y
             reads += 1 + len(monitors)
         else:
             assert decoy is not None
-            seen = decoy(tuple(y.shape), y.dtype)
+            seen = decoy(applied, ctx, tuple(y.shape), y.dtype)
         del y
+        t0 = time.perf_counter()
         controller.observe(t, applied, seen)
+        compute.append(c_s + time.perf_counter() - t0)
         for mon in monitors:
             mon(ctx, applied, seen)
         acts.append(applied)
         props.append(proposal)
-    return Episode(arm.name, block, np.stack(acts), np.stack(props), sealed, reads, np.asarray(slot))
+    meta = EpisodeMeta(np.stack(props), reads, fallback, np.asarray(compute))
+    meta_rec = meta_sealer.seal(f"{block}/{tag}/meta", np.frombuffer(meta.to_bytes(), dtype=np.uint8))
+    return Episode(arm.name, block, np.stack(acts), sealed, meta_rec, np.asarray(slot), tag)
 
 
 @dataclass(frozen=True)
@@ -238,6 +337,9 @@ def run_protocol(
     offline: np.ndarray | None = None,
     monitors: Sequence[Monitor] = (),
     on_episode: Callable[[Episode], None] | None = None,
+    *,
+    blind_sealer: Sealer,
+    codes: Mapping[str, str] | None = None,
 ) -> ProtocolResult:
     """Run every block of ``schedules`` ((B, n_blocks, n_arms) arm names, one schedule per batch element, or
     (n_blocks, n_arms) for B = 1).
@@ -246,9 +348,11 @@ def run_protocol(
     schedule) they run arm by arm inside each block, decision arm first, and each element's time slot is passed to
     the measurement; that is equivalent only for simulators whose state between episodes is exogenous drift indexed
     by the slot. Replays whose source does not exist yet (the first ``lag`` blocks) replay a sham table and are
-    marked ``fallback`` (those blocks are warm-up blocks and excluded from analysis). ``offline`` is
-    (n_blocks, T, B, ...) for replays with ``source="offline"``. With ``on_episode`` every finished episode is handed
-    to it (e.g. written to disk) instead of being kept in the result.
+    marked ``fallback`` in their sealed meta record (those blocks are warm-up blocks and excluded from analysis).
+    ``offline`` is (n_blocks, T, B, ...) for replays with ``source="offline"``. With ``on_episode`` every finished
+    episode is handed to it (e.g. written to disk with :func:`sealed_artifact`) instead of being kept in the result.
+    ``blind_sealer`` (the blinding key) seals each episode's :class:`EpisodeMeta`; ``codes`` (arm -> blinding code,
+    B = 1) labels the records, random tokens otherwise.
     """
     sch = np.asarray(schedules, dtype=object)
     if sch.ndim == 2:
@@ -278,8 +382,23 @@ def run_protocol(
                     table = np.stack([np.asarray(sham(t, batch)) for t in range(t_n)])
                     fallback = True
             slot = k * n_arms + pos[name][:, k]
-            ep = run_episode(arm, k, controller, measure, t_n, batch, sealer, slot, table, sham, decoy, monitors)
-            ep.fallback = fallback
+            ep = run_episode(
+                arm,
+                k,
+                controller,
+                measure,
+                t_n,
+                batch,
+                sealer,
+                slot,
+                table,
+                sham,
+                decoy,
+                monitors,
+                meta_sealer=blind_sealer,
+                label=codes.get(name) if codes is not None else None,
+                fallback=fallback,
+            )
             if arm.kind == "decision":
                 out.decision_tables[k] = ep.actions
                 for old in [b for b in out.decision_tables if b < k - max_lag]:
