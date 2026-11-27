@@ -1021,9 +1021,13 @@ def summary_markdown(
         "## Reading",
         "",
         "- The margin is derived from the control runs by a fixed rule: the effect that the planned experiment "
-        "detects against the control-vs-control distribution with power 0.95 at Holm's first level. It replaces the "
-        "earlier rule (the 0.95 quantile of a single control pair), which made the margin about 40 % of the spin "
-        "signal and its equivalence claims trivially easy.",
+        f"detects against the control-vs-control distribution with power {pa.MARGIN_POWER} at Holm's first level "
+        "(1 - alpha_eq: the positive test and the equivalence test are dual at the margin). Version 1 used the 0.95 "
+        "quantile of a single control pair (about 40 % of the spin signal, equivalence trivially easy); version 2 "
+        "used power 0.95, which left the null claims below their 0.90 target.",
+        "- No decision uses the calibration null alone: a positive claim needs the concurrent null too, and the "
+        "decisive criterion is on the complete rule. The uncorrected rates of the calibration null alone are "
+        "descriptive (the null-calibration table above).",
         "- A positive claim needs a Holm rejection against the frozen calibration controls and against the run's own "
         "sealed controls; the nonstationary condition shows why (the calibration null alone is too narrow when the "
         "confirmatory run drifts more).",
