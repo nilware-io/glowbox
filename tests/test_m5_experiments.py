@@ -25,7 +25,8 @@ def test_m5_adaptive_field_runs_end_to_end(tmp_path):
     for fig in ("shots-to-accuracy", "choices", "quantum-test", "rl-training", "timing"):
         assert (tmp_path / "results" / "figures" / f"m5-adaptive-field-{fig}.png").exists()
     assert summary["no_line_margin_mhz"] > 100
-    (run_dir,) = (tmp_path / "out").iterdir()
+    (run_dir,) = [d for d in (tmp_path / "out").iterdir() if (d / "run.yaml").exists()]  # plus the table cache
+    assert any((tmp_path / "out" / "cache").iterdir())
     info = load_run(run_dir)
     assert info["seed"] == cfg["seed"] and len(info["traces"]) == 2 * 2 * 3 * 10  # condition x policy x step x shots
     for f in ("curves.parquet", "timing.parquet", "rl_training.parquet", "quantum_test.json", "reference_check.json"):

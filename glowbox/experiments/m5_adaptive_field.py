@@ -251,7 +251,8 @@ class AdaptiveTask:
             idx = torch.randint(0, tr_f.shape[0], (n,), generator=gen, device=self.device)
             return tr_f[idx], TableBackend(tr_m[idx], gen)
 
-        train_post = dataclasses.replace(self.post_cfg, n_particles=int(rc["train_particles"]))
+        # training posterior: fewer particles and no restarts (cost); evaluation uses the full posterior
+        train_post = dataclasses.replace(self.post_cfg, n_particles=int(rc["train_particles"]), restart_at=())
         env = FieldSearchEnv(
             table, self.prior, sampler, int(rc["num_envs"]), self.n_steps, self.shots, train_post, self._gen(seed, 20)
         )
@@ -910,13 +911,15 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
     p = task.post_cfg
     L.append(
         f"- Posterior: {p.n_particles} particles, adaptive tempering, resample + {p.mh_steps} MH moves when ESS < "
-        f"{p.ess_frac:g} N; EIG from {p.n_predict} posterior draws ({c['policies']['eig_method']} approximation)."
+        f"{p.ess_frac:g} N, annealed restarts from the prior after blocks {list(p.restart_at)} (adopted when "
+        f"{p.restart_margin:g} nat better); EIG from {p.n_predict} posterior draws "
+        f"({c['policies']['eig_method']} approximation)."
     )
     L.append(
         f"- RL: PPO, {rc['num_envs']} parallel episodes per iteration, {rc['iterations']} iterations, lr {rc['lr']}, "
         f"{rc['epochs']} epochs x {rc['minibatches']} minibatches, clip {rc['clip']}, entropy {rc['ent_coef']}, GAE "
         f"lambda {rc['gae_lambda']}, gamma 1; per-action set policy (hidden {rc['hidden']}); {rc['train_particles']} "
-        "posterior particles while training; training fields from "
+        "posterior particles and no restarts while training; training fields from "
         f"the seed's pool of {c['data']['n_pool']}, test fields unseen."
     )
     cc = c["cnn"]
