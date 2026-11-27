@@ -116,7 +116,9 @@ def test_miniature_pipeline(cfg, pool, monkeypatch):
 
 def test_noselect_model_replays_offline_sequences(cfg, pool, monkeypatch):
     """The wcorr-matched member with a wrong theta0_D: its decision slot replays offline sequences, so the decision
-    pair still exists (A1 in block k, A2 in block k + 1, the same sequence) but nothing selects on the drift."""
+    pair still exists (A1 in block k, A2 in block k + 1, the same sequence) but nothing selects on the drift.
+    Regression: with N_CONF > M_CAL the member ran out of offline sequences (there were only M_CAL + warm-up)."""
+    monkeypatch.setattr(pa, "M_CAL", 8)
     monkeypatch.setattr(pa, "N_CONF", 12)
     runs = pc.simulate_batch(copy.deepcopy(cfg), pool, np.arange(4), "model", "within_noselect", None, 0.0, None, 2)
     t = runs[0]["table"]

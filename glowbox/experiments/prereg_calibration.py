@@ -514,8 +514,9 @@ def simulate_batch(
 
     m_cal = pa.M_CAL
     wu = pa.WARMUP_BLOCKS
-    # offline sequences: the decision process on a separate simulated device (the model's nuisance, its own draws)
-    n_off = m_cal + wu
+    # offline sequences: the decision process on a separate simulated device (the model's nuisance, its own draws);
+    # the calibration block replays M_CAL + warm-up of them, a no-selection model member N_CONF + warm-up
+    n_off = max(m_cal, pa.N_CONF) + wu
     off_dev = device(n_off, nuisance(cfg))
     offline = []
     sealer, meta = Sealer(seal_key), Sealer(blind_key)
@@ -524,7 +525,7 @@ def simulate_batch(
             ArmSpec("offline", "decision"), k, ctrl, off_dev, t_n, batch, sealer, np.full(batch, k), meta_sealer=meta
         )
         offline.append(ep.actions)
-    off_actions = np.stack(offline)  # (M + warm-up, T, B)
+    off_actions = np.stack(offline)  # (max(M, N) + warm-up, T, B)
     decoy_rng = np.random.default_rng(rng.integers(1 << 62))
     sham_rng = np.random.default_rng(rng.integers(1 << 62))
     conf_design = ProtocolDesign(CONF_DESIGN_ARMS, t_n)
