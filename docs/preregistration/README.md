@@ -46,12 +46,16 @@ Deviations from any locked plan: [deviations.md](deviations.md) (append-only).
    script freezes it (null series, margins, model predictions, model check) into a calibration file and a
    calibration lock, which are committed and registered before the confirmatory run starts. One calibration block
    per run series.
-3. **Every run is registered before its first measurement.** `prereg.Registry.register_start` appends the run id,
-   mode, series, key commitments and schedule sha256 to the plan's append-only registry
-   (`PREREG-<n>.registry.yaml`, pinned by the lock like the deviations log); the entry is committed and pushed
-   before data collection. The analysis refuses unregistered runs, a calibration block that is not the only one of
-   its series, and model runs that are not all the registered ones; the report lists every registered run under
-   the lock, completed or aborted.
+3. **Every run is registered before its first measurement, and its end before its sealing key is released.**
+   `prereg.Registry.register_start` appends the run id, mode, series, model member, key commitments and schedule
+   sha256 to the plan's append-only registry (`PREREG-<n>.registry.yaml`, pinned by the lock like the deviations
+   log); the entry is committed and pushed before data collection. `Registry.register_end` appends the sha256 of
+   every sealed artifact file of the run and its acquisition flags; it is committed and pushed before the sealing key
+   is released. **The pushed commits are the timestamps**: the analysis checks the order of events by git ancestry
+   of the commits that added them, and requires the registry's history to only append whole entries. It refuses
+   unregistered runs, a calibration block or confirmatory run that is not the only one of its series, a series that
+   is not one of the plan's, and model runs that are not all the registered ones; the report lists every
+   registered run under the lock, completed or aborted, with the commit of each event.
 4. **Every run records its lock.** `run.yaml` gets a `prereg` section (`prereg.prereg_record`, written with
    `RunLog.annotate`), made at run start after the lock verifies, holding:
    - the lock sha256 and the locked files' hashes *recomputed from disk*, and the git commit;
@@ -73,7 +77,9 @@ Deviations from any locked plan: [deviations.md](deviations.md) (append-only).
    code and labelled by the arm's code (or a random token), never its name. Sealed arms show the decision process
    and the monitors a decoy drawn from the frozen model at the applied action. What differs between observed and
    sealed arms by construction (plaintext deliveries, the controller's proposals, fallback flags, compute time) is
-   sealed with the blinding key. The sealing key is released after the run has ended.
+   sealed with the blinding key. The sealing key is released after the run's end entry (the artifacts' sha256) is
+   committed; the analysis rebuilds every episode table from exactly those artifacts with the locked reduction and
+   never reads a pre-built table.
 7. **Blinded analysis first.** The locked reduction builds the episode table and the arm-blind exclusion flags; the
    script analyses arm *codes*. Its full output is committed and its sha256 registered before the blinding key is
    released. Unblinding is a separate locked step that refuses an output whose sha256 is not the registered one.
@@ -86,7 +92,8 @@ Deviations from any locked plan: [deviations.md](deviations.md) (append-only).
     giving the date, what changed, why, whether it was before or after unblinding, and the commit. Nothing is changed
     silently.
 12. **Claims need replication.** A positive claim needs the same result in an independent replication under the same
-    lock. Anything not pre-registered is exploratory.
+    lock. The plan fixes the series (PREREG-001: S1 the original, S2 the replication, no others); a series without a
+    completed analysis means no claim. Anything not pre-registered is exploratory.
 
 ## Freezing a plan
 
@@ -97,24 +104,30 @@ Done by the owner or the lead, never by an agent on its own:
    text in `deviations.md` ("sign-off" entry) and sets the plan's status line to LOCKED.
 3. Create the plan lock with the locked helper. It covers the plan, the analysis script and the arms with their
    module closures, the modules a run executes (runner, controller, measurement, frozen model: pass them as
-   `extra_modules`), the configs and data files, `pyproject.toml` and `uv.lock`, the frozen constants, and pins the
-   deviations log and the run registry:
+   `extra_modules`), the configs and data files, `pyproject.toml` and `uv.lock`, the frozen constants, the model
+   set (every member with its parameters) and the frozen model of the reduction (`<file>.py:<factory>`, executed
+   from its locked bytes), and pins the deviations log and the run registry:
 
        uv run python -c "from glowbox.analysis import prereg_analysis_001 as a; \
        a.create_plan_lock(extra_modules=['<runner module>', '<controller module>'], \
-       configs=['<config.yaml>']).write('docs/preregistration/PREREG-001.lock.yaml')"
+       configs=['<config.yaml>'], model_set={'<member>': {<parameters>}, ...}, \
+       frozen_model='<path>.py:<factory>').write('docs/preregistration/PREREG-001.lock.yaml')"
 
    Commit the lock file on its own, tag the commit `prereg-001` and push the tag to the public repository: the
    pushed tag is the public timestamp. The analysis refuses a lock that the tag does not hold.
-4. Model runs (mode `model`, one `model` name per member of the plan's model set) and the calibration block (mode
-   `calibration`), each registered before its first measurement (rule 3). Freeze them with
+4. Model runs (mode `model`, recording `model` = the member and `model_params` = its locked parameters) and the
+   calibration block (mode `calibration`), each registered before its first measurement and its end registered
+   before its sealing key is released (rule 3); every model run ends before the calibration block is registered.
+   Freeze them with
 
        python -m glowbox.analysis.prereg_analysis_001 calibrate --run <calibration run> --lock <lock> \
            --model-runs <model>=<run dir> ... --out-dir docs/preregistration/calibration/<series>
 
    and commit the calibration, its calibration lock and the registry.
-5. Run the confirmatory series (mode `confirmatory`, recording the calibration lock; registered first). Then:
-   1. release the sealing key;
+5. Run the confirmatory run of the series (mode `confirmatory`, recording the calibration lock; registered first,
+   after the calibration commit). Then:
+   1. register its end (artifact hashes, acquisition flags), commit and push; the locked steps release the sealing
+      key from the key store (`--keystore`) and log it;
    2. run `... analyse --run <run> --calibration-run <calibration run> --lock <lock> --calibration-lock <...>
       --out <blinded.json>`, and commit the blinded output and the registry;
    3. release the blinding key;

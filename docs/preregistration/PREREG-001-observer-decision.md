@@ -4,7 +4,9 @@
 text and the lock is committed (docs/preregistration/README.md, "Freezing"). Until then no run counts as
 confirmatory, whatever its result.
 
-- Plan: PREREG-001, version 2 (draft of 2026-11-27, revised after the red-team and engineering review).
+- Plan: PREREG-001, version 3 (draft of 2026-11-27, revised after the second review: the analysed data bound to
+  the registered sealed artifacts, one confirmatory run per series and two fixed series, the model set locked, the
+  secondary family under the complete rule, the decisive pass criterion, order checked by git ancestry).
 - Analysis script: `glowbox/analysis/prereg_analysis_001.py` (frozen constants at its top; the reduction of counts
   to the episode table; the calibration, blinded analysis and unblinding steps).
 - Arms and protocol runner: `glowbox/analysis/arms.py`; locking, run records, the run registry, sealing, blinding,
@@ -120,19 +122,33 @@ whether the outcome-contingent choice reached the control.
   predicts for this protocol. A decision arm's choices depend on counts that carry drift, so the replay one block
   later can differ without any new effect.
 - **The model set.** theta0_D is not a single number. The plan names a set of drift and timing models (stage S:
-  the nominal model; stage H: the commissioned model and its variants with within-episode correlated drift, bounded
-  by commissioning data). Each member gets its theta0_D and Monte Carlo SE from **model runs**: registered runs of
-  that model (mode `model`) with the confirmatory design, made before the calibration block; all registered model
-  runs are used. Each SE must be at most margin / 10 (enforced by the script).
-- **Worst case.** H_decision counts only if it rejects at every member's theta0_D (the reported p is the largest),
-  and it is equivalent only if it is equivalent at every member's theta0_D.
-- **Model check.** A misspecified drift model (above all, drift correlated within an episode that an adaptive
-  decision process can exploit) would show up as a decision effect. The model runs therefore also predict the
-  within-episode correlation wcorr of sealed-control pairs (the mean autocorrelation at lags 1-3 of the per-step
-  difference of two sealed replays of the same sequence). The calibration block's (C2, C3) pairs and the
-  confirmatory run's (A3, A3b) pairs must each lie inside the prediction range of at least one member of the set
-  (two-sided, 0.005 each). If either fails, H_decision is **inconclusive** ("the drift model does not reproduce
-  the sealed controls") and no claim is made either way.
+  the members of `models` in the stage-S config; stage H: the commissioned model and its variants with
+  within-episode correlated drift, bounded by commissioning data).
+  - The set is **locked with the plan**: the plan lock's constants list every member by name with its parameters
+    (`create_plan_lock(model_set=...)`).
+  - Each member gets its theta0_D and Monte Carlo SE from **model runs**: registered runs of that member (mode
+    `model`) with the confirmatory design. Every model run records its member and the parameters it ran with, and
+    must end (its end entry committed) before the calibration block is registered.
+  - The calibration step refuses a missing member, an extra member (a registered model run of a name outside the
+    locked set), a model run whose parameters differ from its member's locked ones, and a subset of the registered
+    model runs. Each SE must be at most margin / 10 (enforced by the script).
+- **Model check, member by member.** A misspecified drift model (above all, drift correlated within an episode that
+  an adaptive decision process can exploit) would show up as a decision effect. The model runs therefore also
+  predict the within-episode correlation wcorr of sealed-control pairs (the mean autocorrelation at lags 1-3 of the
+  per-step difference of two sealed replays of the same sequence), as a two-sided prediction range per member
+  (0.005).
+  - A member is **consistent** when both the calibration block's (C2, C3) pairs and the confirmatory run's
+    (A3, A3b) pairs lie inside its range. Members that are not consistent are dropped: their theta0_D comes from a
+    drift model the sealed controls refute.
+  - If no member is consistent, H_decision (and the decision cells of the secondary family) is **inconclusive**
+    ("the drift model does not reproduce the sealed controls") and no claim is made either way.
+- **Worst case.** H_decision counts only if it rejects at every consistent member's theta0_D (the reported p is the
+  largest), and it is equivalent only if it is equivalent at every consistent member's theta0_D.
+- **What the model check cannot do.** It tests the drift, not the selection effect. A member whose drift matches
+  the controls but whose selection effect is wrong passes it. With the right member also in the set the worst case
+  still holds the level (stage S, condition drift_wrong_member); a set that holds only such a member does not
+  (condition drift_only_wrong_member, reported without a criterion). The set must therefore contain the true
+  selection effect, which is why it is locked with the plan and reviewed before sign-off.
 - Alternative: two-sided. No direction is predicted.
 
 **H_observer.** Cell (A2, A3) in the same block: identical actions, and neither applies a decision. They differ only
@@ -156,34 +172,44 @@ come in the same two geometries as the primaries:
 - lag 1: (C1 in block k, C2 in block k + 1), same sequence (the geometry of H_decision);
 - block: (C4, C2), same block, different actions (the geometry of the secondary S1).
 
-The calibration run and all model runs are registered before their first measurement. The locked script
-(`calibrate`) then checks every run against the plan lock and the registry, computes the following, writes the
-calibration file and a **calibration lock** (the calibration's sha256, the plan lock's sha256, the calibration run
-and its data sha256 and start time, every model run and its data sha256), and appends a `calibration` event to the
-registry. All are committed before the confirmatory run starts, and the confirmatory run records the calibration
-lock it will be analysed against.
+The calibration run and all model runs are registered before their first measurement, and each registers its end
+(the sha256 of its sealed artifact files and its acquisition flags) before its sealing key is released (section
+7). The locked script (`calibrate`) then checks every run against the plan lock and the registry, rebuilds every
+episode table from the registered sealed artifacts with the locked reduction, computes the following, writes the
+calibration file and a **calibration lock** (the calibration's sha256, the plan lock's sha256, the calibration run,
+its artifact hashes and data sha256, every model run and its data sha256), and appends a `calibration` event to the
+registry. All are committed before the confirmatory run is registered, and the confirmatory run records the
+calibration lock it will be analysed against.
 
 1. **The empirical null of every test.**
    - The null distribution of a cell's mean over n pairs is a circular moving-block bootstrap of the calibration
-     series of the same geometry and statistic, with block length floor(4 (M / 100)^(2/9)) and a random sign per
-     bootstrap block.
+     series of the same geometry and statistic, with a random sign per bootstrap block.
+   - Block length: the larger of floor(4 (M / 100)^(2/9)) (the Newey-West rule) and twice the series' integrated
+     correlation time, at most M / 4. The correlation time is tau = 1 + 2 sum_k lambda(k / B) rho(k) with the
+     flat-top window lambda and the bandwidth B = 2 m* of Politis and White (2004) (m*: the smallest lag after which
+     max(5, ceil(sqrt(log10 M))) consecutive autocorrelations are below 2 sqrt(log10 M / M) in size). Drift that
+     correlates the pairs over several blocks lengthens the blocks; without it the rule is the Newey-West one.
    - The spread and shape come from the controls. The centre is zero because the controls are exchangeable (random
      order inside blocks).
    - Two-sided p = (1 + #{|null| >= |d|}) / (B + 1), d the cell's centred estimate.
 2. **The margin (smallest effect size of interest)**, per geometry, fixed rule:
 
-       Delta = Q_{1 - alpha/2}(|D|) + Q_{0.90}(|D|),
+       Delta = Q_{1 - alpha/2}(|D|) + Q_{0.95}(|D|),
 
    where D is the empirical control-vs-control null of the mean of N = 100 pairs (item 1) and the quantiles are of
    |D|. For a symmetric null, Q_{1 - alpha/2}(|D|) is the critical value of the test at Holm's first level (alpha / 2,
-   two-sided) and Q_{0.90}(|D|) = Q_{0.95}(D), so an effect of Delta is detected against the controls with power
-   0.95 (MARGIN_POWER) at the planned N. For roughly normal controls Delta = 3.9 x the control-vs-control SD of the
+   two-sided) and Q_{0.95}(|D|) = Q_{0.975}(D), so an effect of Delta is detected against the controls with power
+   0.975 (MARGIN_POWER) at the planned N. For roughly normal controls Delta = 4.2 x the control-vs-control SD of the
    N-pair mean.
    - Meaning: the smallest effect that this experiment, at its fixed size, separates from the control-vs-control
      variability with high power. Smaller effects are not "absent": they are below the resolution the plan is
      built for, and the plan makes no claim about them.
-   - Why 0.95 and not 0.90: a positive claim has two further conditions (the concurrent null and, for H_decision,
-     the model check). The validation shows that the complete rule keeps power >= 0.90 at Delta.
+   - Why MARGIN_POWER = 0.975 = 1 - alpha_eq: the positive test and the equivalence test are then dual at the
+     margin. An effect of exactly Delta escapes the positive test, and a zero effect fails the equivalence test,
+     each with probability about alpha_eq = 0.025. Version 2 used 0.95: its null claims (equivalence, a stable null
+     and the model check together) came out at 0.877 against the 0.90 target, because TOST alone was at 0.93. The
+     complete positive rule (with the concurrent null and the model check) is validated to keep power >= 0.90 at
+     Delta.
    - Why not the earlier rule (the 0.95 quantile of a single control pair, MARGIN_PAIRS = 1): that is about
      2 sigma of a single pair, 20 SE of the cell mean and about 40 % of the spin signal C_ref; the power rule never
      bound, equivalence held in every null run, and an effect of a third of the spin signal would have been called
@@ -191,7 +217,7 @@ lock it will be analysed against.
    - Delta is also reported in units of the spin signal of the replayed sequences, C_ref = the mean over
      calibration blocks of (r of C5 - r of C2), next to every equivalence claim.
 3. **N = 100 valid confirmatory blocks, fixed.** The margin is derived for this N; there is no data-dependent sample
-   size. Stage S gives Delta / C_ref of about 0.08 (section 13).
+   size. Stage S gives Delta / C_ref of about 0.09 (section 13).
 4. **The theta0_D set and the model check** (section 4).
 5. **The bootstrap seed**, from the sha256 of the calibration data (no analyst choice).
 
@@ -236,17 +262,28 @@ disagrees with the empirical-null test, both are reported and the empirical test
 
 ## 6. Secondary outcomes
 
-One family, Holm at FWER 0.05. No claims come from them if the primaries are null. Every secondary uses the empirical
-null of the same calibration geometry and statistic, centred at zero (theta0_D is the model prediction for the
-primary statistic only).
+One family of four cells, Holm at FWER 0.05, under the complete rule of the primaries: a secondary rejects only
+when Holm rejects against the calibration null *and* Holm rejects against the concurrent null (the run's own sealed
+controls of the same geometry and statistic: (A3, A3b) at lag 0, (A3 in block k, A3L in block k + 1) at lag 1).
+The decision cells are centred at every consistent member's theta0_D *of their own statistic* (the model runs
+predict the selection effect of every statistic of the decision cell, not only of r; the worst case is taken), and
+they are refused, like H_decision, when no member is consistent. The observer cells are centred at zero. No claims
+come from the secondaries if the primaries are null.
 
-- **S1, sham vs yoked**: the mean model residual (r - r_model(action)) of A4 against A2 in the same block. The
-  actions differ, hence residuals. r_model is the frozen model's prediction (stage S: the simulator's noiseless
-  means).
-- **S2, dispersion**: the log ratio of the residual variances, A1 vs A2 (lag 1) and A2 vs A3 (lag 0).
+- **S2, dispersion**: the log ratio of the residual variances (r - r_model(action)), A1 vs A2 (lag 1) and A2 vs A3
+  (lag 0). r_model is the frozen model's prediction (stage S: the simulator's noiseless means).
 - **S3, spin specificity**: the primary statistics restricted to steps whose applied frequency is more than
-  3 x (Rabi frequency at the pulse amplitude + T2* FWHM) from every line. A spin-coupled effect must vanish there.
-- **S4, quantum test**: the task error of A5 against A2 (the detuned arm must lose the task).
+  3 x (Rabi frequency at the pulse amplitude + T2* FWHM) from every line, A1 vs A2 (lag 1) and A2 vs A3 (lag 0). A
+  spin-coupled effect must vanish there.
+
+Outside the family:
+
+- **Manipulation check (S4, quantum test)**: the task error of A5 against A2, one-sided at 0.05 (the detuned arm
+  must lose the task). It is a check of the setup, not a hypothesis; a failure is reported with the primaries.
+- **S1, sham vs yoked, exploratory**: the mean model residual of A4 against A2 in the same block. The two arms apply
+  different action sequences, so their residuals differ wherever the frozen model is imperfect, and no sealed
+  control of the design has the same structure (version 2 had it in the family, which was liberal: stage S 0.075
+  for S1-S3). It is reported with the exploratory cells.
 
 ## 7. Sealing, blinding, locking
 
@@ -260,15 +297,25 @@ primary statistic only).
 - **Blinding**: arms appear in every analyst-facing output as random 4-letter codes derived from the blinding key.
   The blinded analysis computes every cell of every code pair (the replay structure is visible from the action
   hashes) and does not need to know the arms.
+- **Sealed artifacts**: the acquisition code writes every episode as it finishes to the run's artifact file (JSON
+  lines: the code or token, block, time slots, applied actions, the sealed outcome records, the sealed setting
+  record, the sealed meta record; `arms.ArtifactWriter`). The episode's synthesiser offset (the detuned arm's
+  400 MHz) is sealed with the sealing key, because in the clear it would name the detuned arm during the run.
 - **Order of steps after a run**:
-  1. Release the sealing key, unseal, and build the episode table and the arm-blind exclusion flags with the locked
+  1. Register the end of acquisition (`Registry.register_end`): the sha256 of every sealed artifact file and the
+     acquisition flags per block (section 8). Commit and push it.
+  2. Only then release the sealing key. The locked script never reads an episode table from the run directory: every
+     step (`calibrate`, `analyse`, `unblind`, and the model-run aggregation) rebuilds the table with the locked
      reduction (`build_episode_table`: r, r_model, off-line flags, task error, sequence hashes and the block
-     exclusions of section 8). The table carries arm codes only.
-  2. Run the locked script (`analyse`) on all valid data. It refuses unless the plan lock, the calibration lock, the
+     exclusions of section 8) from exactly the registered files, with the released sealing key (checked against
+     its commitment; every release is logged) and the frozen model executed from its locked file. It refuses when a
+     file's sha256 differs from the registered one or the run has no single committed end entry. The table carries
+     arm codes only.
+  3. Run the locked script (`analyse`) on all valid data. It refuses unless the plan lock, the calibration lock, the
      calibration run and the confirmatory run all check out (README, rules 2-5). Its output records the run, the
      plan lock, the calibration lock and the script sha256. Commit it and the registry entry of its sha256, with the
      deviations log.
-  3. Only then release the blinding key, run the locked `unblind` step (it refuses an output whose sha256 is not the
+  4. Only then release the blinding key, run the locked `unblind` step (it refuses an output whose sha256 is not the
      registered one), and read off the pre-registered cells.
 - **What blinding protects.** An analyst can guess A5 (its large detuning gap) and the replay structure. Blinding
   guards the decisions that could still be influenced (exclusions, deviations, failure handling), all made before
@@ -278,7 +325,16 @@ primary statistic only).
   carries a planted effect outside simulation, came from a dirty git tree or from a commit that does not hold the
   locked files, or is not registered.
 - **Registry**: every model, calibration and confirmatory run is registered before its first measurement, and every
-  registered run under the lock is reported (completed or aborted). One calibration block per series.
+  registered run under the lock is reported (completed or aborted) with the commit of each of its events. One
+  calibration block and one confirmatory run per series, two series (section 9).
+- **Order is checked by git ancestry**, not by local clocks. The registry's committed history must only append
+  whole entries (no commit may change or extend an earlier entry), and the commit that added each entry is its
+  evidence of time: a run's start entry must be on a commit that descends from the commit the run started from;
+  its end entry on a later commit; every model run's end entry before the calibration block's start entry; the
+  calibration block's end entry before the calibration event; the calibration event before the confirmatory run's
+  start entry; the confirmatory run's end entry before its blinded entry. The commits pushed to the public
+  repository at each registry event are the timestamps (README, rule 3); the `utc` fields and `data_started_utc`
+  are informative only.
 
 ## 8. Sample size, stopping, exclusions
 
@@ -290,7 +346,10 @@ primary statistic only).
   - Peeking is impossible by construction: the outcomes and the arm map are sealed.
 - **Shortfall**: if the cap is reached with fewer valid blocks, the analysis runs on what exists and the shortfall
   is a deviation.
-- **Exclusion of a block as a whole** (all its arms; automated, arm-blind):
+- **Exclusion of a block as a whole** (all its arms; automated, arm-blind). The acquisition flags (interlock trip,
+  counter overflow or saturation, sequencer underrun or loss of sync) are set by the acquisition code blind to
+  outcomes and are part of the registered end entry; the other reasons are computed by the locked reduction. No
+  exclusion can be added after the end entry is committed:
   - a warm-up block;
   - an interlock trip;
   - counter overflow or saturation;
@@ -308,13 +367,19 @@ primary statistic only).
 
 ## 9. Replication and exploratory results
 
-- A **replication** is a new run series under the same lock, with:
+- **Two series, fixed**: series S1 is the original and series S2 the replication. The script refuses any other
+  series name, and each series has exactly one calibration block and one confirmatory run (a second registered one
+  makes the series unusable, as for calibration blocks).
+- A **replication** is the series S2 under the same lock, with:
   - new keys and a new order seed;
   - a new calibration block;
   - a start at least a week after the original;
   - in stage H, ideally a second diamond or a second chip, started by a different person.
-- A positive claim needs a positive claim (section 5, decision rule) in the same direction in the original and in
-  the replication. A null claim needs a null claim in both; an unstable run counts as neither.
+- A positive claim needs a positive claim (section 5, decision rule) in the same direction in S1 and in S2. A null
+  claim needs a null claim in both; an unstable run counts as neither (`series_claim`).
+- A series that is aborted, never completed or unusable counts against every claim: without a completed analysis of
+  both series there is no claim. No third series can be added under the lock, so there is no choice of two agreeing
+  series out of several.
 - A replication series registers its own model runs (if the model set is refitted, that needs a new lock),
   calibration block and confirmatory run; every registered series is reported.
 - Everything else (any other cell of the matrix, any post-hoc pattern) is **exploratory** and labelled so. It
@@ -397,15 +462,24 @@ The calibration script runs the whole procedure on simulated data, R replicates 
 complete experiment with its own keys, order tables and calibration block, analysed with the frozen model set of
 its condition (model runs per model and per true field).
 
-Every criterion is a rule on the Clopper-Pearson 95 % interval of a rate, and the report prints PASS or FAIL for
-each. An error rate passes when its interval is **not above** alpha (lower bound <= 0.05); a coverage, power or
-claim rate when its interval is **not below** its target (upper bound >= target). With R = 1000 a rate of 0.07 is
-excluded; the full size (R = 4000) narrows that to about 0.06.
+Every criterion is a rule on the Clopper-Pearson 95 % interval of a rate, and the report prints PASS, FAIL or
+PENDING for each.
+
+- **The decisive criterion**: the nominal primary family (any positive claim under the complete rule) passes when
+  the interval's **upper bound is at most 0.06** at the documented full size (R = 4000 nominal null replicates,
+  1000 per stress condition). This rule can show that the test is calibrated: a true rate of 0.05 gives an upper
+  bound of about 0.057 at R = 4000. Below the full size it is PENDING, and the plan is not signed off until the
+  full-size run has passed it.
+- **Descriptive error rates** pass when their interval is **not above** their level (lower bound <= level). This rule
+  only fails a test proven liberal (at R = 300 a true rate of 0.07 still passes); it is kept for the checks that are
+  not decisive.
+- Coverage, power and claim rates pass when their interval is **not below** their target (upper bound >= target).
 
 - **Null, nominal condition** (the device is the model):
+  - the primary family (any positive claim under the complete rule): decisive, and descriptive (not above 0.05);
   - each primary's uncorrected rate p <= 0.05 against the calibration null: not above 0.05;
-  - the primary family (any positive claim under the complete rule): not above 0.05;
-  - the secondary family S1-S3 (any Holm rejection): not above 0.05;
+  - the secondary family S2-S3 (any rejection under the complete rule): not above 0.05;
+  - the manipulation check S4 passes: not below 0.95;
   - each primary's 95 % interval covers zero: not below 0.95;
   - each primary's null claim: not below 0.90;
   - the null-stability flag rate: not above 0.05;
@@ -414,7 +488,14 @@ excluded; the full size (R = 4000) narrows that to about 0.06.
   - drift_covered: within-episode contrast drift (AR(1), sd 0.3, correlation 0.9 per step), in the model set
     (theta0_D clearly non-zero);
   - drift_unmodelled: the same drift, missing from the model set (the model check must refuse H_decision);
-  - nonstationary: confirmatory drift 3x larger and 3x faster than in the calibration block.
+  - nonstationary: confirmatory drift 3x larger and 3x faster than in the calibration block;
+  - drift_wrong_member: the same drift; the set holds the right member and a member whose drift matches but whose
+    decision slot replays offline sequences (theta0_D = 0: a wcorr-matched member with a wrong selection effect).
+- **Reported without a criterion**: drift_only_wrong_member (the set holds that wrong member and the nominal model,
+  which the controls refute): the limit of the model check (section 4).
+- **Null claims under nonstationarity**: in the nonstationary condition, an effect of exactly the replicate's
+  frozen margin planted in the decision arm or in every observed arm; the rate of (false) null claims: not above
+  alpha_eq = 0.025 for each primary.
 - **Positive control**: an effect of exactly the replicate's frozen margin, planted in the decision arm (H_decision)
   or in every observed arm (H_observer). Power of the complete rule, attribution (the planted hypothesis claimed,
   the other not) and non-equivalence: each not below 0.90. Below the margin only the power curve is reported.
