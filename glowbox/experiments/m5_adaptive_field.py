@@ -188,6 +188,7 @@ class AdaptiveTask:
                 b_max_t=float(n["table_b_max_t"]),
                 d_par_t=float(n["table_d_par_t"]),
                 d_perp_t=float(n["table_d_perp_t"]),
+                n_az=int(n["table_n_az"]),
             )
             self.seconds["tables"] += time.perf_counter() - t0
             self.tables[cond.name] = tab
@@ -851,8 +852,7 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
         "- Emulator (the learners' model) vs the full surrogate (the truth) on the test fields, resonant: RMS error "
         f"{e.rms_rel_signal.mean():.3g} of the signal spread over actions, max {e.max_rel_signal.max():.3g} "
         f"({e.max_abs.max():.3g} counts per shot; the shot noise of a block of {S} shots is ~{math.sqrt(3.4 / S):.3g} "
-        "counts per shot). The largest errors are fields with an axis nearly perpendicular to B, where the neglected "
-        "B_perp azimuth matters."
+        "counts per shot)."
     )
     L.append(
         f"- QuTiP reference as the device through `Simulator.run()` (`SimulatorBackend`), seed-0 agent and EIG, "

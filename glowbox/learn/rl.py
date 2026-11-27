@@ -456,7 +456,7 @@ def ppo_update(
     params = list(policy.parameters())
     stop = False
     for _ in range(cfg.epochs):
-        perm = torch.randperm(n, generator=generator, device="cpu").to(adv_f.device)
+        perm = torch.randperm(n, generator=generator, device=generator.device).to(adv_f.device)
         for i in range(0, n, mb):
             idx = perm[i : i + mb]
             dist, v = policy({k: x[idx] for k, x in flat_obs.items()})

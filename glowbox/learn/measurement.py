@@ -19,12 +19,12 @@ Three ways to get the per-shot means:
   shortcuts of :func:`emission_table` (equal to the bin path to round-off, tests/learn).
 * :class:`AxisTable`: a fast *emulator* of :func:`measurement_means` for arbitrary fields, used as the likelihood
   of the Bayesian learners. The ensemble signal is a sum over the four NV orientations (docs/physics.md 7), and
-  each orientation's response depends on the field only through B_par = |B . n_k| and B_perp = |B - (B . n_k) n_k|,
-  up to the azimuth of B_perp relative to the MW direction (it changes the drive matrix elements at order
-  (gamma_e B_perp / D)^2 ~ 1e-3 at 3 mT). So one single-orientation table on a (B_par, B_perp) grid, bilinearly
-  interpolated and summed over the four axes, gives the means of any field. Its error against the full surrogate
-  is measured (:func:`emulator_error`) and reported; the learners' *observations* always come from the full
-  surrogate (or another ``run()``), so the emulator only enters as the learners' model, never as the truth.
+  each orientation's response depends on the field only through B_par, |B_perp| and the azimuth of B_perp
+  relative to the MW's transverse direction (:func:`axis_coordinates`; the azimuth matters where an axis is
+  nearly perpendicular to B and its levels mix). So one single-orientation table on that 3-D grid, interpolated
+  and summed over the four axes, gives the means of any field. Its error against the full surrogate is measured
+  (:func:`emulator_error`) and reported; the learners' *observations* always come from the full surrogate (or
+  another ``run()``), so the emulator only enters as the learners' model, never as the truth.
 
 Assumption: the device is calibrated (known ``EnvParams`` apart from the hidden field: T2*, Rabi scale, optics,
 background, E = 0). Milestones 2-4 marginalised over a nuisance prior; milestone 5 does not (docs/results/m5-*).
@@ -289,22 +289,63 @@ def axis_projections(fields_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return par.abs(), perp
 
 
+def mw_azimuths(mw_direction: tuple[float, float, float]) -> np.ndarray:
+    """Azimuth (rad) of the MW field's transverse part in each axis's local frame, (4,)."""
+    from glowbox.sim.surrogate.model import nv_local_frames
+
+    m = np.einsum("kij,j->ki", nv_local_frames(), np.asarray(mw_direction, dtype=np.float64))
+    out: np.ndarray = np.arctan2(m[:, 1], m[:, 0])
+    return out
+
+
+def axis_coordinates(fields_t: torch.Tensor, mw_direction: tuple[float, float, float]) -> torch.Tensor:
+    """Per axis k the coordinates of the single-orientation table, (..., 4, 3): |B_par|, |B_perp| and the table
+    azimuth theta in [0, pi).
+
+    Every orientation's response depends on the field through B_par, |B_perp| and the angle between B_perp and the
+    MW's transverse direction (the model is symmetric under rotations about the axis). Two more symmetries of the
+    model (D S_z^2, isotropic rates and dephasing): a pi rotation about a transverse axis flips B_par and that
+    relative angle, and a linear MW drive is unchanged by u -> -u, so the angle has period pi. Hence theta =
+    sign(B_par) (psi_k - chi_k) + chi_1 mod pi, with psi_k the azimuth of B in axis k's local frame and chi_k the
+    MW's: the angle at which orientation 1 (the table's) sees the same relative geometry."""
+    from glowbox.sim.surrogate.model import nv_local_frames
+
+    fr = torch.as_tensor(nv_local_frames(), dtype=fields_t.dtype, device=fields_t.device)  # (4, 3, 3)
+    loc = torch.einsum("kij,...j->...ki", fr, fields_t)  # (..., 4, 3)
+    par = loc[..., 2]
+    perp = torch.hypot(loc[..., 0], loc[..., 1])
+    psi = torch.atan2(loc[..., 1], loc[..., 0])
+    chi = torch.as_tensor(mw_azimuths(mw_direction), dtype=fields_t.dtype, device=fields_t.device)
+    sgn = torch.where(par < 0, -1.0, 1.0).to(fields_t.dtype)
+    theta = torch.remainder(sgn * (psi - chi) + chi[0], math.pi)
+    return torch.stack([par.abs(), perp, theta], dim=-1)
+
+
+def _catmull_rom(t: torch.Tensor) -> torch.Tensor:
+    """Weights (..., 4) of the nodes i-1, i, i+1, i+2 at fraction t in [0, 1) past node i."""
+    t2, t3 = t * t, t * t * t
+    return torch.stack(
+        [0.5 * (-t + 2 * t2 - t3), 0.5 * (2 - 5 * t2 + 3 * t3), 0.5 * (t + 4 * t2 - 3 * t3), 0.5 * (-t2 + t3)], -1
+    )
+
+
 @dataclass
 class AxisTable:
-    """Single-orientation emission per NV, ``table`` (n_par, n_perp, A, W), on a regular (B_par, B_perp) grid.
+    """Single-orientation emission per NV, ``table`` (n_par, n_perp, n_az, A, W), on a regular grid of
+    (B_par, |B_perp|, azimuth theta of B_perp in orientation 1's frame, see :func:`axis_coordinates`).
 
     :meth:`means` interpolates it for the four axes of each field (Catmull-Rom cubic along B_par, where the lines
-    are sharp; linear along B_perp, where they only shift quadratically) and returns counts per shot. Measured
-    interpolation error at the default steps (10 uT, 100 uT), single axis, relative to its spread over actions:
-    max 0.3 % along B_par, 2 % along B_perp (scratch check recorded in docs/results/m5-adaptive-field.md). The
-    response is even in B_par (spin-1, E = 0), so the grid starts at 0 and reflects there; beyond the far edge it
-    is clamped (the prior stays inside; jittered particles may step out by a few uT).
+    are sharp, and along the periodic azimuth; linear along |B_perp|, where the lines only shift quadratically) and
+    returns counts per shot. The B_par grid starts two steps below 0 so the cubic stencil never leaves it; beyond
+    the far edges it is clamped (the prior stays inside; jittered particles may step out by a few uT). The
+    measured error against the full surrogate is reported per run (:func:`emulator_error`).
     """
 
     spec: MeasurementSpec
     env: EnvParams
     b_par_t: np.ndarray
     b_perp_t: np.ndarray
+    n_az: int
     table: torch.Tensor
 
     @classmethod
@@ -317,21 +358,23 @@ class AxisTable:
         b_max_t: float = 3.1e-3,
         d_par_t: float = 10e-6,
         d_perp_t: float = 100e-6,
+        n_az: int = 8,
         chunk: int = 0,
     ) -> AxisTable:
-        """Simulate orientation 1 alone on the grid (B_perp along its local x; the azimuth of B_perp is
-        neglected, see the module docstring)."""
-        b_par = np.arange(0.0, b_max_t + 0.5 * d_par_t, d_par_t)
-        b_perp = np.arange(0.0, b_max_t + 0.5 * d_perp_t, d_perp_t)
+        """Simulate orientation 1 alone on the grid."""
         from glowbox.sim.surrogate.model import nv_local_frames
 
-        x1, _, n1 = nv_local_frames()[0]
-        pp, qq = np.meshgrid(b_par, b_perp, indexing="ij")
-        fields = pp.reshape(-1, 1) * n1[None] + qq.reshape(-1, 1) * x1[None]
+        b_par = np.arange(-2, round(b_max_t / d_par_t) + 1) * d_par_t
+        b_perp = np.arange(0, round(b_max_t / d_perp_t) + 1) * d_perp_t
+        az = np.arange(n_az) * (math.pi / n_az)
+        x1, y1, n1 = nv_local_frames()[0]
+        pp, qq, aa = np.meshgrid(b_par, b_perp, az, indexing="ij")
+        dirs = np.cos(aa).reshape(-1, 1) * x1[None] + np.sin(aa).reshape(-1, 1) * y1[None]
+        fields = pp.reshape(-1, 1) * n1[None] + qq.reshape(-1, 1) * dirs
         env1 = dataclasses.replace(env, b_field_t=(0.0, 0.0, 0.0), orientation_populations=(1.0, 0.0, 0.0, 0.0))
         em = emission_table(spec, env1, fields, options, device, chunk=chunk)
-        tab = em.reshape(b_par.size, b_perp.size, spec.n_actions, spec.n_windows).float()
-        return cls(spec, env, b_par, b_perp, tab)
+        tab = em.reshape(b_par.size, b_perp.size, n_az, spec.n_actions, spec.n_windows).float()
+        return cls(spec, env, b_par, b_perp, n_az, tab)
 
     def to(self, device: torch.device | str) -> AxisTable:
         return dataclasses.replace(self, table=self.table.to(device))
@@ -341,35 +384,27 @@ class AxisTable:
         return self.table.device
 
     def _stencil(self, fields_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Flat grid indices (..., 4 axes, 8) and weights (..., 4, 8) (orientation population included)."""
-        par, perp = axis_projections(fields_t.to(self.device, torch.float64))
-        dp = float(self.b_par_t[1] - self.b_par_t[0])
+        """Flat grid indices (..., 4 axes, 32) and weights (..., 4, 32) (orientation population included)."""
+        q = axis_coordinates(fields_t.to(self.device, torch.float64), self.env.mw_field_direction)
+        p0, dp = float(self.b_par_t[0]), float(self.b_par_t[1] - self.b_par_t[0])
         dq = float(self.b_perp_t[1] - self.b_perp_t[0])
-        npar, nperp = self.b_par_t.size, self.b_perp_t.size
-        u = torch.clamp(par / dp, 0.0, npar - 1 - 1e-9)
-        v = torch.clamp(perp / dq, 0.0, nperp - 1 - 1e-9)
-        i1, j0 = torch.floor(u).long(), torch.floor(v).long()
-        t, fv = (u - i1).float(), (v - j0).float()
-        # Catmull-Rom weights of the nodes i1-1, i1, i1+1, i1+2.
-        t2, t3 = t * t, t * t * t
-        wp = torch.stack(
-            [
-                0.5 * (-t + 2 * t2 - t3),
-                0.5 * (2 - 5 * t2 + 3 * t3),
-                0.5 * (t + 4 * t2 - 3 * t3),
-                0.5 * (-t2 + t3),
-            ],
-            -1,
-        )
-        ip = i1[..., None] + torch.arange(-1, 3, device=self.device)
-        ip = torch.where(ip < 0, -ip, ip)  # even in B_par: reflect at 0
-        ip = torch.clamp(ip, max=npar - 1)
-        wq = torch.stack([1 - fv, fv], -1)
-        jq = torch.clamp(j0[..., None] + torch.arange(2, device=self.device), max=nperp - 1)
-        idx = (ip[..., :, None] * nperp + jq[..., None, :]).flatten(-2)  # (..., 4, 8)
-        pops = torch.as_tensor(self.env.orientation_populations, dtype=torch.float32, device=self.device)
-        w = (wp[..., :, None] * wq[..., None, :]).flatten(-2) * pops[:, None]
-        return idx, w
+        npar, nperp, naz = self.b_par_t.size, self.b_perp_t.size, self.n_az
+        dev = self.device
+        u = torch.clamp((q[..., 0] - p0) / dp, 1.0, npar - 3 - 1e-9)
+        v = torch.clamp(q[..., 1] / dq, 0.0, nperp - 1 - 1e-9)
+        w = q[..., 2] / (math.pi / naz)
+        i1, j0, k1 = torch.floor(u).long(), torch.floor(v).long(), torch.floor(w).long()
+        wp = _catmull_rom((u - i1).float())  # (..., 4, 4)
+        fv = (v - j0).float()
+        wq = torch.stack([1 - fv, fv], -1)  # (..., 4, 2)
+        wa = _catmull_rom((w - k1).float())  # (..., 4, 4)
+        ip = i1[..., None] + torch.arange(-1, 3, device=dev)
+        jq = torch.clamp(j0[..., None] + torch.arange(2, device=dev), max=nperp - 1)
+        ka = torch.remainder(k1[..., None] + torch.arange(-1, 3, device=dev), naz)
+        idx = (ip[..., :, None, None] * nperp + jq[..., None, :, None]) * naz + ka[..., None, None, :]
+        wt = wp[..., :, None, None] * wq[..., None, :, None] * wa[..., None, None, :]
+        pops = torch.as_tensor(self.env.orientation_populations, dtype=torch.float32, device=dev)
+        return idx.flatten(-3), wt.flatten(-3) * pops[:, None]
 
     def emission(self, fields_t: torch.Tensor, actions: torch.Tensor | None = None) -> torch.Tensor:
         """Orientation-averaged emission per NV per shot, (..., A or A', W) float32; ``actions`` (A',) restricts
@@ -382,7 +417,7 @@ class AxisTable:
         for k in range(4):
             if self.env.orientation_populations[k] == 0:
                 continue
-            for q in range(8):
+            for q in range(idx.shape[-1]):
                 out = out + flat[idx[..., k, q]] * w[..., k, q, None, None]
         return out
 
@@ -402,7 +437,7 @@ class AxisTable:
         for k in range(4):
             if e.orientation_populations[k] == 0:
                 continue
-            for q in range(8):
+            for q in range(idx.shape[-1]):
                 out = out + flat[idx[..., k, q], act] * w[..., k, q, None]
         bg = torch.as_tensor(self.spec.background_counts(e), dtype=torch.float32, device=self.device)
         return e.collection_efficiency * e.n_nv * out + bg

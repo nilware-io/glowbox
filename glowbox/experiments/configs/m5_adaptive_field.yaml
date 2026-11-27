@@ -27,8 +27,9 @@ numerics:                     # truths and the emulator table (milestone 2/4 ban
   n_detuning: 32
   detuning_rule: uniform
   detuning_spacing: 2.0
-  table_d_par_t: 1.0e-5       # emulator grid: 10 uT along B_par (cubic), 100 uT along B_perp (linear)
+  table_d_par_t: 1.0e-5       # emulator grid: 10 uT along B_par (cubic), 100 uT along |B_perp| (linear)
   table_d_perp_t: 1.0e-4
+  table_n_az: 8               # azimuth of B_perp relative to the MW (cubic, periodic over pi)
   table_b_max_t: 3.1e-3
 
 budget:
@@ -93,6 +94,7 @@ quick:
     n_detuning: 4
     table_d_par_t: 2.0e-5
     table_d_perp_t: 2.5e-4
+    table_n_az: 4
   budget:
     n_steps: 20
     shots: 1000

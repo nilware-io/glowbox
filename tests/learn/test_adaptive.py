@@ -34,7 +34,7 @@ PRIOR = FieldPriorSpec()
 @pytest.fixture(scope="module")
 def table() -> AxisTable:
     opt = ModelOptions(n_detuning=2, detuning_rule="uniform", detuning_spacing=2.0)
-    return AxisTable.build(SPEC, EnvParams(), opt, "cpu", d_par_t=25e-6, d_perp_t=250e-6)
+    return AxisTable.build(SPEC, EnvParams(), opt, "cpu", d_par_t=25e-6, d_perp_t=250e-6, n_az=4)
 
 
 def test_prior_and_fold():

@@ -54,25 +54,45 @@ def test_run_path_means_equal_the_run_interface():
 
 
 def test_axis_table_sums_orientations_and_interpolates():
-    """At the table's nodes the emulator reproduces single-orientation simulations exactly; for a full field it
-    equals the sum of its four orientations (up to the neglected B_perp azimuth and the interpolation)."""
-    tab = AxisTable.build(SPEC, ENV, OPT, "cpu", b_max_t=1.0e-3, d_par_t=100e-6, d_perp_t=500e-6)
-    assert tab.table.shape == (11, 3, 14, 2)
-    x1, _, n1 = nv_local_frames()[0]
-    node = torch.as_tensor((0.5e-3 * n1 + 0.5e-3 * x1)[None])
+    """At the table's nodes the emulator reproduces single-orientation simulations exactly; for full fields it is
+    the sum of the four orientations at their table coordinates (interpolation error only)."""
+    tab = AxisTable.build(SPEC, ENV, OPT, "cpu", b_max_t=1.0e-3, d_par_t=100e-6, d_perp_t=500e-6, n_az=4)
+    assert tab.table.shape == (13, 3, 4, 14, 2)
+    x1, y1, n1 = nv_local_frames()[0]
+    az = np.pi / 4  # a node of the 4-point azimuth grid
+    node = torch.as_tensor((0.5e-3 * n1 + 0.5e-3 * (np.cos(az) * x1 + np.sin(az) * y1))[None])
     env1 = dataclasses.replace(ENV, orientation_populations=(1.0, 0.0, 0.0, 0.0))
     t1 = dataclasses.replace(tab, env=env1)
     exact = measurement_means(SPEC, env1, node.numpy(), OPT, "cpu")
     np.testing.assert_allclose(t1.means(node).double().numpy(), exact.numpy(), rtol=2e-6)
-    # four-orientation sum for a field whose projections all sit on nodes: B along [100] (|B.n_k| equal)
+    # a field whose four orientations all sit on nodes: B along [100] (|B.n_k| = |B|/sqrt3, |B_perp| = sqrt(2/3)|B|)
     b = torch.tensor([[0.3e-3 * np.sqrt(3.0), 0.0, 0.0]], dtype=torch.float64)
     par, _ = axis_projections(b)
     np.testing.assert_allclose(par.numpy(), 0.3e-3, rtol=1e-12)
     full = measurement_means(SPEC, ENV, b.numpy(), OPT, "cpu").numpy()
     emu = tab.means(b).double().numpy()
     spread = full.std(axis=1).mean()
-    assert np.abs(emu - full).max() < 0.1 * spread  # B_perp = 0.42 mT is between perp nodes: interpolation
+    assert np.abs(emu - full).max() < 0.1 * spread  # B_perp = 0.42 mT lies between the coarse perp nodes
     # means_at == means gathered
     a = torch.tensor([3, 11])
     bb = torch.as_tensor(B)
     np.testing.assert_allclose(tab.means_at(bb, a).numpy(), tab.means(bb)[torch.arange(2), a].numpy(), rtol=1e-6)
+
+
+def test_axis_coordinates_symmetries():
+    """The table coordinates' claims: every orientation responds like orientation 1 at the mapped azimuth, and a
+    flipped B_par with a mirrored azimuth is the same measurement (exact single-orientation simulations)."""
+    from glowbox.learn.measurement import axis_coordinates, emission_table
+
+    rng = np.random.default_rng(3)
+    b = rng.normal(size=(2, 3)) * 1e-3
+    frames = nv_local_frames()
+    x1, y1, n1 = frames[0]
+    for k in range(4):
+        envk = dataclasses.replace(ENV, orientation_populations=tuple(1.0 if j == k else 0.0 for j in range(4)))
+        ek = emission_table(SPEC, envk, b, OPT, "cpu").numpy()
+        q = axis_coordinates(torch.as_tensor(b), ENV.mw_field_direction)[:, k].numpy()
+        eq = q[:, :1] * n1 + q[:, 1:2] * (np.cos(q[:, 2:3]) * x1 + np.sin(q[:, 2:3]) * y1)
+        env1 = dataclasses.replace(ENV, orientation_populations=(1.0, 0.0, 0.0, 0.0))
+        e1 = emission_table(SPEC, env1, eq, OPT, "cpu").numpy()
+        np.testing.assert_allclose(ek, e1, rtol=1e-6, atol=1e-12)
