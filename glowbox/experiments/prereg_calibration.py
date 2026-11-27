@@ -1053,10 +1053,11 @@ def summary_markdown(
         "- A positive claim needs a Holm rejection against the frozen calibration controls and against the run's own "
         "sealed controls; the nonstationary condition shows why (the calibration null alone is too narrow when the "
         "confirmatory run drifts more).",
-        "- H_decision depends on a model of the selection effect. The drift_unmodelled condition (within-episode "
-        "drift missing from the model set) shows the calibration null alone rejecting too often, and the model check "
-        "refusing H_decision instead. In drift_covered the same drift is in the model set: theta0_D is non-zero and "
-        "the worst-case test keeps its level.",
+        "- H_decision depends on a model of the selection effect. In the drift_unmodelled condition (within-episode "
+        "drift missing from the model set) the model check refuses H_decision: no member reproduces the sealed "
+        "controls, so H_decision is never tested at the wrong centre (theta0_D = 0 while the unmodelled drift moves "
+        "the decision cell; the calibration-null column is gated by the same check). In drift_covered the same "
+        "drift is in the model set: theta0_D is non-zero and the worst-case test keeps its level.",
         "- The model rule: members whose wcorr envelope excludes the sealed controls of the calibration block or of "
         "the confirmatory run are dropped, and the worst case is taken over the rest. drift_wrong_member adds a "
         "member whose drift matches the device (wcorr) but whose selection effect is wrong (its decision arm cannot "
