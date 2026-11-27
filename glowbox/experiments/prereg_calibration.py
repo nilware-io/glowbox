@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import json
 import math
 import multiprocessing as mp
 import time
@@ -413,6 +414,9 @@ def _analyse_rep(job: dict[str, Any]) -> dict[str, Any]:
         out[f"{h}_eq"] = bool(r.get("equivalent", False))
         out[f"{h}_null_claim"] = str(r["conclusion"]).startswith("null")
         out[f"{h}_d"] = r.get("d", float("nan"))
+        # an interval exists only when the hypothesis is not inconclusive by the model check (H_decision: a
+        # consistent member is left); coverage is over the runs that report one
+        out[f"{h}_has_ci"] = not r.get("missing")
         out[f"{h}_cover"] = bool(r["ci95"][0] <= 0.0 <= r["ci95"][1]) if not r.get("missing") else False
         out[f"{h}_nw_rej"] = bool(r.get("nw_p", 1.0) <= pa.ALPHA)
         out[f"{h}_conclusion"] = r["conclusion"]
@@ -771,6 +775,11 @@ def _not(res: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     return [{"x": not r[key]} for r in res]
 
 
+def _with_ci(res: list[dict[str, Any]], h: str) -> list[dict[str, Any]]:
+    """The runs that report an interval for ``h`` (H_decision without a consistent member reports none)."""
+    return [r for r in res if r.get(f"{h}_has_ci", True)]
+
+
 #: Stress conditions with a pass criterion (primary family, any positive claim); others are reported only.
 STRESS_CRITERIA = ("drift_covered", "drift_unmodelled", "nonstationary", "drift_wrong_member")
 
@@ -804,8 +813,18 @@ def criteria(
         err("nominal: H_observer, p <= 0.05 against the calibration null", nom, "H_observer_raw_rej"),
         err("nominal: primary family, any positive claim (complete rule)", _any(nom, both), "x"),
         err("nominal: secondary family S2-S3, any rejection (complete rule)", _any(nom, sec), "x"),
-        at_least("nominal: H_decision 95 % interval covers 0", nom, "H_decision_cover", 0.95),
-        at_least("nominal: H_observer 95 % interval covers 0", nom, "H_observer_cover", 0.95),
+        at_least(
+            "nominal: H_decision 95 % interval covers 0 (runs with an interval)",
+            _with_ci(nom, "H_decision"),
+            "H_decision_cover",
+            0.95,
+        ),
+        at_least(
+            "nominal: H_observer 95 % interval covers 0 (runs with an interval)",
+            _with_ci(nom, "H_observer"),
+            "H_observer_cover",
+            0.95,
+        ),
         at_least("nominal: H_decision null claim", nom, "H_decision_null_claim", pw),
         at_least("nominal: H_observer null claim", nom, "H_observer_null_claim", pw),
         err("nominal: null-stability check flags the run", _not(nom, "stable"), "x"),
@@ -925,16 +944,18 @@ def summary_markdown(
         ("p <= 0.05 against the calibration null (uncorrected)", "raw_rej"),
         ("TOST equivalent at the frozen margin", "eq"),
         ("null claim (equivalent, stable null; H_decision: model check)", "null_claim"),
-        ("95 % interval covers 0", "cover"),
+        ("95 % interval covers 0 (runs with an interval)", "cover"),
         ("Newey-West check, p <= 0.05", "nw_rej"),
     ):
+        dec, obs = (_with_ci(nom, h) if key == "cover" else nom for h in ("H_decision", "H_observer"))
         lines.append(
-            f"| {label} | {fmt_rate(rate(nom, f'H_decision_{key}'))} | {fmt_rate(rate(nom, f'H_observer_{key}'))} |"
+            f"| {label} | {fmt_rate(rate(dec, f'H_decision_{key}'))} | {fmt_rate(rate(obs, f'H_observer_{key}'))} |"
         )
     lines += [
         "",
-        f"- Model check passed: calibration block {fmt_rate(rate(nom, 'model_ok_cal'))}, confirmatory sealed controls "
-        f"{fmt_rate(rate(nom, 'model_ok_conf'))}.",
+        f"- Model check: the calibration block inside some member's range {fmt_rate(rate(nom, 'model_ok_cal'))}, the "
+        f"confirmatory sealed controls {fmt_rate(rate(nom, 'model_ok_conf'))}, one member consistent with both (an "
+        f"interval and a decision for H_decision) {fmt_rate(rate(nom, 'model_ok'))}.",
         "- Manipulation check S4 (the detuned arm loses the task): passes in "
         f"{fmt_rate(rate(nom, 'S4_quantum_test_passed'))}.",
         "- Secondary family (S2, S3: decision cells at every consistent member's theta0_D of their statistic, every "
@@ -1150,6 +1171,7 @@ def main(argv: list[str] | None = None) -> None:
         eng = engineering_validation(int(rc["engineering"]), int(cfg["seed"]), int(rc["n_boot"]))
         seconds = time.perf_counter() - t_start
         md, metrics = summary_markdown(cfg, pool, models, null, pos, eng, seconds)
+        (run.dir / "replicates.json").write_text(json.dumps({"null": null, "positive": pos}, default=str))
         run.log_metrics(0, **metrics)
         png = run.save_figure(figure(null["nominal"], pos), "calibration")
         print(md)
