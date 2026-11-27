@@ -55,7 +55,7 @@ from glowbox.analysis.quantum_test import (
     run_quantum_test,
     t_ci,
 )
-from glowbox.analysis.runlog import DEFAULT_OUTPUT_ROOT, RunLog, write_report
+from glowbox.analysis.runlog import RunLog, write_report
 from glowbox.experiments.m1_odmr_rabi import load_config
 from glowbox.experiments.m2_field_estimation import _style
 from glowbox.experiments.m3_bit_memory import _band, _ci
@@ -187,11 +187,11 @@ class AdaptiveTask:
                 "d_perp_t": float(n["table_d_perp_t"]),
                 "n_az": int(n["table_n_az"]),
             }
-            # The table depends only on these inputs: cache it between runs (outputs/ is gitignored).
+            # The table depends only on these inputs: cache it between runs (next to the run directories).
             key = hashlib.sha256(
                 repr((dataclasses.asdict(self.cond_spec(cond)), self.env.to_dict(), self.opt, kw)).encode()
             ).hexdigest()[:16]
-            cache = DEFAULT_OUTPUT_ROOT / "cache" / f"m5_axis_table_{key}.pt"
+            cache = self.run.dir.parent / "cache" / f"m5_axis_table_{key}.pt"
             if cache.exists():
                 tab = AxisTable(self.cond_spec(cond), self.env, *torch.load(cache, weights_only=False))
                 tab = tab.to(self.device)
