@@ -1,0 +1,79 @@
+# Milestone 5, Task 2 with a learned write: an RL agent (PPO, black box) chooses the write pulses of every L-bit
+# pattern; compared with the same parametrisation trained by gradient through the differentiable surrogate
+# (milestone 4's learner) and fixed at random (milestone 3/4's reservoir). Recall: the Bayes-optimal readout of each
+# codebook after a dark storage delay. Quantum test: every MW frequency + 400 MHz, everything retrained.
+# Run: uv run python -m glowbox.experiments.m5_rl_bit_write  (--quick: a smoke run, a few minutes on a CPU)
+name: m5-rl-bit-write
+seed: 20261130
+seeds: [0, 1, 2, 3, 4]
+detuned_offset_hz: 4.0e+8
+
+device:
+  bias_field_t: [1.2e-3, 0.7e-3, 2.5e-3]   # known static field: eight distinct lines (milestones 1, 3, 4)
+  prior:                      # nuisance ranges, one draw per seed (glowbox.learn.field_data.FieldPrior)
+    t2_star_s: [0.5e-6, 2.0e-6]
+    rabi_full_scale_hz: [8.0e+6, 12.0e+6]
+    optical_beta_full_scale: [0.07, 0.13]
+    collection_efficiency: [2.0e-3, 4.0e-3]
+    background_cps: [5.0e+3, 2.0e+4]
+    e_hz: [0.0, 3.0e+5]
+  n_detuning: 8               # T2* quadrature while training (quantile rule, as milestone 4)
+  eval_n_detuning: 32         # every template, evaluation, probe and the QuTiP check
+system: {init_ns: 1500, settle_ns: 1000}
+
+layout:                       # glowbox.learn.encoder.Layout (one block)
+  n_segments: 8               # one MW segment per device line (sorted), 100 ns slots: milestone 3's write block
+  slot_ns: 100
+  min_ns: 0.0
+  max_ns: 100.0
+  amp_lo: 0.0
+  amp_hi: 1.0
+  span_hz: 4.0e+6
+  delay_ns: 1000              # storage delay (milestone 3's headline)
+  readout_ns: 1000
+  gate_ns: 0                  # time-resolved readout in 100 ns windows (milestone 3 read every 10 ns bin)
+  window_ns: 100
+
+task:
+  n_bits: 4
+  train_shots: 10000          # the shots per recall the learners optimise for (milestone 3's headline)
+  eval_shots: [1000, 10000, 100000]
+  headline_shots: 10000
+  draws_per_pattern: 512
+
+rl:                           # PPO on the codebook bandit (glowbox.learn.rl.CodebookEnv)
+  iterations: 400
+  codebooks: 16               # codebooks sampled per iteration (16 x 2^L actions)
+  n_noise: 8                  # noise draws per pattern for the reward
+  lr: 3.0e-3
+  epochs: 8
+  minibatches: 4
+  clip: 0.2
+  ent_coef: 0.0
+  init_log_std: 0.0           # exploration std 1 in pre-activation space
+  hidden: [64, 64]
+  target_kl: 0.0
+
+gradient:                     # the same objective by gradient through the surrogate (milestone 4's learner)
+  steps: 1000
+  lr: 3.0e-3
+  n_noise: 8
+  hidden: [64, 64]
+  out_scale: 1.0
+random: {gain: 1.5, hidden: [64, 64]}
+
+timing:
+  shifts_ns: [-50, -20, 20, 50]
+
+reference:
+  workers: 16
+
+quick:
+  device: {n_detuning: 2, eval_n_detuning: 4}
+  layout: {n_segments: 4, readout_ns: 600, delay_ns: 500}
+  task: {n_bits: 2, draws_per_pattern: 64}
+  rl: {iterations: 4, codebooks: 4, n_noise: 2, hidden: [16]}
+  gradient: {steps: 4, n_noise: 2, hidden: [16]}
+  random: {hidden: [16]}
+  timing: {shifts_ns: [-50, 50]}
+  reference: {workers: 4}

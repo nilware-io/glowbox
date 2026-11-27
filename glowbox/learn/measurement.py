@@ -272,10 +272,17 @@ def measurement_means(
     options: ModelOptions,
     device: torch.device | str,
     chunk: int = 0,
+    field_chunk: int = 512,
 ) -> torch.Tensor:
     """Mean detected counts per shot, (N, A, W) float64: collection x NVs x emission + background (the truth
-    tables of the learners' environments)."""
-    em = emission_table(spec, env, fields_t, options, device, chunk)
+    tables of the learners' environments). Fields go in chunks of ``field_chunk`` (host memory of the statics)."""
+    f = np.atleast_2d(np.asarray(fields_t, dtype=np.float64))
+    em = torch.cat(
+        [
+            emission_table(spec, env, f[i : i + field_chunk], options, device, chunk)
+            for i in range(0, f.shape[0], field_chunk)
+        ]
+    )
     bg = torch.as_tensor(spec.background_counts(env), dtype=torch.float64, device=em.device)
     return env.collection_efficiency * env.n_nv * em + bg
 
@@ -360,6 +367,7 @@ class AxisTable:
         d_perp_t: float = 100e-6,
         n_az: int = 8,
         chunk: int = 0,
+        field_chunk: int = 2048,
     ) -> AxisTable:
         """Simulate orientation 1 alone on the grid."""
         from glowbox.sim.surrogate.model import nv_local_frames
@@ -372,8 +380,12 @@ class AxisTable:
         dirs = np.cos(aa).reshape(-1, 1) * x1[None] + np.sin(aa).reshape(-1, 1) * y1[None]
         fields = pp.reshape(-1, 1) * n1[None] + qq.reshape(-1, 1) * dirs
         env1 = dataclasses.replace(env, b_field_t=(0.0, 0.0, 0.0), orientation_populations=(1.0, 0.0, 0.0, 0.0))
-        em = emission_table(spec, env1, fields, options, device, chunk=chunk)
-        tab = em.reshape(b_par.size, b_perp.size, n_az, spec.n_actions, spec.n_windows).float()
+        # Field chunks bound the host memory of the statics (complex 14x14 superoperators per field and node).
+        parts = [
+            emission_table(spec, env1, fields[i : i + field_chunk], options, device, chunk=chunk).float()
+            for i in range(0, fields.shape[0], field_chunk)
+        ]
+        tab = torch.cat(parts).reshape(b_par.size, b_perp.size, n_az, spec.n_actions, spec.n_windows)
         return cls(spec, env, b_par, b_perp, n_az, tab)
 
     def to(self, device: torch.device | str) -> AxisTable:

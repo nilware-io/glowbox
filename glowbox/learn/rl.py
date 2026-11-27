@@ -203,6 +203,7 @@ class FieldSearchEnv:
         self.post = FieldPosterior(self.table, self.prior, self.num_envs, self.post_cfg, self.gen)
         self.t = 0
         self._last = self._loss()
+        self._first = self._last
         return self.observe(), {}
 
     def step(self, action: torch.Tensor) -> tuple[Obs, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
