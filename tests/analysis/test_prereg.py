@@ -246,20 +246,27 @@ def test_registry_end_entry_and_history(tmp_path):
     rec = pr.prereg_record(lock, root / "l.yaml", pr.RunKeys.generate(), "model", root=root, series="S1",
                            schedule_sha256="x", extra={"model": "nominal"})  # fmt: skip
     with pytest.raises(ValueError, match="not registered"):
-        reg.register_end("m-1", root, ["plan.md"])
+        reg.register_end("m-1", root, ["plan.md"], attempted_blocks=1)
     reg.register_start("m-1", rec)
     _commit_all(root, "start")
     run = root / "outputs" / "m-1"
     run.mkdir(parents=True)
     (run / "sealed.jsonl").write_text("{}\n")
     with pytest.raises(ValueError, match="artifact"):
-        reg.register_end("m-1", run, [])
+        reg.register_end("m-1", run, [], attempted_blocks=1)
+    # regression: the attempted-block count was optional (and never checked): the stopping rule had no record
+    with pytest.raises(TypeError):
+        reg.register_end("m-1", run, ["sealed.jsonl"])  # type: ignore[call-arg]
+    for bad in (-1, 1.5, True, None):
+        with pytest.raises(ValueError, match="attempted_blocks"):
+            reg.register_end("m-1", run, ["sealed.jsonl"], attempted_blocks=bad)  # type: ignore[arg-type]
     end = reg.register_end("m-1", run, ["sealed.jsonl"], {3: "interlock"}, attempted_blocks=12)
+    assert end["attempted_blocks"] == 12
     assert end["artifacts"] == {"sealed.jsonl": pr.sha256_file(run / "sealed.jsonl")} and end["flags"] == {
         "3": "interlock"
     }
     with pytest.raises(ValueError, match="already has an end"):
-        reg.register_end("m-1", run, ["sealed.jsonl"])
+        reg.register_end("m-1", run, ["sealed.jsonl"], attempted_blocks=12)
     probs, owner = reg.history()
     assert owner[-1] is None and any("differs from its last commit" in p for p in probs)
     _commit_all(root, "end")

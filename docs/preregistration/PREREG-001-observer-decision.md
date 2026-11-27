@@ -351,11 +351,19 @@ Outside the family:
   - N = 400 valid confirmatory blocks, M_CAL = 200 valid calibration blocks, both fixed (N = 400 by the owner's
     decision of 2026-11-27, before any confirmatory data; section 5, item 3).
   - Collection stops at N valid blocks or at 1.2 N attempted blocks, whichever comes first. The calibration block
-    stops at M_CAL valid or 1.2 M_CAL attempted blocks.
-  - Stopping depends only on validity flags, computed blind to arm and outcome.
+    stops at M_CAL valid or 1.2 M_CAL attempted blocks. The warm-up blocks come on top of the cap (cap = 2 +
+    ceil(1.2 N): 482 for the confirmatory run, 242 for the calibration block).
+  - Stopping depends only on validity flags, computed blind to arm and outcome: the warm-up blocks, the
+    acquisition flags and complete blocks. The outcome-based exclusions below (reference floor, non-finite values)
+    are not visible during acquisition and do not count for stopping.
+  - The end entry records the number of attempted blocks (required). The script enforces the rule against it
+    (`sample_size`): it refuses a run with episodes of blocks beyond the attempted ones, more attempts than the
+    cap, more valid blocks than planned, blocks attempted after the N-th (M_CAL-th) valid one, or a stop before
+    both N valid blocks and the cap; the calibration's sample is frozen in its lock.
   - Peeking is impossible by construction: the outcomes and the arm map are sealed.
-- **Shortfall**: if the cap is reached with fewer valid blocks, the analysis runs on what exists and the shortfall
-  is a deviation.
+- **Shortfall**: if the cap is reached with fewer valid blocks, or outcome-based exclusions leave fewer than N
+  valid blocks, the analysis runs on what exists and the shortfall is a deviation (recorded in the blinded output
+  and reported).
 - **Exclusion of a block as a whole** (all its arms; automated, arm-blind). The acquisition flags (interlock trip,
   counter overflow or saturation, sequencer underrun or loss of sync) are set by the acquisition code blind to
   outcomes and are part of the registered end entry; the other reasons are computed by the locked reduction. No

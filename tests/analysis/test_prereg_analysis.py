@@ -560,7 +560,7 @@ class Chain:
         self.state: dict = {}
 
     def run(self, run_id, mode, eps, series="S1", calibration_lock=None, register=True, end=True, flags=None,
-            commit_start=True, **extra):  # fmt: skip
+            commit_start=True, attempted=None, **extra):  # fmt: skip
         keys = pr.RunKeys.from_seed(run_id)
         rec = pr.prereg_record(
             self.lock, self.lock_path, keys, mode, root=self.root, series=series, schedule_sha256="cd" * 32,
@@ -581,28 +581,32 @@ class Chain:
         for e in eps:
             w(e)
         if register and end:
-            self.registry.register_end(run_id, d, ["sealed.jsonl"], flags)
+            if attempted is None:
+                attempted = len({e.block for e in eps})
+            self.registry.register_end(run_id, d, ["sealed.jsonl"], flags, attempted_blocks=attempted)
             _commit(self.root, f"end {run_id}")
         return d, keys
 
-    def models(self, n=10, seed=500, name="nominal", params=None, start=0):
+    def models(self, n=10, seed=500, name="nominal", params=None, start=0, series="S1"):
         rng = np.random.default_rng(seed)
         out = []
         for i in range(start, start + n):
             rid = f"model-{name}-{i}"
             eps = _episodes(MODEL, pa.N_CONF + 2, rng, pr.RunKeys.from_seed(rid))
-            out.append(self.run(rid, "model", eps, model=name, model_params=params or {})[0])
+            out.append(self.run(rid, "model", eps, series=series, model=name, model_params=params or {})[0])
         return {name: out}
 
-    def calibration(self, seed=0, run_id="cal-1", series="S1", scale=1.0, **kw):
+    def calibration(self, seed=0, run_id="cal-1", series="S1", scale=1.0, n_blocks=None, **kw):
         keys = pr.RunKeys.from_seed(run_id)
-        eps = _episodes(CAL, pa.M_CAL + 2, np.random.default_rng(seed), keys, scale=scale)
+        n_blocks = pa.M_CAL + 2 if n_blocks is None else n_blocks
+        eps = _episodes(CAL, n_blocks, np.random.default_rng(seed), keys, scale=scale)
         return self.run(run_id, "calibration", eps, series=series, **kw)[0]
 
-    def confirmatory(self, cal_lock, shift=None, run_id="conf-1", **kw):
+    def confirmatory(self, cal_lock, shift=None, run_id="conf-1", n_blocks=None, **kw):
         keys = pr.RunKeys.from_seed(run_id)
         codes = pr.arm_codes(keys.blind, pa.CONFIRMATORY_ARMS)
-        eps = _episodes(CONF, pa.N_CONF + 2, np.random.default_rng(42), keys, codes=codes, shift=shift)
+        n_blocks = pa.N_CONF + 2 if n_blocks is None else n_blocks
+        eps = _episodes(CONF, n_blocks, np.random.default_rng(42), keys, codes=codes, shift=shift)
         return self.run(run_id, "confirmatory", eps, calibration_lock=cal_lock, **kw)
 
     def cal_dir_of(self, series="S1"):
@@ -906,3 +910,82 @@ def test_chain_order_is_checked_by_git_ancestry(fresh):
     _expect("did not end before the calibration", pa.freeze_calibration, cal,
             {"nominal": m2["nominal"] + late["nominal"]}, f2.lock_path, f2.root / "o", f2.root,
             keys=f2.keystore)  # fmt: skip
+
+
+# --- Fixed sample size and stopping rule (PREREG-001 section 8) -------------------------------------------------------
+
+
+def _sized(n_blocks, invalid=(), reason="interlock"):
+    return _table(MODEL, n_blocks, np.random.default_rng(3), invalid={**WARM, **{k: reason for k in invalid}})
+
+
+def test_sample_size_rule():
+    """Regression: the fixed N and the stopping rule were not enforced (a run of any size was analysed against a
+    margin derived for N_CONF pairs; ATTEMPT_CAP was only a constant). Target 20: cap = 2 warm-up + 24."""
+    tgt = 20
+    assert pa.attempt_cap(tgt) == 26 and pa.attempt_cap(400) == 482 and pa.attempt_cap(200) == 242
+    ok = pa.sample_size(_sized(22), {"attempted_blocks": 22}, tgt, "r")
+    assert ok == {"target": 20, "valid": 20, "acquisition_valid": 20, "attempted": 22, "cap": 26, "shortfall": False}
+    # invalid blocks are replaced until the target is reached (inside the cap)
+    assert pa.sample_size(_sized(25, (4, 9, 11)), {"attempted_blocks": 25}, tgt, "r")["valid"] == 20
+    # shortfall: the cap was reached first; analysed, flagged
+    short = pa.sample_size(_sized(26, range(2, 9)), {"attempted_blocks": 26}, tgt, "r")
+    assert short["shortfall"] and short["valid"] == 17
+    # outcome-based exclusions are invisible to the acquisition: they make a shortfall, not a refusal
+    floor = pa.sample_size(_sized(22, (5,), pa.REASON_REF_FLOOR), {"attempted_blocks": 22}, tgt, "r")
+    assert floor["shortfall"] and floor["valid"] == 19 and floor["acquisition_valid"] == 20
+    refusals = [
+        (_sized(22), {}, "no attempted-block count"),
+        (_sized(22), {"attempted_blocks": None}, "no attempted-block count"),
+        (_sized(22), {"attempted_blocks": 21}, "outside the 21 attempted"),
+        (_sized(27, range(2, 9)), {"attempted_blocks": 27}, "more than the cap"),
+        (_sized(23), {"attempted_blocks": 23}, "21 valid blocks, more than the planned 20"),
+        (_sized(12), {"attempted_blocks": 12}, "stopped at 12 attempted blocks with 10 valid"),
+        (_sized(24, (22, 23)), {"attempted_blocks": 24}, "went on after the 20-th valid block"),
+        (_sized(22), {"attempted_blocks": 24}, "went on after the 20-th valid block"),
+    ]
+    for t, end, match in refusals:
+        with pytest.raises(pr.LockMismatchError, match=match):
+            pa.sample_size(t, end, tgt, "r")
+
+
+def test_chain_refuses_calibration_block_of_the_wrong_size(fresh):
+    """Regression: a calibration block of any size was frozen (fewer than M_CAL blocks give a noisier margin). The
+    calibration block must stop at M_CAL valid blocks or the cap; a short one and a long one are refused."""
+    models = fresh.models()
+    short = fresh.calibration(n_blocks=pa.M_CAL - 10)
+    _expect("stopped at", pa.freeze_calibration, short, models, fresh.lock_path, fresh.cal_dir, fresh.root,
+            keys=fresh.keystore)  # fmt: skip
+    models2 = fresh.models(n=2, start=100, series="S2")
+    long = fresh.calibration(run_id="cal-long", series="S2", n_blocks=pa.M_CAL + 5)
+    _expect("more than the planned", pa.freeze_calibration, long, models2, fresh.lock_path, fresh.cal_dir_of("S2"),
+            fresh.root, keys=fresh.keystore)  # fmt: skip
+
+
+def test_chain_refuses_confirmatory_run_of_the_wrong_size(fresh):
+    """Regression: a confirmatory run of any size (the old N = 100, or 1000) was analysed against the margin of
+    N_CONF pairs. More valid blocks than planned are refused at the blinded analysis."""
+    models, cal_dir = fresh.honest_until_calibration()
+    cal_lock = fresh.freeze(cal_dir, models)
+    conf_dir, _ = fresh.confirmatory(cal_lock, n_blocks=pa.N_CONF + 5)
+    _expect("more than the planned", fresh.analyse, conf_dir, cal_dir)
+
+
+def test_chain_shortfall_at_the_cap_is_analysed_and_reported(fresh):
+    """A run that reaches the attempt cap with fewer valid blocks is analysed, and the shortfall is recorded in the
+    blinded output and reported as a deviation (section 8); the calibration's sample is frozen in its lock."""
+    models, cal_dir = fresh.honest_until_calibration()
+    cal_lock = fresh.freeze(cal_dir, models)
+    assert cal_lock.constants["calibration_sample"] == {
+        "target": pa.M_CAL, "valid": pa.M_CAL, "acquisition_valid": pa.M_CAL, "attempted": pa.M_CAL + 2,
+        "cap": pa.attempt_cap(pa.M_CAL), "shortfall": False,
+    }  # fmt: skip
+    cap = pa.attempt_cap(pa.N_CONF)
+    flags = {k: "interlock" for k in range(2, cap - pa.N_CONF + 1)}  # one valid block short at the cap
+    conf_dir, keys = fresh.confirmatory(cal_lock, n_blocks=cap, flags=flags)
+    ba, analysis = fresh.analyse(conf_dir, cal_dir)
+    assert ba.sample == {"target": pa.N_CONF, "valid": pa.N_CONF - 1, "acquisition_valid": pa.N_CONF - 1,
+                         "attempted": cap, "cap": cap, "shortfall": True}  # fmt: skip
+    rep = fresh.unblind(analysis, conf_dir, keys)
+    assert rep.sample["confirmatory"]["shortfall"] and not rep.sample["calibration"]["shortfall"]
+    assert "SHORTFALL" in (fresh.root / "report.md").read_text()

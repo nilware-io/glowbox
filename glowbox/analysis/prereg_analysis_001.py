@@ -321,6 +321,13 @@ class FrozenModel(Protocol):
     def r_model(self, actions: np.ndarray, offset_hz: float) -> np.ndarray: ...
 
 
+#: Exclusion reasons computed from the sealed outcomes by the locked reduction: the acquisition cannot see them, so
+#: they do not count against the stopping rule (a block they exclude makes a shortfall, :func:`sample_size`).
+REASON_REF_FLOOR = "reference count below the floor"
+REASON_NON_FINITE = "non-finite values"
+OUTCOME_REASONS = frozenset({REASON_REF_FLOOR, REASON_NON_FINITE})
+
+
 def build_episode_table(
     code: Sequence[str] | np.ndarray,
     block: Sequence[int] | np.ndarray,
@@ -380,9 +387,9 @@ def build_episode_table(
         elif set(map(str, code_a[rows])) != all_codes or int(rows.sum()) != len(all_codes):
             reason = "incomplete block"
         elif np.any(ref[rows] < REF_COUNT_FLOOR):
-            reason = "reference count below the floor"
+            reason = REASON_REF_FLOOR
         elif not np.all(np.isfinite(r[rows])):
-            reason = "non-finite values"
+            reason = REASON_NON_FINITE
         if reason is not None:
             invalid[k] = reason
     return EpisodeTable(block_a, pos_a, code_a, seq, r, r_model, off_line, task, invalid)
@@ -901,6 +908,8 @@ class BlindedAnalysis:
     lock_sha256: str
     script_sha256: str
     cells: list[CellResult]
+    #: The run's sample size against the stopping rule (:func:`sample_size`; set by :func:`analyse_run`).
+    sample: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -912,6 +921,7 @@ class BlindedAnalysis:
             "lock_sha256": self.lock_sha256,
             "script_sha256": self.script_sha256,
             "cells": [c.to_dict() for c in self.cells],
+            "sample": dict(self.sample),
         }
 
     @classmethod
@@ -925,6 +935,7 @@ class BlindedAnalysis:
             str(d["lock_sha256"]),
             str(d["script_sha256"]),
             [CellResult(**cd) for cd in d["cells"]],
+            dict(d.get("sample") or {}),
         )
 
     def sha256(self) -> str:
@@ -1113,12 +1124,28 @@ class Report:
     analysis_sha256: str
     registered_runs: list[dict[str, Any]] = field(default_factory=list)
     manipulation: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Sample size against the stopping rule: "confirmatory" and "calibration" (:func:`sample_size`).
+    sample: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
     def to_markdown(self) -> str:
         lines = [f"# {PLAN}: unblinded result", "", f"Blinded analysis sha256: `{self.analysis_sha256}`", ""]
+        for k, sz in self.sample.items():
+            if not sz:
+                continue
+            note = (
+                "SHORTFALL: the cap was reached with fewer valid blocks than planned (a deviation, section 8)"
+                if sz.get("shortfall")
+                else "as planned"
+            )
+            lines.append(
+                f"- Sample, {k}: {sz['valid']} valid of {sz['target']} planned, {sz['attempted']} attempted "
+                f"(cap {sz['cap']}): {note}."
+            )
+        if any(self.sample.values()):
+            lines.append("")
         lines += ["## Primary hypotheses", ""]
         lines += [
             "Positive claim: Holm (FWER 0.05) against the calibration controls and against the run's own sealed "
@@ -1211,6 +1238,7 @@ def unblind(
     code_to_arm: Mapping[str, str],
     cal: Calibration,
     registered_runs: Sequence[Mapping[str, Any]] = (),
+    calibration_sample: Mapping[str, Any] | None = None,
 ) -> Report:
     """Read off the pre-registered cells after the blinded output was committed (see the module docstring)."""
     inv = {a: c for c, a in code_to_arm.items()}
@@ -1305,6 +1333,7 @@ def unblind(
         ba.sha256(),
         [dict(r) for r in registered_runs],
         manipulation,
+        {"confirmatory": dict(ba.sample), "calibration": dict(calibration_sample or {})},
     )
 
 
@@ -1599,6 +1628,54 @@ def run_table(
     return t, end
 
 
+def attempt_cap(target: int) -> int:
+    """The most blocks a run of ``target`` planned valid blocks may attempt: the warm-up blocks plus
+    ceil(ATTEMPT_CAP x target) (PREREG-001 section 8)."""
+    return WARMUP_BLOCKS + math.ceil(ATTEMPT_CAP * target - 1e-9)
+
+
+def sample_size(table: EpisodeTable, end: Mapping[str, Any], target: int, run_id: str) -> dict[str, Any]:
+    """The fixed sample size and the stopping rule (PREREG-001 section 8), checked against the run's registered
+    end entry. Collection stops at ``target`` valid blocks or at :func:`attempt_cap` attempted blocks, whichever
+    comes first, judged on the validity the acquisition can see (warm-up, acquisition flags, complete blocks; not
+    the outcome-based exclusions :data:`OUTCOME_REASONS`). Refuses (LockMismatchError) an end entry without an
+    attempted-block count, episodes of a block beyond the attempted ones, more attempts than the cap, more valid
+    blocks than planned, attempts after the ``target``-th valid block, and a run that stopped short of both. A run
+    analysed with fewer valid blocks than planned (the cap reached first, or blocks excluded by the outcome-based
+    rules) is returned with ``shortfall`` True: it is analysed, and the shortfall is a deviation (reported)."""
+    att = end.get("attempted_blocks")
+    if isinstance(att, bool) or not isinstance(att, int) or att < 0:
+        raise LockMismatchError([f"run {run_id}: the end entry records no attempted-block count"])
+    blocks = sorted({int(b) for b in table.block})
+    valid = [b for b in blocks if table.valid(b) or table.invalid_blocks.get(b) in OUTCOME_REASONS]
+    analysed = sum(1 for b in blocks if table.valid(b))
+    cap = attempt_cap(target)
+    probs = []
+    if blocks and (blocks[0] < 0 or blocks[-1] >= att):
+        probs.append(f"run {run_id}: episodes of blocks outside the {att} attempted blocks")
+    if att > cap:
+        probs.append(f"run {run_id}: {att} blocks attempted, more than the cap of {cap}")
+    if len(valid) > target:
+        probs.append(f"run {run_id}: {len(valid)} valid blocks, more than the planned {target}")
+    elif len(valid) == target and valid[-1] != att - 1:
+        probs.append(f"run {run_id}: collection went on after the {target}-th valid block (block {valid[-1]})")
+    elif len(valid) < target and att < cap:
+        probs.append(
+            f"run {run_id}: stopped at {att} attempted blocks with {len(valid)} valid, before {target} valid "
+            f"blocks or the cap of {cap}"
+        )
+    if probs:
+        raise LockMismatchError(probs)
+    return {
+        "target": target,
+        "valid": analysed,
+        "acquisition_valid": len(valid),
+        "attempted": att,
+        "cap": cap,
+        "shortfall": analysed < target,
+    }
+
+
 def _first_commit(registry: Registry, run_id: str, event: str) -> str:
     cs = registry.commit_of(run_id, event)
     if not cs or cs[0] is None:
@@ -1669,6 +1746,7 @@ def freeze_calibration(
             [f"model runs given {sorted(given)} are not all the registered model runs {sorted(registered)}"]
         )
     table, end = run_table(cal_run, run_id, rec, lock, registry, keys, root)
+    cal_sample = sample_size(table, end, M_CAL, run_id)
     cal = derive_calibration(table, models, n_boot)
     out_dir.mkdir(parents=True, exist_ok=True)
     cal_path = out_dir / "calibration.json"
@@ -1681,6 +1759,7 @@ def freeze_calibration(
         "calibration_data_sha256": table.sha256(),
         "calibration_artifacts": dict(end["artifacts"]),
         "calibration_data_started_utc": str(rec["data_started_utc"]),
+        "calibration_sample": cal_sample,
         "model_runs": model_prov,
     }
     cal_lock = Lock.create(CAL_LOCK_NAME, [cal_path], constants, root=root)
@@ -1769,10 +1848,13 @@ def analyse_run(
         probs.append("this run already has a registered blinded analysis")
     if probs:
         raise LockMismatchError(probs)
-    cal_table, _ = run_table(cal_run, cal_id, cal_info["prereg"], lock, registry, keys, root)
+    cal_table, cal_end = run_table(cal_run, cal_id, cal_info["prereg"], lock, registry, keys, root)
     if cal_table.sha256() != cal.data_sha256:
         raise LockMismatchError(["the calibration run's data differ from the frozen calibration's"])
-    table, _ = run_table(conf_run, run_id, rec, lock, registry, keys, root)
+    if sample_size(cal_table, cal_end, M_CAL, cal_id) != cal_lock.constants.get("calibration_sample"):
+        raise LockMismatchError(["the calibration block's sample size differs from the one frozen in its lock"])
+    table, end = run_table(conf_run, run_id, rec, lock, registry, keys, root)
+    sample = sample_size(table, end, N_CONF, run_id)
     prov = {
         "run_id": run_id,
         "lock_sha256": lock.sha256(),
@@ -1780,6 +1862,7 @@ def analyse_run(
         "script_sha256": sha256_file(root / SCRIPT_PATH),
     }
     ba = analyse(table, cal, n_boot, prov)
+    ba.sample = sample
     out.write_text(json.dumps(ba.to_dict(), sort_keys=True, indent=1, default=float))
     registry.append("blinded", run_id, analysis_sha256=ba.sha256())
     return ba
@@ -1823,11 +1906,13 @@ def unblind_run(
         probs.append("the blinded analysis was made by a different script")
     if probs:
         raise LockMismatchError(probs)
-    table, _ = run_table(conf_run, run_id, info["prereg"], lock, registry, keys, root)
+    table, end = run_table(conf_run, run_id, info["prereg"], lock, registry, keys, root)
     if ba.data_sha256 != table.sha256():
         raise LockMismatchError(["the blinded analysis was made on different data"])
+    if ba.sample != sample_size(table, end, N_CONF, run_id):
+        raise LockMismatchError(["the blinded analysis records a different sample size than the run's"])
     mapping = unblind_codes(blind_key, info["prereg"]["keys"]["blind_sha256"], CONFIRMATORY_ARMS)
-    rep = unblind(ba, mapping, cal, registry.summary(lock.sha256()))
+    rep = unblind(ba, mapping, cal, registry.summary(lock.sha256()), cal_lock.constants.get("calibration_sample"))
     out.write_text(rep.to_markdown())
     out.with_suffix(".json").write_text(json.dumps(rep.to_dict(), sort_keys=True, indent=1, default=float))
     return rep

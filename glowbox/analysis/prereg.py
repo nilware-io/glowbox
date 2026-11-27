@@ -686,12 +686,17 @@ class Registry:
         run_dir: Path | str,
         artifacts: Sequence[str],
         flags: Mapping[int, str] | None = None,
-        attempted_blocks: int | None = None,
+        *,
+        attempted_blocks: int,
     ) -> dict[str, Any]:
         """Register the end of acquisition: the sha256 of every sealed artifact file (paths relative to the run
-        directory) and the acquisition flags per block (interlock trip, counter overflow, sequencer underrun or
-        loss of sync; set blind to outcomes). Call when the run has ended, then commit and push, *then* release the
-        sealing key: the analysis rebuilds the episode table from exactly these files and these flags."""
+        directory), the acquisition flags per block (interlock trip, counter overflow, sequencer underrun or
+        loss of sync; set blind to outcomes) and the number of blocks attempted (every block started, warm-up
+        included; required: the analysis checks the stopping rule against it). Call when the run has ended, then
+        commit and push, *then* release the sealing key: the analysis rebuilds the episode table from exactly these
+        files and these flags."""
+        if isinstance(attempted_blocks, bool) or not isinstance(attempted_blocks, int) or attempted_blocks < 0:
+            raise ValueError("attempted_blocks must be a non-negative integer")
         if not [e for e in self.entries() if e["event"] == "start" and e["run_id"] == run_id]:
             raise ValueError(f"run {run_id} is not registered")
         if self.events(run_id, "end"):

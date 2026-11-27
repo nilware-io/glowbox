@@ -50,9 +50,10 @@ Deviations from any locked plan: [deviations.md](deviations.md) (append-only).
    `prereg.Registry.register_start` appends the run id, mode, series, model member, key commitments and schedule
    sha256 to the plan's append-only registry (`PREREG-<n>.registry.yaml`, pinned by the lock like the deviations
    log); the entry is committed and pushed before data collection. `Registry.register_end` appends the sha256 of
-   every sealed artifact file of the run and its acquisition flags; it is committed and pushed before the sealing key
-   is released. **The pushed commits are the timestamps**: the analysis checks the order of events by git ancestry
-   of the commits that added them, and requires the registry's history to only append whole entries. It refuses
+   every sealed artifact file of the run, its acquisition flags and its number of attempted blocks (the script
+   checks the stopping rule against it); it is committed and pushed before the sealing key is released. **The
+   pushed commits are the timestamps**: the analysis checks the order of events by git ancestry of the commits that
+   added them, and requires the registry's history to only append whole entries. It refuses
    unregistered runs, a calibration block or confirmatory run that is not the only one of its series, a series that
    is not one of the plan's, and model runs that are not all the registered ones; the report lists every
    registered run under the lock, completed or aborted, with the commit of each event.
