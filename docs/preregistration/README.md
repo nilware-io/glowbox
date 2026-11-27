@@ -23,7 +23,7 @@ Deviations from any locked plan: [deviations.md](deviations.md) (append-only).
 - **The analysis script** (`glowbox/analysis/prereg_analysis_<n>.py`): the plan as code, with the frozen constants
   at its top.
 - **Machinery** shared by every plan:
-  - `glowbox/analysis/prereg.py`: locks, run records, sealing, blinding, the block schedule;
+  - `glowbox/analysis/prereg.py`: locks, run records, the run registry, sealing, blinding, the block schedule;
   - `glowbox/analysis/arms.py`: the decision, yoked-replay, sealed and sham arms, and the protocol runner, generic
     over any controller and any `run()` measurement.
 - **The empirical null.** A plan's tests compare decision or observer arms against the distribution of the same

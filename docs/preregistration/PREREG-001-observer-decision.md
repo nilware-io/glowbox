@@ -191,7 +191,7 @@ lock it will be analysed against.
    - Delta is also reported in units of the spin signal of the replayed sequences, C_ref = the mean over
      calibration blocks of (r of C5 - r of C2), next to every equivalence claim.
 3. **N = 100 valid confirmatory blocks, fixed.** The margin is derived for this N; there is no data-dependent sample
-   size. Stage S gives Delta / C_ref = MARGIN_C_REF (section 13).
+   size. Stage S gives Delta / C_ref of about 0.08 (section 13).
 4. **The theta0_D set and the model check** (section 4).
 5. **The bootstrap seed**, from the sha256 of the calibration data (no analyst choice).
 
@@ -425,8 +425,8 @@ excluded; the full size (R = 4000) narrows that to about 0.06.
 ## 13. Open for the owner before sign-off
 
 - **The margin rule** (section 5): Delta = the effect detected against the controls with power 0.95 at N = 100.
-  Stage S (stand-in decision process, docs/results/prereg-calibration.md): Delta = MARGIN_ABS in r, that is
-  MARGIN_C_REF of the spin signal C_ref, about 3.9 x the control-vs-control SD of the 100-pair mean. A larger N
+  Stage S (stand-in decision process, docs/results/prereg-calibration.md): Delta is about 0.0025 in r, that is
+  about 8 % of the spin signal C_ref, about 3.9 x the control-vs-control SD of the 100-pair mean. A larger N
   gives a smaller margin (Delta falls as 1 / sqrt(N)); the hardware rates change it again (PREREG-002).
 - **The sizes** M_CAL = 200, N = 100, the model runs per model (stage S: 500 over 4 true fields), ENG_N =
   ENG_N_CONTROL = 20.
