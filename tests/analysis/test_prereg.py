@@ -190,11 +190,18 @@ def test_published_lock_needs_commit_and_tag(tmp_path):
     assert any("differs from its committed" in p for p in probs) and any("different" in p for p in probs)
 
 
+def _commit_all(root, msg):
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "--allow-empty", "-m", msg)
+
+
 def test_registry_rules(tmp_path):
     root = _git_repo(tmp_path)
     (root / "registry.yaml").write_text("# registry\n")
+    _commit_all(root, "registry")
     lock = pr.Lock.create("P-1", ["plan.md"], root=root, registry="registry.yaml")
     reg = pr.Registry(root / "registry.yaml")
+    assert reg.root.resolve() == root.resolve()
     keys = pr.RunKeys.generate()
     rec = pr.prereg_record(lock, root / "l.yaml", keys, "calibration", root=root, series="S1", schedule_sha256="x")
     reg.register_start("cal-1", rec)
@@ -204,6 +211,8 @@ def test_registry_rules(tmp_path):
     with pytest.raises(ValueError, match="before its first measurement"):
         reg.register_start("cal-x", rec)
     info = {"prereg": rec}
+    assert any("not committed" in p for p in reg.run_problems("cal-1", info, lock))
+    _commit_all(root, "register cal-1")
     assert reg.run_problems("cal-1", info, lock) == []
     assert any("registered 0 times" in p for p in reg.run_problems("cal-2", info, lock))
     assert any("key commitments" in p for p in reg.run_problems("cal-1", {"prereg": {**rec, "keys": {}}}, lock))
@@ -213,13 +222,56 @@ def test_registry_rules(tmp_path):
     # a second calibration block in the same series is refused (no picking the most favourable null)
     rec2 = pr.prereg_record(lock, root / "l.yaml", keys, "calibration", root=root, series="S1", schedule_sha256="x")
     reg.register_start("cal-2", rec2)
-    assert any("2 registered calibration blocks" in p for p in reg.run_problems("cal-1", info, lock))
+    _commit_all(root, "register cal-2")
+    assert any("2 registered calibration runs" in p for p in reg.run_problems("cal-1", info, lock))
     reg.append("abort", "cal-2", reason="test")
-    assert [r["events"] for r in reg.summary(lock.sha256())] == [[], ["abort"]]
+    _commit_all(root, "abort cal-2")
+    summ = reg.summary(lock.sha256())
+    assert [r["events"] for r in summ] == [[], ["abort"]]
+    assert set(summ[1]["commits"]) == {"start", "abort"} and all(len(c) == 40 for c in summ[1]["commits"].values())
     lock.verify(root)  # appending keeps the lock
     (root / "registry.yaml").write_text("# rewritten\n")
     with pytest.raises(pr.LockMismatchError, match="append-only"):
         lock.verify(root)
+
+
+def test_registry_end_entry_and_history(tmp_path):
+    """The end entry carries the sealed artifacts' sha256 and the acquisition flags; the registry's git history
+    must only append whole entries, and names the commit of every entry."""
+    root = _git_repo(tmp_path)
+    (root / "registry.yaml").write_text("# registry\n")
+    _commit_all(root, "registry")
+    lock = pr.Lock.create("P-1", ["plan.md"], root=root, registry="registry.yaml")
+    reg = pr.Registry(root / "registry.yaml")
+    rec = pr.prereg_record(lock, root / "l.yaml", pr.RunKeys.generate(), "model", root=root, series="S1",
+                           schedule_sha256="x", extra={"model": "nominal"})  # fmt: skip
+    with pytest.raises(ValueError, match="not registered"):
+        reg.register_end("m-1", root, ["plan.md"])
+    reg.register_start("m-1", rec)
+    _commit_all(root, "start")
+    run = root / "outputs" / "m-1"
+    run.mkdir(parents=True)
+    (run / "sealed.jsonl").write_text("{}\n")
+    with pytest.raises(ValueError, match="artifact"):
+        reg.register_end("m-1", run, [])
+    end = reg.register_end("m-1", run, ["sealed.jsonl"], {3: "interlock"}, attempted_blocks=12)
+    assert end["artifacts"] == {"sealed.jsonl": pr.sha256_file(run / "sealed.jsonl")} and end["flags"] == {
+        "3": "interlock"
+    }
+    with pytest.raises(ValueError, match="already has an end"):
+        reg.register_end("m-1", run, ["sealed.jsonl"])
+    probs, owner = reg.history()
+    assert owner[-1] is None and any("differs from its last commit" in p for p in probs)
+    _commit_all(root, "end")
+    probs, owner = reg.history()
+    assert probs == [] and owner[0] != owner[1] and pr.is_ancestor(owner[0], owner[1], root, proper=True)
+    info = {"prereg": pr.mark_data_start(dict(rec))}
+    assert reg.run_problems("m-1", info, lock) == []
+    # appending lines to the last entry keeps the bytes before them: still a rewrite of that entry
+    text = (root / "registry.yaml").read_text()
+    (root / "registry.yaml").write_text(text + "  reason: added later\n")
+    _commit_all(root, "extend the last entry")
+    assert any("rewrites earlier" in p for p in reg.history()[0])
 
 
 def test_runlog_annotate(tmp_path):

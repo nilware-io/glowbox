@@ -608,20 +608,42 @@ def check_run_record(info: Mapping[str, Any], lock: Lock, mode: str, root: Path 
 # --- Run registry ---------------------------------------------------------------------------------------------------
 
 
+def is_ancestor(a: str, b: str, root: Path = REPO_ROOT, proper: bool = False) -> bool:
+    """True when commit ``a`` is an ancestor of commit ``b`` (``proper``: and not the same commit)."""
+    if proper and _git(root, "rev-parse", a).stdout.strip() == _git(root, "rev-parse", b).stdout.strip():
+        return False
+    return _git(root, "merge-base", "--is-ancestor", a, b).returncode == 0
+
+
+def _count_items(data: bytes) -> int:
+    """Top-level YAML list items of a registry file as :meth:`Registry.append` writes them (one ``- `` line each)."""
+    return sum(1 for line in data.splitlines() if line.startswith(b"- "))
+
+
 class Registry:
     """The append-only run registry of a plan (a YAML list, one item per event), pinned by the plan lock like the
     deviations log. Every run in a :data:`STRICT_MODES` mode is registered with :meth:`register_start` *before its
-    first measurement*, and the entry is committed and pushed; later events (``calibration``: the calibration lock
-    frozen; ``blinded``: the blinded analysis sha256 committed; ``end`` / ``abort``) are appended the same way.
+    first measurement*, and the entry is committed and pushed; later events are appended the same way: ``end``
+    (:meth:`register_end`: the sha256 of every sealed artifact file and the acquisition flags, committed before the
+    sealing key is released), ``calibration`` (the calibration lock frozen), ``blinded`` (the blinded analysis sha256
+    committed), ``abort``.
 
-    The analysis refuses an unregistered run, a second calibration block in a series, model runs that are not all
-    the registered ones, and a blinded analysis whose sha256 is not the registered one; the report lists every
-    registered run under the lock, completed or aborted."""
+    The registry's git history is the evidence of order: :meth:`history` checks that every committed version only
+    appends to the one before (on the first-parent line) and names the commit that added each entry. The pushed
+    commits are the timestamps (the ``utc`` fields are informative only). The analysis refuses an unregistered run,
+    a second calibration block or confirmatory run in a series, model runs that are not all the registered ones, a
+    blinded analysis whose sha256 is not the registered one and events whose commits are out of order; the report
+    lists every registered run under the lock, completed or aborted, with the commit of each event."""
 
     EVENTS = ("start", "calibration", "blinded", "end", "abort")
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, root: Path | None = None) -> None:
         self.path = Path(path)
+        if root is None:
+            top = _git(self.path.parent if self.path.parent.is_dir() else REPO_ROOT, "rev-parse", "--show-toplevel")
+            root = Path(top.stdout.decode().strip()) if top.returncode == 0 else REPO_ROOT
+        self.root = root
+        self._history: tuple[tuple[bytes, str], list[str], list[str | None]] | None = None
 
     def entries(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
@@ -655,6 +677,35 @@ class Registry:
             series=rec.get("series"),
             keys=dict(rec["keys"]),
             schedule_sha256=rec.get("schedule_sha256"),
+            model=rec.get("model"),
+        )
+
+    def register_end(
+        self,
+        run_id: str,
+        run_dir: Path | str,
+        artifacts: Sequence[str],
+        flags: Mapping[int, str] | None = None,
+        attempted_blocks: int | None = None,
+    ) -> dict[str, Any]:
+        """Register the end of acquisition: the sha256 of every sealed artifact file (paths relative to the run
+        directory) and the acquisition flags per block (interlock trip, counter overflow, sequencer underrun or
+        loss of sync; set blind to outcomes). Call when the run has ended, then commit and push, *then* release the
+        sealing key: the analysis rebuilds the episode table from exactly these files and these flags."""
+        if not [e for e in self.entries() if e["event"] == "start" and e["run_id"] == run_id]:
+            raise ValueError(f"run {run_id} is not registered")
+        if self.events(run_id, "end"):
+            raise ValueError(f"run {run_id} already has an end entry")
+        d = Path(run_dir)
+        hashes = {str(a): sha256_file(d / a) for a in artifacts}
+        if not hashes:
+            raise ValueError("an end entry needs the run's sealed artifact files")
+        return self.append(
+            "end",
+            run_id,
+            artifacts=hashes,
+            flags={str(int(k)): str(v) for k, v in (flags or {}).items()},
+            attempted_blocks=attempted_blocks,
         )
 
     def events(self, run_id: str, event: str) -> list[dict[str, Any]]:
@@ -671,10 +722,48 @@ class Registry:
             and (series is None or e.get("series") == series)
         ]
 
+    def history(self) -> tuple[list[str], list[str | None]]:
+        """(problems, commit per entry). Walks the commits that changed the registry on the first-parent line of
+        HEAD, oldest first: every version must start with the bytes of the one before (append-only in the history,
+        not only since the lock), and the working file must be the committed one. Entry i was added by the first
+        commit whose version holds more than i entries (None: not committed yet)."""
+        rel = _rel(self.path, self.root)
+        head = _git(self.root, "rev-parse", "HEAD").stdout.strip()
+        cur = self.path.read_bytes() if self.path.is_file() else b""
+        key = (head, sha256_bytes(cur))
+        if self._history is not None and self._history[0] == key:
+            return list(self._history[1]), list(self._history[2])
+        log = _git(self.root, "log", "--first-parent", "--reverse", "--format=%H", "--", rel)
+        commits = log.stdout.decode().split() if log.returncode == 0 else []
+        probs: list[str] = []
+        owner: list[str | None] = []
+        prev = b""
+        for c in commits:
+            r = _git(self.root, "show", f"{c}:{rel}")
+            data = r.stdout if r.returncode == 0 else b""
+            added = data[len(prev) :]
+            # only whole new items may follow: bytes appended without a new "- " item would extend the last entry
+            if not data.startswith(prev) or (prev and added and not added.startswith(b"- ")):
+                probs.append(f"{rel}: commit {c[:12]} rewrites earlier registry entries (the registry is append-only)")
+            owner += [c] * max(0, _count_items(data) - len(owner))
+            prev = data
+        if cur != prev:
+            probs.append(f"{rel}: the working registry differs from its last commit")
+        n = len(self.entries())
+        owner = (owner + [None] * n)[:n]
+        self._history = (key, list(probs), list(owner))
+        return probs, owner
+
+    def commit_of(self, run_id: str, event: str) -> list[str | None]:
+        """The commits that added the ``event`` entries of ``run_id`` (registry order)."""
+        _, owner = self.history()
+        return [owner[i] for i, e in enumerate(self.entries()) if e["run_id"] == run_id and e["event"] == event]
+
     def run_problems(self, run_id: str, info: Mapping[str, Any], lock: Lock) -> list[str]:
         """Problems unless the run is registered exactly once under ``lock``, before its first measurement, with
-        the keys, schedule, mode and series of its record; and, for a calibration run, unless it is the only
-        calibration block of its series."""
+        the keys, schedule, mode, series and model of its record; its start entry is committed, on a commit that
+        descends from the commit the run started from; its end entry (if any) is unique and committed on a later
+        commit; and, for a calibration run or a confirmatory run, it is the only one of its series."""
         rec = info.get("prereg") or {}
         starts = [e for e in self.runs(lock.sha256()) if e["run_id"] == run_id]
         if len(starts) != 1:
@@ -684,21 +773,53 @@ class Registry:
         for k in ("mode", "series", "schedule_sha256"):
             if e.get(k) != rec.get(k):
                 probs.append(f"registry {k} {e.get(k)!r} differs from the run's {rec.get(k)!r}")
+        if e.get("model") != rec.get("model"):
+            probs.append(f"registry model {e.get('model')!r} differs from the run's {rec.get('model')!r}")
         if e.get("keys") != rec.get("keys"):
             probs.append("registered key commitments differ from the run's")
         started = rec.get("data_started_utc")
         if not started or str(e["utc"]) > str(started):
             probs.append("run was registered after its first measurement")
-        if rec.get("mode") == "calibration":
-            n_cal = len(self.runs(lock.sha256(), "calibration", rec.get("series")))
-            if n_cal != 1:
-                probs.append(f"series {rec.get('series')!r} has {n_cal} registered calibration blocks (needs 1)")
+        for mode in ("calibration", "confirmatory"):
+            if rec.get("mode") == mode:
+                n_runs = len(self.runs(lock.sha256(), mode, rec.get("series")))
+                if n_runs != 1:
+                    probs.append(f"series {rec.get('series')!r} has {n_runs} registered {mode} runs (needs 1)")
+        hprobs, owner = self.history()
+        probs += hprobs
+        idx = {(x["run_id"], x["event"]): i for i, x in reversed(list(enumerate(self.entries())))}
+        c_start = owner[idx[(run_id, "start")]]
+        if c_start is None:
+            probs.append(f"the start entry of {run_id} is not committed")
+        elif rec.get("git_commit") and not is_ancestor(str(rec["git_commit"]), c_start, self.root):
+            probs.append(f"run {run_id} started from a commit that is not an ancestor of its registration commit")
+        ends = self.events(run_id, "end")
+        if len(ends) > 1:
+            probs.append(f"run {run_id} has {len(ends)} end entries (needs at most 1)")
+        elif ends:
+            c_end = owner[idx[(run_id, "end")]]
+            if c_end is None:
+                probs.append(f"the end entry of {run_id} is not committed")
+            elif c_start is not None and not is_ancestor(c_start, c_end, self.root, proper=True):
+                probs.append(f"the end entry of {run_id} is not committed after its start entry")
         return probs
 
     def summary(self, lock_sha256: str) -> list[dict[str, Any]]:
-        """Every registered run under the lock with its later events (for the report: all runs are reported)."""
+        """Every registered run under the lock with its later events and the commit of every event (for the
+        report: all runs are reported)."""
+        _, owner = self.history()
+        ents = self.entries()
         out = []
         for e in self.runs(lock_sha256):
-            later = [x["event"] for x in self.entries() if x["run_id"] == e["run_id"] and x["event"] != "start"]
-            out.append({"run_id": e["run_id"], "mode": e["mode"], "series": e.get("series"), "events": later})
+            rid = e["run_id"]
+            evs = [(x["event"], owner[i]) for i, x in enumerate(ents) if x["run_id"] == rid]
+            out.append(
+                {
+                    "run_id": rid,
+                    "mode": e["mode"],
+                    "series": e.get("series"),
+                    "events": [ev for ev, _ in evs if ev != "start"],
+                    "commits": {ev: (c or "uncommitted") for ev, c in evs},
+                }
+            )
         return out
