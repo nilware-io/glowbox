@@ -934,6 +934,17 @@ def test_sample_size_rule():
     # outcome-based exclusions are invisible to the acquisition: they make a shortfall, not a refusal
     floor = pa.sample_size(_sized(22, (5,), pa.REASON_REF_FLOOR), {"attempted_blocks": 22}, tgt, "r")
     assert floor["shortfall"] and floor["valid"] == 19 and floor["acquisition_valid"] == 20
+    # the report names the cause of a shortfall (regression: it always said "the cap was reached")
+    assert pa.sample_note(ok) == "as planned"
+    assert pa.sample_note(short) == (
+        "SHORTFALL: the cap was reached with 17 acquisition-valid blocks of 20 planned (a deviation, section 8)"
+    )
+    assert pa.sample_note(floor) == "SHORTFALL: 1 block excluded by the outcome-based rules (a deviation, section 8)"
+    mixed = {**short, "valid": 16}
+    assert pa.sample_note(mixed) == (
+        "SHORTFALL: the cap was reached with 17 acquisition-valid blocks of 20 planned; 1 block excluded by the "
+        "outcome-based rules (a deviation, section 8)"
+    )
     refusals = [
         (_sized(22), {}, "no attempted-block count"),
         (_sized(22), {"attempted_blocks": None}, "no attempted-block count"),
@@ -988,4 +999,4 @@ def test_chain_shortfall_at_the_cap_is_analysed_and_reported(fresh):
                          "attempted": cap, "cap": cap, "shortfall": True}  # fmt: skip
     rep = fresh.unblind(analysis, conf_dir, keys)
     assert rep.sample["confirmatory"]["shortfall"] and not rep.sample["calibration"]["shortfall"]
-    assert "SHORTFALL" in (fresh.root / "report.md").read_text()
+    assert "SHORTFALL: the cap was reached" in (fresh.root / "report.md").read_text()

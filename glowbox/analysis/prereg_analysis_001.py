@@ -1113,6 +1113,25 @@ def _worst(ps: Sequence[float]) -> float:
     return float("nan") if a.size == 0 or not np.all(np.isfinite(a)) else float(a.max())
 
 
+def sample_note(sz: Mapping[str, Any]) -> str:
+    """The report's note on a :func:`sample_size` result: "as planned", or the cause(s) of a shortfall (PREREG-001
+    section 8): the attempt cap reached with fewer acquisition-valid blocks than planned, and/or blocks excluded by
+    the outcome-based rules :data:`OUTCOME_REASONS` after acquisition."""
+    if not sz.get("shortfall"):
+        return "as planned"
+    valid, target = int(sz["valid"]), int(sz["target"])
+    acq = int(sz.get("acquisition_valid", valid))
+    causes = []
+    if int(sz["attempted"]) >= int(sz["cap"]) and acq < target:
+        causes.append(f"the cap was reached with {acq} acquisition-valid blocks of {target} planned")
+    if acq > valid:
+        k = acq - valid
+        causes.append(f"{k} block{'s' if k != 1 else ''} excluded by the outcome-based rules")
+    if not causes:
+        causes.append(f"{valid} valid blocks of {target} planned")
+    return f"SHORTFALL: {'; '.join(causes)} (a deviation, section 8)"
+
+
 @dataclass
 class Report:
     primary: dict[str, dict[str, Any]]
@@ -1135,11 +1154,7 @@ class Report:
         for k, sz in self.sample.items():
             if not sz:
                 continue
-            note = (
-                "SHORTFALL: the cap was reached with fewer valid blocks than planned (a deviation, section 8)"
-                if sz.get("shortfall")
-                else "as planned"
-            )
+            note = sample_note(sz)
             lines.append(
                 f"- Sample, {k}: {sz['valid']} valid of {sz['target']} planned, {sz['attempted']} attempted "
                 f"(cap {sz['cap']}): {note}."
