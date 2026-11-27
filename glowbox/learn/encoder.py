@@ -4,7 +4,8 @@ differentiable surrogate together with a decoder.
 The encoder writes the *suffix* of a sequence that starts with a fixed MW-free initialisation (laser + dark settle,
 :func:`glowbox.learn.reservoir.init_prefix`). The suffix is ``n_blocks`` repetitions of
 
-    [MW block: n_segments slots of slot_ns, one MW segment from each slot's start] [readout laser] [dark gap]
+    [MW block: n_segments slots of slot_ns, one MW segment from each slot's start] [dark delay] [readout laser]
+    [dark gap]
 
 and the decoder sees the readout counts: either one gated number per readout (the first ``gate_ns`` of each
 readout laser, what a gated photon counter returns; the rest of the laser re-polarises the spins) or every readout
@@ -80,13 +81,15 @@ class Layout:
     window_ns: int = 0
     #: Dark time after each readout (lets the singlet empty), ns.
     gap_ns: int = 0
+    #: Dark time between each MW block and its readout (the storage delay of Task 2), ns.
+    delay_ns: int = 0
     grid_ns: int = GRID_DEFAULT_NS
 
     def __post_init__(self) -> None:
         g = self.grid_ns
         if self.n_blocks < 1 or self.n_segments < 1:
             raise ValueError("need n_blocks >= 1 and n_segments >= 1")
-        for name in ("slot_ns", "readout_ns", "gate_ns", "gap_ns", "window_ns"):
+        for name in ("slot_ns", "readout_ns", "gate_ns", "gap_ns", "window_ns", "delay_ns"):
             if getattr(self, name) % g:
                 raise ValueError(f"{name} must be a multiple of the grid")
         if not 0 <= self.min_ns <= self.max_ns <= self.slot_ns:
@@ -115,8 +118,12 @@ class Layout:
         return self.gate_ns // self.grid_ns
 
     @property
+    def delay_bins(self) -> int:
+        return self.delay_ns // self.grid_ns
+
+    @property
     def period_bins(self) -> int:
-        return self.block_bins + self.readout_bins + self.gap_ns // self.grid_ns
+        return self.block_bins + self.delay_bins + self.readout_bins + self.gap_ns // self.grid_ns
 
     @property
     def n_bins(self) -> int:
@@ -137,7 +144,7 @@ class Layout:
 
     def readout_start(self, k: int) -> int:
         """First bin of readout ``k``."""
-        return k * self.period_bins + self.block_bins
+        return k * self.period_bins + self.block_bins + self.delay_bins
 
 
 @dataclass
@@ -202,6 +209,17 @@ def preactivations_for(
     return z
 
 
+def activate(z: torch.Tensor, layout: Layout, base_hz: torch.Tensor) -> BlockParams:
+    """Pre-activations (N, n_blocks, n_segments, 4) -> bounded pulse parameters (the parametrisation of the module
+    docstring); ``base_hz`` (n_blocks, n_segments) float64."""
+    ly = layout
+    amp = ly.amp_lo + (ly.amp_hi - ly.amp_lo) * torch.sigmoid(z[..., 0])
+    phase = math.pi * torch.tanh(z[..., 1])
+    freq = base_hz[None] + ly.span_hz * torch.tanh(z[..., 2]).to(torch.float64)
+    dur = ly.min_ns + (ly.max_ns - ly.min_ns) * torch.sigmoid(z[..., 3])
+    return BlockParams(amp, phase, freq, dur)
+
+
 class PulseEncoder(nn.Module):
     """Input (N, n_inputs) -> :class:`BlockParams`. ``n_inputs = 0``: the sequence is a free parameter (the same for
     every sample; a learned *protocol*, e.g. a sensor protocol for Task 1).
@@ -259,14 +277,7 @@ class PulseEncoder(nn.Module):
         return z.reshape(-1, ly.n_blocks, ly.n_segments, 4)
 
     def forward(self, u: torch.Tensor | None, n: int | None = None) -> BlockParams:
-        ly = self.layout
-        z = self.preactivations(u, n)
-        amp = ly.amp_lo + (ly.amp_hi - ly.amp_lo) * torch.sigmoid(z[..., 0])
-        phase = math.pi * torch.tanh(z[..., 1])
-        base = self.get_buffer("base_hz")
-        freq = base[None] + ly.span_hz * torch.tanh(z[..., 2]).to(torch.float64)
-        dur = ly.min_ns + (ly.max_ns - ly.min_ns) * torch.sigmoid(z[..., 3])
-        return BlockParams(amp, phase, freq, dur)
+        return activate(self.preactivations(u, n), self.layout, self.get_buffer("base_hz"))
 
     @torch.no_grad()
     def randomize_(self, gain: float, generator: torch.Generator) -> PulseEncoder:
@@ -324,15 +335,21 @@ def build_suffix(
     def rep(x: torch.Tensor) -> torch.Tensor:  # (N, B, S) -> (N, B, S*sb)
         return x[..., None].expand(*x.shape, sb).reshape(n, ly.n_blocks, ly.block_bins)
 
-    nr, ngap = ly.readout_bins, ly.gap_ns // ly.grid_ns
-    tail = nr + ngap
+    nr, ngap, nd = ly.readout_bins, ly.gap_ns // ly.grid_ns, ly.delay_bins
+    tail = nd + nr + ngap
 
     def with_tail(x: torch.Tensor, value: float) -> torch.Tensor:
         pad = torch.full((n, ly.n_blocks, tail), value, dtype=x.dtype, device=dev)
         return torch.cat([x, pad], dim=-1).reshape(n, ly.n_bins)
 
     laser_blk = torch.zeros(n, ly.n_blocks, ly.block_bins, dtype=dt, device=dev)
-    laser_tail = torch.cat([torch.ones(nr, dtype=dt, device=dev), torch.zeros(ngap, dtype=dt, device=dev)])
+    laser_tail = torch.cat(
+        [
+            torch.zeros(nd, dtype=dt, device=dev),
+            torch.ones(nr, dtype=dt, device=dev),
+            torch.zeros(ngap, dtype=dt, device=dev),
+        ]
+    )
     laser = torch.cat([laser_blk, laser_tail.expand(n, ly.n_blocks, tail)], dim=-1).reshape(n, ly.n_bins)
     arrays = SequenceArrays(
         laser=laser,
@@ -447,7 +464,8 @@ def readout_features(counts: torch.Tensor, layout: Layout) -> torch.Tensor:
     ly = layout
     n = counts.shape[0]
     per = counts.reshape(n, ly.n_blocks, ly.period_bins)
-    ro = per[..., ly.block_bins : ly.block_bins + ly.readout_bins]
+    r0 = ly.block_bins + ly.delay_bins
+    ro = per[..., r0 : r0 + ly.readout_bins]
     if ly.gate_ns:
         return ro[..., : ly.gate_bins].sum(-1)
     return ro.reshape(n, ly.n_blocks, -1, ly.window_bins).sum(-1).reshape(n, ly.n_features)
@@ -492,6 +510,8 @@ def layout_runs(
             d = dur[:, k, s]
             runs.append(Run(d * ns, 0.0, ac[:, k, s], as_[:, k, s], f, t0))
             runs.append(Run((ly.slot_ns - d) * ns, 0.0, 0.0, 0.0, f, t0))
+        if ly.delay_ns:
+            runs.append(Run(ly.delay_ns * ns, 0.0, frame_hz=f_last))
         if ly.gate_ns:
             runs.append(Run(ly.gate_ns * ns, beta_on, frame_hz=f_last, record=True))
             rest = ly.readout_ns - ly.gate_ns

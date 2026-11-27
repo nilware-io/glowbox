@@ -248,3 +248,30 @@ def test_area_matched_amplitude_matches_shifted_areas():
         on = d > 0
         assert torch.allclose((q.amplitude * d)[on], (a * ds)[on])
         assert q.amplitude[0, 0, 0] == a[0, 0, 0]
+
+
+def test_storage_delay_run_path_equals_full_sequence():
+    """A dark delay between the MW block and its readout (Task 2's store step): run path, bin path and the full
+    PulseSequence agree, and the layout counts the delay."""
+    import dataclasses
+
+    from glowbox.learn.encoder import encoded_counts, prefix_states_and_statics
+
+    ly = dataclasses.replace(LAYOUT, delay_ns=200)
+    assert ly.period_bins == LAYOUT.period_bins + 20 and ly.readout_start(0) == ly.block_bins + 20
+    torch.manual_seed(0)
+    enc = PulseEncoder(ly, BASE, n_inputs=3, init=preactivations_for(ly, 0.5, 30.0)).double()
+    enc.randomize_(1.5, torch.Generator().manual_seed(2))
+    u = torch.randn(3, 3, dtype=torch.float64)
+    pre = init_prefix(600, 400)
+    st0, st, _ = prefix_states_and_statics(pre, ENV, OPT, "cpu")
+    p = enc(u).detach()
+    with torch.no_grad():
+        runs = encoded_counts(p, ly, ENV, st0.expand(3, *st0.shape[1:]), st).numpy()
+    arr, fill = build_suffix(p, ly)
+    c = suffix_counts(arr, fill, ENV, st0.expand(3, *st0.shape[1:]), OPT).detach()
+    np.testing.assert_allclose(runs, readout_features(c, ly).numpy(), rtol=1e-9)
+    for i, row in enumerate(suffix_to_numpy(p, ly).unbatch()):
+        seq = full_sequence(pre, row)
+        r = expected_rate_cps(seq.to_arrays(), ENV, options=OPT, device="cpu") * 1e-8
+        assert float((r[-ly.n_bins :] - c[i]).abs().max()) < 1e-8 * float(c[i].max())
