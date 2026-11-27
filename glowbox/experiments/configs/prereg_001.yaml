@@ -1,0 +1,67 @@
+# PREREG-001 stage-S validation: null calibration and positive control of the frozen analysis
+# (docs/preregistration/PREREG-001-observer-decision.md, glowbox/analysis/prereg_analysis_001.py).
+# The simulator has no decision or observer effect by construction: these runs only check that the whole
+# pipeline (arms, schedule, sealing, blinding, calibration block, frozen analysis, unblinding) keeps the
+# false-positive rate at alpha and has the planned power. They are not evidence for or against any hypothesis.
+# Run: uv run python -m glowbox.experiments.prereg_calibration   (CPU, a few minutes)
+name: prereg-001-calibration
+seed: 20261127
+detuned_offset_hz: 4.0e+8
+
+measurement:                  # glowbox.learn.measurement.MeasurementSpec: one pulsed-ODMR action per step
+  f_start_hz: 2.77e+9
+  f_stop_hz: 2.97e+9
+  step_hz: 2.0e+6             # 100 frequencies
+  durations_ns: [100]         # ~pi pulse at amplitude 0.6 (the stand-in controller picks frequencies only)
+  amplitude: 0.6
+  init_ns: 1500
+  settle_ns: 3000             # docs/physics.md 8: 3 us settle
+  windows_ns: [300, 1700, 300]  # signal = first 300 ns; reference = 2.0-2.3 us (re-polarised, spin-independent)
+signal_window: 0
+reference_window: 2
+off_line_widths: 3.0          # "far from every line": > 3 x (Rabi frequency at the pulse amplitude + T2* FWHM)
+
+prior:
+  b_min_t: 0.5e-3
+  b_max_t: 3.0e-3
+field_pool: 4                 # true fields (one per simulated run, cycled over replicates)
+
+numerics:
+  n_detuning: 8
+  detuning_rule: uniform
+  detuning_spacing: 2.0
+
+protocol:
+  n_steps: 100                # T steps per episode
+  shots: 400                  # S shots per step
+
+nuisance:                     # drift between and within episodes (indexed by the run's time slots)
+  laser_rel_sigma: 0.02       # slow laser power, OU per episode slot
+  laser_tau_slots: 20
+  laser_jitter_rel: 0.01      # per step, iid
+  contrast_rel_sigma: 0.05    # slow drift of the spin contrast (e.g. temperature), OU per episode slot
+  contrast_tau_slots: 70      # ~10 confirmatory blocks
+
+controller:                   # stand-in decision process (same feedback structure as the M5 learners)
+  threshold_below_baseline: 0.03   # "in a dip" when r < baseline - this
+  fine_step: 1
+  coarse_step: 4
+
+replicates:
+  batch: 500
+  theta0: 500                 # model runs that fix theta0_D (the selection effect) before the null runs
+  null_runs: 1000
+  positive: 400               # per hypothesis, effect = the replicate's frozen margin
+  half: 200                   # per hypothesis, effect = margin / 2 (power curve only)
+  n_boot: 2000                # empirical-null draws per test (confirmatory analysis: 10000)
+  workers: 8                  # analysis processes
+
+quick:
+  replicates:
+    batch: 40
+    theta0: 40
+    null_runs: 40
+    positive: 20
+    half: 0
+    n_boot: 500
+    workers: 4
