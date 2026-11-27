@@ -107,3 +107,29 @@ def test_fixed_sweep_cycles_the_grid(table: AxisTable):
     pol = FixedSweep(SPEC, dur_index=1)
     acts = [int(pol.select(DesignState(post, t, SPEC.n_freq, 100.0))[0]) for t in range(SPEC.n_freq)]
     assert sorted(acts) == list(range(SPEC.n_freq, 2 * SPEC.n_freq))
+
+
+def test_restart_recovers_a_lost_mode(table: AxisTable):
+    """Particles all stuck at a wrong field: the annealed restart from the prior through the same data finds a set
+    with a better posterior density and replaces them; on a healthy posterior it changes nothing."""
+    g = torch.Generator().manual_seed(6)
+    truths = PRIOR.sample((4,), g, table.device)
+    means = table.means(truths).double()
+    cfg = PosteriorConfig(n_particles=256, restart_at=())
+    post = FieldPosterior(table, PRIOR, 4, cfg, g)
+    for a in (3, 9, 15, 21, 27, 33):
+        act = torch.full((4,), a)
+        post.update(act, torch.poisson(means[torch.arange(4), act] * 3000, generator=g), torch.full((4,), 3000.0))
+    healthy = post.particles.clone()
+    assert not bool(post.restart().any())  # nothing better to find
+    wrong = PRIOR.sample((4,), g, table.device)
+    post.particles = wrong[:, None].expand(-1, 256, -1).clone() + 1e-7 * torch.randn(4, 256, 3, generator=g)
+    post.particles = fold_wedge_t(post.particles)
+    post.logw.zero_()
+    err_before = (post.mean() - truths).norm(dim=-1)
+    replaced = post.restart()
+    err_after = (post.mean() - truths).norm(dim=-1)
+    healthy_err = (healthy.mean(1) - truths).norm(dim=-1)
+    assert bool(replaced.any()) and float(err_after.mean()) < float(err_before.mean())
+    # back to the healthy posterior's accuracy (the data are only six blocks: that is ~0.1-0.3 mT)
+    assert bool((err_after <= 2 * healthy_err + 50e-6).all())

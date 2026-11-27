@@ -133,6 +133,8 @@ def posterior_config(cfg: dict[str, Any]) -> PosteriorConfig:
         mh_steps=int(p["mh_steps"]),
         mh_scale=float(p["mh_scale"]),
         n_predict=int(p["n_predict"]),
+        restart_at=tuple(int(t) for t in p.get("restart_at", ())),
+        restart_margin=float(p.get("restart_margin", 1.0)),
     )
 
 
