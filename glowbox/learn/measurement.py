@@ -15,8 +15,8 @@ Three ways to get the per-shot means:
 
 * :meth:`MeasurementSpec.sequence`: the measurement as a :class:`~glowbox.control.pulse.PulseSequence`, for any
   :class:`~glowbox.sim.interface.Simulator` (``run()``: the QuTiP reference, the surrogate, later hardware).
-* :func:`measurement_means`: the surrogate's run-length path (:mod:`glowbox.sim.surrogate.runs`) for many fields
-  and every action at once (one propagator per run; equal to the bin path on the grid, tests/learn).
+* :func:`measurement_means`: the surrogate's physics for many fields and every action at once, with the
+  shortcuts of :func:`emission_table` (equal to the bin path to round-off, tests/learn).
 * :class:`AxisTable`: a fast *emulator* of :func:`measurement_means` for arbitrary fields, used as the likelihood
   of the Bayesian learners. The ensemble signal is a sum over the four NV orientations (docs/physics.md 7), and
   each orientation's response depends on the field only through B_par = |B . n_k| and B_perp = |B - (B . n_k) n_k|,
@@ -43,8 +43,15 @@ from glowbox.control.pulse import MagnetSetting, PulseSequence, SequenceBuilder
 from glowbox.learn.reservoir import init_prefix
 from glowbox.sim import constants as c
 from glowbox.sim.interface import EnvParams
-from glowbox.sim.surrogate.model import ModelOptions, build_statics, emission_and_state
-from glowbox.sim.surrogate.runs import Run, run_emission
+from glowbox.sim.surrogate.model import (
+    ACC,
+    N_AUG,
+    ModelOptions,
+    Statics,
+    _generator,
+    build_statics,
+    emission_and_state,
+)
 
 #: MW direction perpendicular fraction for every axis with the default MW along [100].
 MW_PERP_DEFAULT = math.sqrt(2.0 / 3.0)
@@ -154,12 +161,32 @@ class MeasurementSpec:
         return out
 
 
-def _runs(spec: MeasurementSpec, env: EnvParams, freq_hz: torch.Tensor, dur_ns: torch.Tensor) -> list[Run]:
-    ns = 1e-9
-    beta = env.optical_beta_full_scale
-    runs = [Run(dur_ns * ns, 0.0, spec.amplitude, 0.0, freq_hz, 0.0)]
-    runs += [Run(w * ns, beta, frame_hz=freq_hz, record=True) for w in spec.windows_ns]
-    return runs
+def _readout_functionals(st: Statics, spec: MeasurementSpec, beta: float) -> torch.Tensor:
+    """Linear maps from the post-MW state to each window's photons per NV, (G, K, M, W, 14).
+
+    The readout is MW-free: its generator couples the populations (and the frame-independent -~/+~ coherence) only
+    among themselves (secular rule, docs/physics.md 3), so the emission does not depend on the frame frequency and
+    one map per field and detuning node serves every action (checked against the run path in tests/learn)."""
+    g, k, m = st.l0.shape[:3]
+    grp = torch.arange(g, device=st.l0.device)
+    dt, dev = st.l0.dtype, st.l0.device
+    z = torch.zeros(g, dtype=dt, device=dev)
+    # Any frame gives the same emission; one near the lines keeps the exponentials' norms small.
+    frame = torch.full((g,), float(spec.freqs_hz().mean()), dtype=torch.float64, device=dev)
+    lro = _generator(st, grp, z + beta, z, z, frame)
+    lro = lro.to(torch.float64)
+    keep = torch.ones(N_AUG, dtype=torch.float64, device=st.l0.device)
+    keep[ACC] = 0.0
+    eye_k = torch.diag(keep)
+    e_acc = torch.zeros(N_AUG, dtype=torch.float64, device=st.l0.device)
+    e_acc[ACC] = 1.0
+    chain = eye_k.expand(g, k, m, N_AUG, N_AUG)  # maps the post-MW state to the state at the current window start
+    out = []
+    for w in spec.windows_ns:
+        p = torch.linalg.matrix_exp(lro * (w * 1e-9))
+        out.append(torch.einsum("i,gkmij,gkmjl->gkml", e_acc, p, chain))
+        chain = eye_k @ p @ chain
+    return torch.stack(out, dim=3).to(st.l0.dtype)
 
 
 @torch.no_grad()
@@ -169,19 +196,19 @@ def emission_table(
     fields_t: np.ndarray,
     options: ModelOptions,
     device: torch.device | str,
-    actions: np.ndarray | None = None,
-    chunk: int = 2048,
+    chunk: int = 0,
 ) -> torch.Tensor:
-    """Photons emitted per NV per shot in each readout window, (N, A', W) float64 on ``device``, for every field
-    (total field = ``env.b_field_t`` + row) and every action (or the listed ``actions``), averaged over the
-    orientations kept by ``env.orientation_populations`` with their weights. The run-length surrogate path."""
+    """Photons emitted per NV per shot in each readout window, (N, A, W) float64 on ``device``, for every field
+    (total field = ``env.b_field_t`` + row) and every action, averaged over the orientations kept by
+    ``env.orientation_populations`` with their weights.
+
+    Exact surrogate physics with three shortcuts (all checked against ``SurrogateSimulator.run`` in tests/learn):
+    the initialisation runs once per field (MW-free, so no coherence enters the measurement); the MW pulse is one
+    propagator exp(L d) per (field, frequency, node), the longer durations by squaring when they double; the
+    readout is a fixed linear functional of the post-MW state (:func:`_readout_functionals`). ``chunk`` bounds
+    the (field, frequency) pairs per batch (0: from the memory budget)."""
     dev = torch.device(device)
     fields = np.atleast_2d(np.asarray(fields_t, dtype=np.float64)) + np.asarray(env.b_field_t)[None]
-    n = fields.shape[0]
-    f_all, d_all = spec.action_grid()
-    act = np.arange(spec.n_actions) if actions is None else np.asarray(actions, dtype=np.int64)
-    f_a = torch.as_tensor(f_all[act], dtype=torch.float64, device=dev)
-    d_a = torch.as_tensor(d_all[act], dtype=torch.float64, device=dev)
     env0 = dataclasses.replace(env, b_field_t=(0.0, 0.0, 0.0))
     # Statics for the distinct fields in np.unique order (what emission_and_state expects); inv maps rows to them.
     ufields, inv = np.unique(fields, axis=0, return_inverse=True)
@@ -195,27 +222,47 @@ def emission_table(
         detuning_rule=options.detuning_rule,
         detuning_spacing=options.detuning_spacing,
     )
-    # Initialisation, once per field (MW-free: no coherence enters the measurement).
     pre = init_prefix(spec.init_ns, spec.settle_ns, grid_ns=spec.grid_ns)
     k = pre.n_bins
+    ng = ufields.shape[0]
     pre_b = dataclasses.replace(
         pre,
-        laser=np.repeat(np.asarray(pre.laser), n, axis=0),
-        mw_amplitude=np.zeros((n, k), np.float32),
-        mw_frequency_hz=np.zeros((n, k)),
-        mw_phase_rad=np.zeros((n, k), np.float32),
-        magnet_t=fields,
+        laser=np.repeat(np.asarray(pre.laser), ng, axis=0),
+        mw_amplitude=np.zeros((ng, k), np.float32),
+        mw_frequency_hz=np.zeros((ng, k)),
+        mw_phase_rad=np.zeros((ng, k), np.float32),
+        magnet_t=ufields,
     )
-    _, state = emission_and_state(pre_b, env0, options=options, device=dev, statics=st)
-    na = act.shape[0]
-    out = torch.empty(n, na, spec.n_windows, dtype=torch.float64, device=dev)
-    pairs = n * na
+    _, state = emission_and_state(pre_b, env0, options=options, device=dev, statics=st)  # (G, K, M, 14)
+    ro = _readout_functionals(st, spec, env.optical_beta_full_scale)  # (G, K, M, W, 14)
+    freqs = torch.as_tensor(spec.freqs_hz() + spec.mw_offset_hz, dtype=torch.float64, device=dev)
+    durs = sorted(set(spec.durations_ns))
+    nf, nk, nm = freqs.shape[0], st.weights.shape[0], st.weights.shape[1]
+    if chunk <= 0:
+        chunk = max(1, (1 << 18) // (nk * nm))
+    keep = torch.ones(N_AUG, dtype=st.l0.dtype, device=dev)
+    keep[ACC] = 0.0
+    em_u = torch.empty(ng, nf, len(durs), spec.n_windows, dtype=torch.float64, device=dev)
+    pairs = ng * nf
     for i in range(0, pairs, chunk):
         idx = torch.arange(i, min(pairs, i + chunk), device=dev)
-        g, a = idx // na, idx % na
-        em, _ = run_emission(st, inv_t[g], _runs(spec, env0, f_a[a], d_a[a]), state[g])
-        out[g, a] = em.double()
-    return out
+        g, fi = idx // nf, idx % nf
+        b = idx.shape[0]
+        zb = torch.zeros(b, dtype=st.l0.dtype, device=dev)
+        lmw = _generator(st, g, zb, zb + spec.amplitude, zb, freqs[fi])
+        r0 = (state[g] * keep)[..., None]
+        prev_d, prop = 0, None
+        for di, d in enumerate(durs):
+            doubled = prop is not None and d == 2 * prev_d
+            prop = prop @ prop if doubled and prop is not None else torch.linalg.matrix_exp(lmw * (d * 1e-9))
+            prev_d = d
+            r = (prop @ r0)[..., 0]  # (b, K, M, 14)
+            em = torch.einsum("bkmwi,bkmi,km->bw", ro[g], r, st.weights)
+            em_u[g, fi, di] = em.double()
+    # actions are duration-major: a = d_index * n_freq + f_index (durations in the spec's order)
+    order = [durs.index(d) for d in spec.durations_ns]
+    em_all = em_u[:, :, order].permute(0, 2, 1, 3).reshape(ng, spec.n_actions, spec.n_windows)
+    return em_all[inv_t]
 
 
 def measurement_means(
@@ -224,12 +271,11 @@ def measurement_means(
     fields_t: np.ndarray,
     options: ModelOptions,
     device: torch.device | str,
-    actions: np.ndarray | None = None,
-    chunk: int = 2048,
+    chunk: int = 0,
 ) -> torch.Tensor:
-    """Mean detected counts per shot, (N, A', W) float64: collection x NVs x emission + background (the truth
+    """Mean detected counts per shot, (N, A, W) float64: collection x NVs x emission + background (the truth
     tables of the learners' environments)."""
-    em = emission_table(spec, env, fields_t, options, device, actions, chunk)
+    em = emission_table(spec, env, fields_t, options, device, chunk)
     bg = torch.as_tensor(spec.background_counts(env), dtype=torch.float64, device=em.device)
     return env.collection_efficiency * env.n_nv * em + bg
 
@@ -271,7 +317,7 @@ class AxisTable:
         b_max_t: float = 3.1e-3,
         d_par_t: float = 10e-6,
         d_perp_t: float = 100e-6,
-        chunk: int = 2048,
+        chunk: int = 0,
     ) -> AxisTable:
         """Simulate orientation 1 alone on the grid (B_perp along its local x; the azimuth of B_perp is
         neglected, see the module docstring)."""
