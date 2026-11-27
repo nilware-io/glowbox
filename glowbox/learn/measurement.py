@@ -439,6 +439,22 @@ class AxisTable:
         bg = torch.as_tensor(self.spec.background_counts(e), dtype=torch.float32, device=self.device)
         return e.collection_efficiency * e.n_nv * self.emission(fields_t, actions) + bg
 
+    def means_per_row(self, fields_t: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Counts per shot of a few actions per row: fields (E, n, 3), actions (E, U) -> (E, n, U, W) (each row's
+        particles at that row's actions; cheaper than :meth:`means` when U << A)."""
+        e = self.env
+        flat = self.table.reshape(-1, self.spec.n_actions, self.spec.n_windows)
+        idx, w = self._stencil(fields_t)
+        act = actions.to(self.device)[:, None, :]
+        out = torch.zeros((*fields_t.shape[:2], actions.shape[1], self.spec.n_windows), device=self.device)
+        for k in range(4):
+            if e.orientation_populations[k] == 0:
+                continue
+            for q in range(idx.shape[-1]):
+                out = out + flat[idx[..., k, q][..., None], act] * w[..., k, q, None, None]
+        bg = torch.as_tensor(self.spec.background_counts(e), dtype=torch.float32, device=self.device)
+        return e.collection_efficiency * e.n_nv * out + bg
+
     def means_at(self, fields_t: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         """Counts per shot of one action per field: fields (..., 3), actions (...) -> (..., W)."""
         e = self.env

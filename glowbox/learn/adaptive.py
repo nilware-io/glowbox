@@ -209,13 +209,16 @@ class FieldPosterior:
     def log_likelihood(self, b: torch.Tensor) -> torch.Tensor:
         """Log-likelihood of every block so far for fields b (E, n, 3), (E, n) (constants dropped), plus the
         tempered pending block during an update."""
-        used = torch.nonzero(self.shots.sum(0) > 0).reshape(-1)
-        if used.numel() == 0:
+        measured = self.shots > 0  # (E, A)
+        n_used = int(measured.sum(-1).max())
+        if n_used == 0:
             out = torch.zeros(b.shape[:2], dtype=torch.float64, device=self.device)
         else:
-            lam = self.table.means(b, used).double().clamp_min(1e-12)  # (E, n, U, W)
-            c = self.counts[:, used][:, None]
-            s = self.shots[:, used][:, None, :, None]
+            # each episode's own measured actions, padded to the longest list (padding carries zero shots)
+            act = torch.topk(measured.to(torch.int8), n_used, dim=-1).indices  # (E, U)
+            lam = self.table.means_per_row(b, act).double().clamp_min(1e-12)  # (E, n, U, W)
+            c = torch.gather(self.counts, 1, act[..., None].expand(-1, -1, self.counts.shape[-1]))[:, None]
+            s = torch.gather(self.shots, 1, act)[:, None, :, None]
             out = (c * torch.log(lam) - s * lam).sum((-1, -2))
         if self._pending is not None:
             a, y, sh, phi = self._pending
