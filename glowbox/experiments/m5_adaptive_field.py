@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import hashlib
 import json
 import math
 import time
@@ -54,7 +55,7 @@ from glowbox.analysis.quantum_test import (
     run_quantum_test,
     t_ci,
 )
-from glowbox.analysis.runlog import RunLog, write_report
+from glowbox.analysis.runlog import DEFAULT_OUTPUT_ROOT, RunLog, write_report
 from glowbox.experiments.m1_odmr_rabi import load_config
 from glowbox.experiments.m2_field_estimation import _style
 from glowbox.experiments.m3_bit_memory import _band, _ci
@@ -180,16 +181,24 @@ class AdaptiveTask:
         if cond.name not in self.tables:
             n = self.cfg["numerics"]
             t0 = time.perf_counter()
-            tab = AxisTable.build(
-                self.cond_spec(cond),
-                self.env,
-                self.opt,
-                self.device,
-                b_max_t=float(n["table_b_max_t"]),
-                d_par_t=float(n["table_d_par_t"]),
-                d_perp_t=float(n["table_d_perp_t"]),
-                n_az=int(n["table_n_az"]),
-            )
+            kw: dict[str, Any] = {
+                "b_max_t": float(n["table_b_max_t"]),
+                "d_par_t": float(n["table_d_par_t"]),
+                "d_perp_t": float(n["table_d_perp_t"]),
+                "n_az": int(n["table_n_az"]),
+            }
+            # The table depends only on these inputs: cache it between runs (outputs/ is gitignored).
+            key = hashlib.sha256(
+                repr((dataclasses.asdict(self.cond_spec(cond)), self.env.to_dict(), self.opt, kw)).encode()
+            ).hexdigest()[:16]
+            cache = DEFAULT_OUTPUT_ROOT / "cache" / f"m5_axis_table_{key}.pt"
+            if cache.exists():
+                tab = AxisTable(self.cond_spec(cond), self.env, *torch.load(cache, weights_only=False))
+                tab = tab.to(self.device)
+            else:
+                tab = AxisTable.build(self.cond_spec(cond), self.env, self.opt, self.device, **kw)
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                torch.save((tab.b_par_t, tab.b_perp_t, tab.n_az, tab.table.cpu()), cache)
             self.seconds["tables"] += time.perf_counter() - t0
             self.tables[cond.name] = tab
             print(f"[m5-field] table {cond.name} {tuple(tab.table.shape)} {time.perf_counter() - t0:.0f} s", flush=True)
@@ -538,6 +547,28 @@ def run_reference_check(task: AdaptiveTask) -> dict[str, Any]:
         out[f"{name}_max_diff_rel_signal"] = float(max(diffs)) / spread
     out["seconds"] = time.perf_counter() - t0
     return out
+
+
+def log_example_traces(task: AdaptiveTask) -> None:
+    """Raw traces (10 shots, full surrogate through ``run()``) of the first measurements the seed-0 agent and the
+    EIG design chose for test field 0, in both conditions."""
+    from glowbox.sim.surrogate import SurrogateSimulator
+
+    sim = SurrogateSimulator(task.device, task.opt)
+    rng = np.random.default_rng([task.base_seed, 3])
+    b = task.test_fields[0][0].cpu().numpy()
+    env = dataclasses.replace(task.env, b_field_t=(float(b[0]), float(b[1]), float(b[2])))
+    for cname in ("resonant", "detuned"):
+        spec = task.spec if cname == "resonant" else task.spec.detuned(float(task.cfg["detuned_offset_hz"]))
+        for name in ("rl", "eig"):
+            path = task.data_dir / f"actions_s0_{cname}_{name}.npy"
+            if not path.exists():
+                continue
+            acts = np.load(path)[:, 0]
+            for step in (0, 1, len(acts) - 1):
+                seq = spec.sequence(int(acts[step]))
+                tr = sim.run(seq, env, shots=10, rng=rng)
+                task.run.log_trace(tr, seq, condition=cname, policy=name, step=step, field_t=b.tolist())
 
 
 # --- plots -----------------------------------------------------------------------------------------------------------
@@ -922,6 +953,7 @@ def main(
         qt.higher_is_better = {m: m.endswith("_skill") for m in qt.metrics()}
         print("[m5-field] reference check", flush=True)
         ref = run_reference_check(task)
+        log_example_traces(task)
         tv = timing_verdicts(task)
         for name, rows in (
             ("curves", task.rows),

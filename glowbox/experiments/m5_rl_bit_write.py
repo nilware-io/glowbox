@@ -416,6 +416,30 @@ def run_reference_check(task: WriteTask) -> dict[str, Any]:
     }
 
 
+def log_example_traces(task: WriteTask) -> None:
+    """Raw traces (10 shots, full surrogate through ``run()``) of the seed-0 RL and gradient writes of the first and
+    last pattern, both conditions."""
+    from glowbox.learn.reservoir import init_prefix
+    from glowbox.sim.surrogate import SurrogateSimulator
+
+    sim = SurrogateSimulator(task.device, task.sys_eval.options)
+    rng = np.random.default_rng([task.base_seed, 3])
+    env = task.env(0)
+    sc = task.cfg["system"]
+    pre = init_prefix(int(sc["init_ns"]), int(sc["settle_ns"]), grid_ns=task.layout.grid_ns)
+    off = float(task.cfg["detuned_offset_hz"])
+    for cname, offset in (("resonant", 0.0), ("detuned", off)):
+        for name in ("rl", "gradient"):
+            p = task.codebooks.get((0, cname, name))
+            if p is None:
+                continue
+            rows = suffix_to_numpy(p, task.layout, offset_hz=offset).unbatch()
+            for j in (0, len(rows) - 1):
+                seq = full_sequence(pre, rows[j])
+                tr = sim.run(seq, env, shots=10, rng=rng)
+                task.run.log_trace(tr, seq, condition=cname, write=name, pattern=int(j))
+
+
 # --- plots -----------------------------------------------------------------------------------------------------------
 
 
@@ -726,6 +750,7 @@ def main(
         qt.higher_is_better = {m: True for m in qt.metrics()}
         print("[m5-write] reference check", flush=True)
         ref = run_reference_check(task)
+        log_example_traces(task)
         tv = timing_verdicts(task)
         for name, rows in (
             ("recall", task.rows),
