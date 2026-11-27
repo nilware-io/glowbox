@@ -20,9 +20,12 @@ posterior (:mod:`glowbox.learn.adaptive`) for the estimate:
 * ``cnn``: milestone 2's CNN decoder on the fixed sweep (no posterior; trained on a bank of the training pool).
 
 Quantum test: everything per seed with every MW frequency + ``detuned_offset_hz`` (the agent retrained there).
-Timing: which durations (pulse areas) the adaptive learners pick, and every learner with all MW durations shifted
-in the device while its model assumes the nominal ones. Check: the seed-0 agent run against the QuTiP reference
-through ``Simulator.run()`` (:class:`~glowbox.learn.rl.SimulatorBackend`).
+Timing: which durations (pulse areas) the adaptive learners pick; every learner with all MW durations shifted in
+the device while its model assumes the nominal ones (sensitivity to calibration, reported in absolute RMSE); and
+the same shifts with the learners' model rebuilt for the shifted durations (does the agent, not retrained, still
+pick the pulse area the information-greedy design picks?). Check: the seed-0 agent and design run against the QuTiP
+reference through ``Simulator.run()`` (:class:`~glowbox.learn.rl.SimulatorBackend`), on test fields including the
+one where the emulator is worst.
 """
 
 from __future__ import annotations
@@ -180,7 +183,11 @@ class AdaptiveTask:
         return self.spec.detuned(cond.mw_offset_hz) if cond.detuned else self.spec
 
     def table(self, cond: Condition) -> AxisTable:
-        if cond.name not in self.tables:
+        return self.table_for(cond.name, self.cond_spec(cond))
+
+    def table_for(self, name: str, spec: MeasurementSpec) -> AxisTable:
+        """The learners' model (emulator table) for ``spec``, cached in memory under ``name`` and on disk."""
+        if name not in self.tables:
             n = self.cfg["numerics"]
             t0 = time.perf_counter()
             kw: dict[str, Any] = {
@@ -191,20 +198,20 @@ class AdaptiveTask:
             }
             # The table depends only on these inputs: cache it between runs (next to the run directories).
             key = hashlib.sha256(
-                repr((dataclasses.asdict(self.cond_spec(cond)), self.env.to_dict(), self.opt, kw)).encode()
+                repr((dataclasses.asdict(spec), self.env.to_dict(), self.opt, kw)).encode()
             ).hexdigest()[:16]
             cache = self.run.dir.parent / "cache" / f"m5_axis_table_{key}.pt"
             if cache.exists():
-                tab = AxisTable(self.cond_spec(cond), self.env, *torch.load(cache, weights_only=False))
+                tab = AxisTable(spec, self.env, *torch.load(cache, weights_only=False))
                 tab = tab.to(self.device)
             else:
-                tab = AxisTable.build(self.cond_spec(cond), self.env, self.opt, self.device, **kw)
+                tab = AxisTable.build(spec, self.env, self.opt, self.device, **kw)
                 cache.parent.mkdir(parents=True, exist_ok=True)
                 torch.save((tab.b_par_t, tab.b_perp_t, tab.n_az, tab.table.cpu()), cache)
             self.seconds["tables"] += time.perf_counter() - t0
-            self.tables[cond.name] = tab
-            print(f"[m5-field] table {cond.name} {tuple(tab.table.shape)} {time.perf_counter() - t0:.0f} s", flush=True)
-        return self.tables[cond.name]
+            self.tables[name] = tab
+            print(f"[m5-field] table {name} {tuple(tab.table.shape)} {time.perf_counter() - t0:.0f} s", flush=True)
+        return self.tables[name]
 
     def fields(self, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
         """(test fields, training pool incl. validation), tesla, float64 on the device."""
@@ -473,6 +480,8 @@ class AdaptiveTask:
         out["cnn_rmse_ut"] = cnn[self.curve_steps[-1]]
         out["cnn_skill"] = 1.0 - out["cnn_rmse_ut"] / prior_ut
         out["prior_rmse_ut"] = prior_ut
+        # the no-information floor on these test fields: the initial (prior) posterior's mean, before any shot
+        out["prior_fields_rmse_ut"] = float(np.sqrt(logs["fixed"].sq_err[0].mean())) * 1e6
         if not cond.detuned:
             self.timing_probe(seed, spec, table, test, policies, logs)
         print(
@@ -492,21 +501,41 @@ class AdaptiveTask:
         policies: dict[str, Policy],
         logs: dict[str, EpisodeLog],
     ) -> None:
-        """Every MW duration shifted in the device (truth), the learners' model unaware: RMSE change."""
-        for shift in self.cfg["timing"]["shifts_ns"]:
-            sh = int(shift)
-            m = self.truth(shifted(spec, sh), test)
-            for k, name in enumerate(("fixed", "eig", "rl")):
-                lg = self.episodes(policies[name], m, test, table, self._gen(seed, 300 + 10 * k + sh))
-                self.timing_rows.append(
-                    {
+        """Every MW duration shifted in the device (truth).
+
+        ``frozen``: the learners' model keeps the nominal durations (a miscalibrated model: every model-based
+        estimator degrades, whatever its strategy, so this measures sensitivity, not the strategy).
+        ``recal``: the model (emulator table) is rebuilt for the shifted durations and the same policies run on it
+        (the agent is not retrained); its duration choices are recorded. Does the strategy still work, and does the
+        agent still pick the pulse area the information-greedy design picks?"""
+        tc = self.cfg["timing"]
+        di = int(self.cfg["policies"]["fixed_dur_index"])
+        method = str(self.cfg["policies"]["eig_method"])
+        for mode, shifts in (("frozen", tc["shifts_ns"]), ("recal", tc.get("recal_shifts_ns", []))):
+            for shift in shifts:
+                sh = int(shift)
+                sspec = shifted(spec, sh)
+                m = self.truth(sspec, test)
+                if mode == "frozen":
+                    tab, pols = table, {n: policies[n] for n in ("fixed", "eig", "rl")}
+                else:
+                    tab = self.table_for(f"resonant_shift{sh:+d}", sspec)
+                    pols = {"fixed": FixedSweep(sspec, di), "eig": EIGDesign(method), "rl": policies["rl"]}
+                salt = 300 if mode == "frozen" else 400
+                for k, (name, pol) in enumerate(pols.items()):
+                    lg = self.episodes(pol, m, test, tab, self._gen(seed, salt + 10 * k + sh))
+                    row: dict[str, Any] = {
                         "seed": seed,
+                        "mode": mode,
                         "policy": name,
                         "shift_ns": sh,
                         "rmse_ut": lg.rmse_t() * 1e6,
                         "rmse0_ut": logs[name].rmse_t() * 1e6,
                     }
-                )
+                    _, dj = sspec.split(lg.actions.reshape(-1))
+                    for d in range(sspec.n_dur):
+                        row[f"frac_d{d}"] = float(np.mean(dj == d))
+                    self.timing_rows.append(row)
 
 
 # --- reference check -----------------------------------------------------------------------------------------------
@@ -520,13 +549,17 @@ def run_reference_check(task: AdaptiveTask) -> dict[str, Any]:
     o = task.opt
     rule: Any = o.detuning_rule
     ref = ReferenceSimulator(n_detuning=o.n_detuning, detuning_rule=rule, detuning_spacing=o.detuning_spacing)
-    truths = task.test_fields[0][:n]
-    sur_means = task.test_means[(0, "resonant")][:n]
     table = task.tables["resonant"]
+    all_f, all_m = task.test_fields[0], task.test_means[(0, "resonant")]
+    # the test field where the emulator (the learners' model) is worst, plus the first n - 1 others
+    err = (table.means(all_f.to(table.device)).double() - all_m.to(table.device).double()).abs()
+    worst = int(err.reshape(err.shape[0], -1).amax(dim=1).argmax())
+    idx = [worst, *[i for i in range(all_f.shape[0]) if i != worst][: n - 1]]
+    truths, sur_means = all_f[idx], all_m[idx]
     envs = [
         dataclasses.replace(task.env, b_field_t=(float(b[0]), float(b[1]), float(b[2]))) for b in truths.cpu().numpy()
     ]
-    out: dict[str, Any] = {"n_fields": n}
+    out: dict[str, Any] = {"n_fields": n, "worst_emulator_field": worst}
     t0 = time.perf_counter()
     for name, pol in (
         ("rl", RLDesign(task.agents[(0, "resonant")], task.prior_rmse_t / math.sqrt(3.0))),
@@ -689,16 +722,22 @@ def plot_training(task: AdaptiveTask) -> Figure:
 
 def plot_timing(task: AdaptiveTask) -> Figure:
     df = pd.DataFrame(task.timing_rows)
-    fig, ax = plt.subplots(figsize=(6, 3.4))
+    fig, ax = plt.subplots(figsize=(6.4, 3.6))
     for name in ("fixed", "eig", "rl"):
-        d = _sel(df, policy=name)
-        shifts = sorted(set(d.shift_ns))
-        vals = [(_sel(d, shift_ns=s).rmse_ut / _sel(d, shift_ns=s).rmse0_ut - 1).to_numpy() for s in shifts]
-        _band(ax, shifts, vals, COLORS[name], "-", LABELS[name])
-    ax.axhline(0, color="#8a8985", lw=0.8)
-    ax.set_xlabel("every MW duration shifted (ns), model unaware")
-    ax.set_ylabel("relative RMSE increase")
-    ax.legend(fontsize=7)
+        d0 = _sel(df, policy=name, mode="frozen")
+        nominal = d0.groupby("seed").rmse0_ut.first().to_numpy()
+        for mode, ls, mk in (("frozen", "-", "o"), ("recal", "--", "s")):
+            d = _sel(df, policy=name, mode=mode)
+            if not len(d):
+                continue
+            shifts = sorted({*set(d.shift_ns), 0})
+            vals = [nominal if s == 0 else _sel(d, shift_ns=s).rmse_ut.to_numpy() for s in shifts]
+            lab = f"{LABELS[name]}, {'model unaware' if mode == 'frozen' else 'model recalibrated'}"
+            _band(ax, shifts, vals, COLORS[name], ls, lab, marker=mk)
+    ax.set_yscale("log")
+    ax.set_xlabel("every MW duration shifted in the device (ns)")
+    ax.set_ylabel("RMSE at the full budget (uT)")
+    ax.legend(fontsize=6)
     _style(ax)
     fig.tight_layout()
     return fig
@@ -708,35 +747,87 @@ def plot_timing(task: AdaptiveTask) -> Figure:
 
 
 def timing_verdicts(task: AdaptiveTask) -> dict[str, Any]:
+    """Duration preference (nominal and with the model recalibrated for shifted durations) and the absolute RMSEs
+    of both timing probes. The frozen-model probe is reported but not used for the verdict: with a miscalibrated
+    model every model-based estimator collapses to a similar absolute error, whatever its strategy."""
     df = pd.DataFrame(task.timing_rows)
-    out: dict[str, Any] = {}
-    shift = max(abs(int(s)) for s in task.cfg["timing"]["shifts_ns"])
-    for name in ("fixed", "eig", "rl"):
-        d = _sel(df, policy=name)
-        rel = []
-        for s in sorted(set(d.seed)):
-            ds = _sel(d, seed=s)
-            ds = ds[ds.shift_ns.abs() == shift]
-            rel.append(float((ds.rmse_ut / ds.rmse0_ut - 1).mean()))
-        v = t_ci(rel)
-        out[name] = {"rel_at_max_shift": v, "relies_on_pulse_timing": bool(v[1] > 0.10)}
+    out: dict[str, Any] = {"policies": {}}
     ch = pd.DataFrame(task.choice_rows)
     areas = task.spec.pulse_area_pi(task.env)
+    uniform = 1.0 / task.spec.n_dur
+    for name in ("fixed", "eig", "rl"):
+        v: dict[str, Any] = {}
+        for mode in ("frozen", "recal"):
+            d = _sel(df, policy=name, mode=mode)
+            v[mode] = {}
+            for s in sorted(set(d.shift_ns)):
+                ds = _sel(d, shift_ns=s).sort_values("seed")
+                r = ds.rmse_ut.to_numpy()
+                v[mode][int(s)] = {
+                    "rmse_ut": t_ci(r),
+                    "minus_nominal_ut": t_ci(r - ds.rmse0_ut.to_numpy()),
+                    "ratio": t_ci(r / ds.rmse0_ut.to_numpy()),
+                    "dur_fractions": {j: t_ci(ds[f"frac_d{j}"].to_numpy()) for j in range(task.spec.n_dur)},
+                }
+        if name != "fixed":
+            d = _sel(ch, cond="resonant", policy=name)
+            fr = {int(j): t_ci(_sel(d, dur_index=j).frac.to_numpy()) for j in range(task.spec.n_dur)}
+            top = max(fr, key=lambda j: fr[j][0])
+            v["dur_fractions"] = fr
+            v["top_dur_index"] = top
+            v["top_duration_ns"] = task.spec.durations_ns[top]
+            v["top_area_pi"] = float(areas[top])
+            v["prefers_a_duration"] = bool(fr[top][1] > uniform)
+            rec = {}
+            for s, e in v["recal"].items():
+                f2 = e["dur_fractions"]
+                t2 = max(f2, key=lambda j: f2[j][0])
+                rec[s] = {"top_dur_index": t2, "prefers": bool(f2[t2][1] > uniform)}
+            v["recal_top"] = rec
+        out["policies"][name] = v
+    # paired, frozen model: learner - fixed sweep, absolute uT, per shift
+    paired: dict[str, dict[int, tuple[float, float, float]]] = {}
+    fz = _sel(df, mode="frozen")
     for name in ("eig", "rl"):
-        d = _sel(ch, cond="resonant", policy=name)
-        fr = {int(j): t_ci(_sel(d, dur_index=j).frac.to_numpy()) for j in range(task.spec.n_dur)}
-        top = max(fr, key=lambda j: fr[j][0])
-        out[name]["dur_fractions"] = fr
-        out[name]["top_duration_ns"] = task.spec.durations_ns[top]
-        out[name]["top_area_pi"] = float(areas[top])
-        uniform = 1.0 / task.spec.n_dur
-        out[name]["prefers_a_duration"] = bool(fr[top][1] > uniform)
-    out["strategy_learns_timing"] = bool(out["rl"]["relies_on_pulse_timing"] and out["rl"]["prefers_a_duration"])
+        paired[name] = {}
+        for s in sorted(set(fz.shift_ns)):
+            a = _sel(fz, policy=name, shift_ns=s).sort_values("seed").rmse_ut.to_numpy()
+            f = _sel(fz, policy="fixed", shift_ns=s).sort_values("seed").rmse_ut.to_numpy()
+            paired[name][int(s)] = t_ci(a - f)
+    out["frozen_minus_fixed_ut"] = paired
+    rl, eig = out["policies"]["rl"], out["policies"]["eig"]
+    recal_ok = bool(rl["recal_top"]) and all(
+        e["prefers"] and e["top_dur_index"] == eig["recal_top"][s]["top_dur_index"] for s, e in rl["recal_top"].items()
+    )
+    out["rl_recal_keeps_area_choice"] = recal_ok
+    # RL picks a Rabi-scale pulse area beyond uniform, and with every duration shifted and the model rebuilt it
+    # still prefers one, the same one the information-greedy design picks on the shifted model.
+    out["strategy_learns_timing"] = bool(rl["prefers_a_duration"] and recal_ok)
     return out
 
 
 def _fmt(v: float) -> str:
     return "n/a" if not math.isfinite(v) else f"{v:.3g}"
+
+
+def _field_spread(task: AdaptiveTask, cond: str) -> float:
+    """Largest spread (max - min over the test fields) of one action's noiseless mean, counts per shot, over
+    seeds, actions and windows."""
+    out = 0.0
+    for (_, c), m in task.test_means.items():
+        if c == cond:
+            out = max(out, float((m.amax(dim=0) - m.amin(dim=0)).max()))
+    return out
+
+
+def _shots_cell(v: np.ndarray, budget: int) -> str:
+    """Shots to a threshold over seeds (NaN = never within the budget)."""
+    fin = np.isfinite(v)
+    if fin.all():
+        return _fmt(float(np.mean(v)))
+    med = float(np.median(np.where(fin, v, np.inf)))
+    tag = f"{int(fin.sum())}/{v.size} seeds reach it"
+    return f"median {_fmt(med)} ({tag})" if math.isfinite(med) else f"> {budget:.3g} ({tag})"
 
 
 def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], ref: dict[str, Any]) -> str:
@@ -789,6 +880,21 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
         f"there) the detuned skill (1 - RMSE / prior RMSE) is between {min(det):.3g} and {max(det):.3g}; the gap is "
         f"significant for {len(sig)} of {len(names)} learners ({', '.join(sig) or 'none'})."
     )
+    floor = np.asarray(qt.values["detuned"]["prior_fields_rmse_ut"])
+    fl = [
+        f"{n} {_ci(t_ci(np.asarray(qt.values['detuned'][f'{n}_rmse_ut']) - floor))}"
+        for n in ("fixed", "eig", "rl", "cnn")
+    ]
+    L.append(
+        f"- The detuned floor: the prior's mean on each seed's {task.cfg['data']['n_test']} test fields scores "
+        f"{_ci(t_ci(floor))} uT (the {task.prior_rmse_t * 1e6:.0f} uT above is the prior's RMSE over the whole "
+        "prior; a finite test set scatters around it). Detuned RMSE minus this per-seed floor, uT: "
+        + "; ".join(fl)
+        + f". The remaining small skill is not MW leakage: far from any line the glow still depends weakly on the "
+        "field without microwaves (the off-axis field mixes the spin states): the noiseless means of one action "
+        f"differ by up to {_field_spread(task, 'detuned'):.2g} counts per shot across the test fields (resonant: "
+        f"{_field_spread(task, 'resonant'):.2g}), against a block shot noise of ~{math.sqrt(3.4 / S):.2g}."
+    )
     L.append(
         f"- Timing: the RL agent's strategy uses microsecond-scale (Rabi-scale) timing: "
         f"**{'yes' if tv['strategy_learns_timing'] else 'no'}** (details below)."
@@ -804,20 +910,16 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
         L.append("| " + " | ".join(cells) + " |")
     L.append("")
     L.append(
-        "Shots until the RMSE over the test fields first falls below a threshold (mean over seeds; n/a = not "
-        "within the budget):"
+        "Shots until the RMSE over the test fields first falls below a threshold: mean over seeds when every seed "
+        "reaches it; otherwise the median with the seeds that never reach it counted as beyond the budget (a mean "
+        "over only the seeds that reach it would be biased low):"
     )
     thr = [int(x) for x in task.cfg["budget"]["thresholds_ut"]]
     L += ["", "| policy | " + " | ".join(f"<= {x} uT" for x in thr) + " |", "|" + " --- |" * (len(thr) + 1)]
     for n in ("fixed", "eig", "eig_pi", "rl", "rl_init", "random"):
-        cells = []
-        for x in thr:
-            v = np.asarray(qt.values["resonant"][f"{n}_shots_to_{x}ut"], dtype=float)
-            cells.append(
-                _fmt(float(np.mean(v)))
-                if np.all(np.isfinite(v))
-                else f"{_fmt(float(np.nanmean(v)))} ({int(np.isfinite(v).sum())}/{v.size} seeds)"
-            )
+        cells = [
+            _shots_cell(np.asarray(qt.values["resonant"][f"{n}_shots_to_{x}ut"], dtype=float), budget) for x in thr
+        ]
         L.append(f"| {LABELS[n]} | " + " | ".join(cells) + " |")
     L.append("")
     L += ["## Fixed sweeps at each duration", ""]
@@ -842,37 +944,79 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
         + " |",
     ]
     L.append("|" + " --- |" * (task.spec.n_dur + 1))
+    P = tv["policies"]
     for n in ("eig", "rl"):
-        fr = tv[n]["dur_fractions"]
+        fr = P[n]["dur_fractions"]
         L.append(f"| {LABELS[n]} | " + " | ".join(_ci(fr[j], "{:.2f}") for j in range(task.spec.n_dur)) + " |")
     L.append("")
-    df = pd.DataFrame(task.timing_rows)
-    shifts = sorted(set(df.shift_ns))
-    L.append(
-        "Every MW duration shifted in the device while the learners' model assumes the nominal durations; "
-        "relative RMSE increase [t CI]:"
-    )
-    L += ["", "| policy | " + " | ".join(f"{s:+d} ns" for s in shifts) + " |", "|" + " --- |" * (len(shifts) + 1)]
-    for n in ("fixed", "eig", "rl"):
-        cells = []
-        for s in shifts:
-            dt = _sel(df, policy=n, shift_ns=s)
-            cells.append(_ci(t_ci((dt.rmse_ut / dt.rmse0_ut - 1).to_numpy()), "{:+.2f}"))
-        L.append(f"| {LABELS[n]} | " + " | ".join(cells) + " |")
-    L.append("")
-    for n in ("fixed", "eig", "rl"):
-        v = tv[n]
-        extra = ""
-        if "top_duration_ns" in v:
-            pref = "yes" if v["prefers_a_duration"] else "no"
-            extra = (
-                f"; most chosen duration {v['top_duration_ns']} ns ({v['top_area_pi']:.2f} pi), preferred beyond "
-                f"uniform: {pref}"
+    nominal = {n: _ci(t_ci(qt.values["resonant"][f"{n}_rmse_ut"])) for n in ("fixed", "eig", "rl")}
+    for mode, what in (
+        ("frozen", "the learners' model keeps the nominal durations (miscalibrated model)"),
+        (
+            "recal",
+            "the learners' model (emulator table) rebuilt for the shifted durations, policies unchanged "
+            "(the agent is not retrained)",
+        ),
+    ):
+        shifts = sorted(P["rl"][mode])
+        if not shifts:
+            continue
+        L.append(
+            f"Every MW duration shifted in the device, {what}: RMSE (uT) at the full budget [t CI], and the ratio to "
+            "the unshifted RMSE:"
+        )
+        L += [
+            "",
+            "| policy | unshifted | " + " | ".join(f"{s:+d} ns" for s in shifts) + " |",
+            "|" + " --- |" * (len(shifts) + 2),
+        ]
+        for n in ("fixed", "eig", "rl"):
+            cells = [f"{_ci(P[n][mode][s]['rmse_ut'])} (x{P[n][mode][s]['ratio'][0]:.2g})" for s in shifts]
+            L.append(f"| {LABELS[n]} | {nominal[n]} | " + " | ".join(cells) + " |")
+        L.append("")
+        if mode == "frozen":
+            pd_ = tv["frozen_minus_fixed_ut"]
+            L.append(
+                "- Paired, model unaware, learner - fixed sweep (uT): "
+                + "; ".join(f"{s:+d} ns: EIG {_ci(pd_['eig'][s])}, RL {_ci(pd_['rl'][s])}" for s in sorted(pd_["rl"]))
+                + ". With a miscalibrated model every model-based estimator degrades whatever its strategy, so this "
+                "probe measures the sensitivity to calibration and is not used for the timing verdict; the large "
+                "ratios of the adaptive learners come from their smaller unshifted error."
             )
-        rel = "yes" if v["relies_on_pulse_timing"] else "no"
-        L.append(f"- {LABELS[n]}: relies on its pulse timing (> 10 % worse at the largest shift, CI): {rel}{extra}.")
+        else:
+            L.append(
+                "- Recalibrated, shifted - unshifted RMSE (uT): "
+                + "; ".join(
+                    f"{s:+d} ns: "
+                    + ", ".join(f"{k} {_ci(P[k][mode][s]['minus_nominal_ut'])}" for k in ("fixed", "eig", "rl"))
+                    for s in shifts
+                )
+                + "."
+            )
+            for n in ("eig", "rl"):
+                for s in shifts:
+                    fr = P[n][mode][s]["dur_fractions"]
+                    top = P[n]["recal_top"][s]["top_dur_index"]
+                    d_ns = task.spec.durations_ns[top] + s
+                    L.append(
+                        f"- {LABELS[n]}, recalibrated {s:+d} ns: duration fractions "
+                        + ", ".join(
+                            f"{task.spec.durations_ns[j] + s} ns {_ci(fr[j], '{:.2f}')}" for j in range(task.spec.n_dur)
+                        )
+                        + f"; most chosen {d_ns} ns, preferred beyond uniform: "
+                        f"{'yes' if P[n]['recal_top'][s]['prefers'] else 'no'}."
+                    )
+        L.append("")
+    for n in ("eig", "rl"):
+        v = P[n]
+        pref = "yes" if v["prefers_a_duration"] else "no"
+        L.append(
+            f"- {LABELS[n]}: most chosen duration {v['top_duration_ns']} ns ({v['top_area_pi']:.2f} pi), preferred "
+            f"beyond uniform: {pref}."
+        )
     L.append(
-        "- `strategy_learns_timing` (RL: relies on pulse timing and prefers a pulse area) = "
+        "- `strategy_learns_timing` (RL prefers a pulse area beyond uniform, and with every duration shifted and the "
+        "model recalibrated it still prefers one, the one the information-greedy design picks there) = "
         f"**{tv['strategy_learns_timing']}**."
     )
     L.append("")
@@ -887,11 +1031,13 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
     )
     L.append(
         f"- QuTiP reference as the device through `Simulator.run()` (`SimulatorBackend`), seed-0 agent and EIG, "
-        f"{ref['n_fields']} test fields: RL RMSE {ref['rl_rmse_ref_ut']:.1f} (reference) vs "
-        f"{ref['rl_rmse_sur_ut']:.1f} uT (surrogate truth), EIG {ref['eig_rmse_ref_ut']:.1f} vs "
-        f"{ref['eig_rmse_sur_ut']:.1f} uT; noiseless means of every action measured within "
-        f"{ref['rl_max_diff_rel_signal']:.2g} (RL) and {ref['eig_max_diff_rel_signal']:.2g} (EIG) "
-        f"of the signal spread ({ref['rl_ref_calls'] + ref['eig_ref_calls']} reference runs, {ref['seconds']:.0f} s)."
+        f"{ref['n_fields']} test fields (one of them the field where the emulator is worst): noiseless means of "
+        f"every action measured within {ref['rl_max_diff_rel_signal']:.2g} (RL) and "
+        f"{ref['eig_max_diff_rel_signal']:.2g} (EIG) of the signal spread "
+        f"({ref['rl_ref_calls'] + ref['eig_ref_calls']} reference runs, {ref['seconds']:.0f} s). The end-to-end RMSE "
+        f"on these few fields (one noisy episode each; a noise-level check only): RL {ref['rl_rmse_ref_ut']:.1f} "
+        f"(reference) vs {ref['rl_rmse_sur_ut']:.1f} uT (surrogate truth), EIG {ref['eig_rmse_ref_ut']:.1f} vs "
+        f"{ref['eig_rmse_sur_ut']:.1f} uT."
     )
     L.append("")
     L += ["## Quantum test", "", qt.to_markdown([f"{n}_rmse_ut" for n in names] + [f"{n}_skill" for n in names]), ""]

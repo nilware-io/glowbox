@@ -83,10 +83,12 @@ cnn:                          # milestone 2's CNN on the fixed sweep (both windo
   mix_channels: 8
 
 timing:
-  shifts_ns: [-50, 50]        # every MW duration shifted in the truth (the learners' model unaware)
+  shifts_ns: [-50, -20, -10, 10, 20, 50]  # every MW duration shifted in the truth, the learners' model unaware
+  recal_shifts_ns: [-50, -20, 20, 50]     # shifted, and the learners' model (table) rebuilt for the shifted durations
 
 reference:
-  n_fields: 2                 # QuTiP reference: the seed-0 RL agent through SimulatorBackend (run())
+  n_fields: 8                 # QuTiP reference: seed-0 agent + EIG through SimulatorBackend (run()); incl. the
+                              # field with the largest emulator error
 
 quick:
   seeds: [0, 1, 2, 3, 4]
@@ -121,6 +123,7 @@ quick:
     hidden: 32
   timing:
     shifts_ns: [-50, 50]
+    recal_shifts_ns: [50]
   policies:
     fixed_dur_index: 0
   reference:
