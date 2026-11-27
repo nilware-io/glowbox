@@ -64,3 +64,7 @@ summary to `docs/results/<run-id>.md` (committed). Configs are plain YAML.
   literature source each.
 - Small tested steps; type hints throughout; `ruff` (lint + format, line length 120) and `mypy` clean.
 - No hostnames, usernames, home paths or IP addresses in committed files.
+- Confirmatory comparisons of decision arms (an outcome-contingent choice applied to the control) or observer arms
+  (a process reading the results during the run) must go through `docs/preregistration/` (README there): a locked
+  plan and analysis script, a calibration block of control runs, sealed outcomes and blinded arm codes. Without a
+  locked plan such a comparison is exploratory and must be labelled so.
