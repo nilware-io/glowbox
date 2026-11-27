@@ -52,7 +52,8 @@ replicates:
   theta0: 500                 # model runs that fix theta0_D (the selection effect) before the null runs
   null_runs: 1000
   positive: 400               # per hypothesis, effect = the replicate's frozen margin
-  half: 200                   # per hypothesis, effect = margin / 2 (power curve only)
+  curve: 200                  # per hypothesis and fraction: the power curve below the margin (no pass criterion)
+  curve_fractions: [0.5, 0.25, 0.125]
   n_boot: 2000                # empirical-null draws per test (confirmatory analysis: 10000)
   workers: 8                  # analysis processes
 
@@ -62,6 +63,6 @@ quick:
     theta0: 40
     null_runs: 40
     positive: 20
-    half: 0
+    curve: 0
     n_boot: 500
     workers: 4

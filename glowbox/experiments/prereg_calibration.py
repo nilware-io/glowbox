@@ -17,7 +17,7 @@ replicate is one complete simulated experiment, run exactly as the plan prescrib
 Phases: ``theta0`` (model runs that fix the selection effect theta0_D, before anything else), ``null`` (no effect:
 false-positive rates, TOST equivalence rate, interval coverage, null-stability flags), ``positive`` (an effect of
 exactly the replicate's frozen margin planted in the decision arm, or in every observed arm, for H_decision and
-H_observer separately: power, attribution, non-equivalence) and ``half`` (margin / 2: the power curve).
+H_observer separately: power, attribution, non-equivalence; and fractions of the margin: the power curve).
 
 Observations come from the surrogate's emission tables (noiseless means per action for a pool of true fields,
 docs/physics.md readout windows) with Poisson shot noise and slow laser and contrast drift indexed by the run's
@@ -628,7 +628,8 @@ def summary_markdown(
         "## Positive control (effect planted in the simulated device)",
         "",
         "Decision: E[r] of the decision arm A1 shifted by the size. Observer: E[r] of every observed arm "
-        "(A1, A2, A4, A5) shifted, the sealed arms not. Size = the replicate's own frozen margin (or half of it).",
+        "(A1, A2, A4, A5) shifted, the sealed arms not. Size = the replicate's own frozen margin, or a fraction of it "
+        "(power curve).",
         "",
         "| planted | size | power (Holm rejection of the planted hypothesis) "
         "| attributed (planted rejected, other not) | not equivalent |",
@@ -658,22 +659,24 @@ def summary_markdown(
         "",
         "- Pass criteria of the plan: false-positive rate per hypothesis within the binomial interval of 0.05 "
         "(Holm makes it at most 0.05); TOST equivalence >= 0.90 under the null; power >= 0.90 and non-equivalence "
-        ">= 0.90 at the margin; correct attribution. The margin / 2 rows are the power curve only.",
+        ">= 0.90 at the margin; correct attribution. The rows below 1 x margin are the power curve only (no pass "
+        "criterion): they show how far below the margin the plan still detects an effect (the margin governs "
+        "the equivalence claims and the power target).",
+        "- The Newey-West robustness check is liberal at N = 100 (above 0.05 in the null), one reason it is not the "
+        "decisive test.",
         "- The calibration block mirrors the confirmatory block slot for slot. A first version of this validation used "
         "a 4-arm calibration block: its paired controls were closer in time than the 7-arm confirmatory pairs, saw "
         "less drift, and the test was liberal (H_decision p <= 0.05 in 0.070 [0.055, 0.088] of 1000 null replicates, "
         "95 % coverage 0.930). The control runs must share the confirmatory schedule, not only its arms.",
         "- One sealing key per batch of replicates instead of one per replicate (speed); every outcome is still "
         "sealed and unsealed through the same code. Blinding keys and order seeds are per replicate.",
-        "- The stand-in decision process is not the M5 policy, and theta0_D depends on the policy: the full-size run "
-        "with the real policy is the command below (GPU machine), and its theta0_D is the one to freeze.",
-        "",
-        "Full size (R = 2000 null replicates; the null phase takes about twice as long as here):",
+        "- The stand-in decision process is not the M5 policy, and theta0_D depends on the policy. The command below "
+        "is the full size with the stand-in (R = 2000 null replicates; the null phase takes about twice as long as "
+        "here). With the real policy the decision process is a Controller (glowbox.analysis.arms) wrapping the M5 "
+        "policy over its posterior, run on the GPU machine; that adapter belongs to M7, and its theta0_D is the one "
+        "to freeze.",
         "",
         "    uv run python -m glowbox.experiments.prereg_calibration --replicates 2000",
-        "",
-        "With the real M5 policy the decision process is a Controller (glowbox.analysis.arms) wrapping the M5 "
-        "policy over its posterior; that adapter belongs to M7 and is not part of this validation.",
         "",
         f"Wall time here: {seconds / 60:.1f} min on a CPU.",
     ]
@@ -739,8 +742,9 @@ def main(argv: list[str] | None = None) -> None:
         pos: dict[str, list[dict[str, Any]]] = {}
         for plant in ("decision", "observer"):
             pos[f"{plant}:1"] = run_phase(cfg, pool, "positive", int(rc["positive"]), plant, 1.0, theta0)
-            if int(rc["half"]):
-                pos[f"{plant}:0.5"] = run_phase(cfg, pool, "positive", int(rc["half"]), plant, 0.5, theta0)
+            for frac in rc.get("curve_fractions", []) if int(rc["curve"]) else []:
+                n_c = int(rc["curve"])
+                pos[f"{plant}:{frac:g}"] = run_phase(cfg, pool, "positive", n_c, plant, float(frac), theta0)
         seconds = time.perf_counter() - t_start
         md, metrics = summary_markdown(cfg, pool, theta0, theta_o, null, pos, seconds)
         run.log_metrics(0, **metrics)
