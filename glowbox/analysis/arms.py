@@ -38,6 +38,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import numpy as np
@@ -127,6 +128,10 @@ class ArmSpec:
     source: Literal["decision", "offline"] = "decision"
     lag: int = 1
     variant: str = "nominal"
+    #: The synthesiser offset of the arm's MW frequencies (Hz; the detuned arm's offset). Recorded per episode in a
+    #: record sealed with the sealing key (:attr:`Episode.setting`): the locked reduction needs it, and in the clear
+    #: it would name the detuned arm during the run.
+    offset_hz: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,8 @@ class Episode:
     slot: np.ndarray
     #: The label of the episode's records: the arm's blinding code, or a random token.
     label: str = ""
+    #: (1,) float64 synthesiser offset of the episode (Hz), sealed with the sealing key.
+    setting: SealedRecord | None = None
 
     def outcomes(self, key: bytes) -> np.ndarray:
         return unseal_outcomes(self, key)
@@ -188,30 +195,87 @@ class Episode:
     def unseal_meta(self, blind_key: bytes) -> EpisodeMeta:
         return EpisodeMeta.from_bytes(unseal(blind_key, self.meta).tobytes())
 
+    def offset_hz(self, key: bytes) -> float:
+        """The episode's synthesiser offset (sealing key); 0 when the episode has no setting record."""
+        return 0.0 if self.setting is None else float(unseal(key, self.setting)[0])
+
+
+def _rec_dict(r: SealedRecord) -> dict[str, Any]:
+    return {
+        "id": r.record_id,
+        "nonce": r.nonce.hex(),
+        "dtype": r.dtype,
+        "shape": list(r.shape),
+        "ct": r.ciphertext.hex(),
+        "tag": r.tag.hex(),
+    }
+
+
+def _rec_from(d: Mapping[str, Any]) -> SealedRecord:
+    return SealedRecord(
+        str(d["id"]),
+        bytes.fromhex(d["nonce"]),
+        str(d["dtype"]),
+        tuple(int(x) for x in d["shape"]),
+        bytes.fromhex(d["ct"]),
+        bytes.fromhex(d["tag"]),
+    )
+
 
 def sealed_artifact(ep: Episode) -> dict[str, Any]:
     """The on-disk form of an episode: its label (code or token), block, time slots, applied actions, the sealed
-    outcome records and the sealed meta record. No arm name and no field that differs between observed and sealed
-    arms is in the clear."""
-
-    def rec(r: SealedRecord) -> dict[str, Any]:
-        return {
-            "id": r.record_id,
-            "nonce": r.nonce.hex(),
-            "dtype": r.dtype,
-            "shape": list(r.shape),
-            "ct": r.ciphertext.hex(),
-            "tag": r.tag.hex(),
-        }
-
-    return {
+    outcome records, the sealed setting record (the synthesiser offset) and the sealed meta record. No arm name and
+    no field that differs between observed and sealed arms is in the clear."""
+    out = {
         "label": ep.label,
         "block": int(ep.block),
         "slot": np.asarray(ep.slot).tolist(),
         "actions": np.asarray(ep.actions).tolist(),
-        "outcomes": [rec(r) for r in ep.sealed],
-        "meta": rec(ep.meta),
+        "outcomes": [_rec_dict(r) for r in ep.sealed],
+        "meta": _rec_dict(ep.meta),
     }
+    if ep.setting is not None:
+        out["setting"] = _rec_dict(ep.setting)
+    return out
+
+
+def episode_from_artifact(d: Mapping[str, Any]) -> Episode:
+    """The inverse of :func:`sealed_artifact` (the arm name is unknown: ``arm`` is the label)."""
+    return Episode(
+        str(d["label"]),
+        int(d["block"]),
+        np.asarray(d["actions"]),
+        [_rec_from(r) for r in d["outcomes"]],
+        _rec_from(d["meta"]),
+        np.asarray(d["slot"]),
+        str(d["label"]),
+        _rec_from(d["setting"]) if d.get("setting") else None,
+    )
+
+
+class ArtifactWriter:
+    """Appends episodes to a JSON-lines file of :func:`sealed_artifact` records as they finish (use as the
+    ``on_episode`` callback of :func:`run_protocol`). After the last episode, register the file's sha256 with
+    :meth:`glowbox.analysis.prereg.Registry.register_end` before the sealing key is released."""
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            raise FileExistsError(f"{self.path} exists: a sealed artifact file is written once")
+        self.path.touch()
+        self.n = 0
+
+    def __call__(self, ep: Episode) -> None:
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(sealed_artifact(ep), separators=(",", ":")) + "\n")
+        self.n += 1
+
+
+def read_artifacts(path: Path | str) -> list[Episode]:
+    """Every episode of a JSON-lines artifact file (:class:`ArtifactWriter`)."""
+    with open(path, encoding="utf-8") as f:
+        return [episode_from_artifact(json.loads(line)) for line in f if line.strip()]
 
 
 def unseal_outcomes(ep: Episode, key: bytes) -> np.ndarray:
@@ -288,7 +352,8 @@ def run_episode(
         props.append(proposal)
     meta = EpisodeMeta(np.stack(props), reads, fallback, np.asarray(compute))
     meta_rec = meta_sealer.seal(f"{block}/{tag}/meta", np.frombuffer(meta.to_bytes(), dtype=np.uint8))
-    return Episode(arm.name, block, np.stack(acts), sealed, meta_rec, np.asarray(slot), tag)
+    setting = sealer.seal(f"{block}/{tag}/setting", np.array([float(arm.offset_hz)], dtype=np.float64))
+    return Episode(arm.name, block, np.stack(acts), sealed, meta_rec, np.asarray(slot), tag, setting)
 
 
 @dataclass(frozen=True)

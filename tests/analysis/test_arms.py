@@ -237,7 +237,7 @@ def test_protocol_streams_episodes():
     assert not res.episodes and len(got) == 4 * len(DESIGN.names)
 
 
-ALLOWED_ARTIFACT_KEYS = {"label", "block", "slot", "actions", "outcomes", "meta"}
+ALLOWED_ARTIFACT_KEYS = {"label", "block", "slot", "actions", "outcomes", "meta", "setting"}
 
 
 @pytest.mark.parametrize("with_codes", [False, True])
