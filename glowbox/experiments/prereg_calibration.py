@@ -1063,8 +1063,14 @@ def summary_markdown(
         "drift_only_wrong_member (no criterion) shows the limit of any model check on wcorr: when the set holds only "
         "the wrong member and one the controls refute, H_decision is tested at a wrong centre. The set must contain "
         "the true selection effect; that is why it is locked with the plan and reviewed before sign-off.",
-        "- The Newey-West robustness check is liberal at N = 100 (above 0.05 in the null), one reason it is not the "
-        "decisive test.",
+        "- The Newey-West robustness check (not decisive): p <= 0.05 in the nominal null "
+        f"{fmt_rate(rate(nom, 'H_decision_nw_rej'))} (H_decision), {fmt_rate(rate(nom, 'H_observer_nw_rej'))} "
+        "(H_observer).",
+        f"- Sizes: N = {pa.N_CONF} confirmatory blocks (the owner's decision of 2026-11-27, was 100: the margin "
+        f"halves), M_CAL = {pa.M_CAL} calibration blocks. M_CAL is not scaled with N: the calibration estimates the "
+        "spread of one control pair, so the precision of the critical values and of the margin depends on M_CAL, not "
+        "on N; the null of the N-pair mean is the block bootstrap of the M_CAL series. The model runs per member are "
+        "not scaled either: theta0_D's Monte Carlo SE and the margin both fall as 1 / sqrt(N).",
         "- The bootstrap block length is the larger of the Newey-West rule and twice the integrated correlation time "
         "of the calibration series (Politis-White flat-top window). In this simulation the control pairs are "
         "uncorrelated (the slow drift cancels within a block), so it stays at the Newey-West rule: "

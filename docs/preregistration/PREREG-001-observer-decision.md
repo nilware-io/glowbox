@@ -6,7 +6,8 @@ confirmatory, whatever its result.
 
 - Plan: PREREG-001, version 3 (draft of 2026-11-27, revised after the second review: the analysed data bound to
   the registered sealed artifacts, one confirmatory run per series and two fixed series, the model set locked, the
-  secondary family under the complete rule, the decisive pass criterion, order checked by git ancestry).
+  secondary family under the complete rule, the decisive pass criterion, order checked by git ancestry; N = 400
+  confirmatory blocks by the owner's decision of 2026-11-27, revalidated at the full size).
 - Analysis script: `glowbox/analysis/prereg_analysis_001.py` (frozen constants at its top; the reduction of counts
   to the episode table; the calibration, blinded analysis and unblinding steps).
 - Arms and protocol runner: `glowbox/analysis/arms.py`; locking, run records, the run registry, sealing, blinding,
@@ -196,7 +197,7 @@ calibration lock it will be analysed against.
 
        Delta = Q_{1 - alpha/2}(|D|) + Q_{0.95}(|D|),
 
-   where D is the empirical control-vs-control null of the mean of N = 100 pairs (item 1) and the quantiles are of
+   where D is the empirical control-vs-control null of the mean of N = 400 pairs (item 1) and the quantiles are of
    |D|. For a symmetric null, Q_{1 - alpha/2}(|D|) is the critical value of the test at Holm's first level (alpha / 2,
    two-sided) and Q_{0.95}(|D|) = Q_{0.975}(D), so an effect of Delta is detected against the controls with power
    0.975 (MARGIN_POWER) at the planned N. For roughly normal controls Delta = 4.2 x the control-vs-control SD of the
@@ -216,8 +217,16 @@ calibration lock it will be analysed against.
      "practically null".
    - Delta is also reported in units of the spin signal of the replayed sequences, C_ref = the mean over
      calibration blocks of (r of C5 - r of C2), next to every equivalence claim.
-3. **N = 100 valid confirmatory blocks, fixed.** The margin is derived for this N; there is no data-dependent sample
-   size. Stage S gives Delta / C_ref of about 0.09 (section 13).
+3. **N = 400 valid confirmatory blocks, fixed.** The margin is derived for this N; there is no data-dependent sample
+   size. The owner set N = 400 on 2026-11-27 (was 100), before any confirmatory data, so that the margin falls below
+   5 % of the spin signal: Delta falls as 1 / sqrt(N), and stage S gives Delta / C_ref of about 0.043 at N = 400
+   (0.086 at N = 100; section 13, deviations log).
+   - M_CAL = 200 is not scaled with N. The calibration block estimates the spread (and shape) of one control pair;
+     the null of the N-pair mean is the block bootstrap of the M_CAL series, so the relative precision of the
+     critical values and of the margin (about 1 / sqrt(2 M_CAL), 5 %) depends on M_CAL and not on N. Stage S
+     checks this at N = 400 (the decisive criterion, coverage and power, section 12).
+   - The model runs per member are not scaled: the Monte Carlo SE of theta0_D and the margin both fall as
+     1 / sqrt(N), so the rule SE <= margin / 10 holds with the same number of runs.
 4. **The theta0_D set and the model check** (section 4).
 5. **The bootstrap seed**, from the sha256 of the calibration data (no analyst choice).
 
@@ -339,7 +348,8 @@ Outside the family:
 ## 8. Sample size, stopping, exclusions
 
 - **Fixed sample size, no interim looks.**
-  - N = 100 valid confirmatory blocks, M_CAL = 200 valid calibration blocks, both fixed.
+  - N = 400 valid confirmatory blocks, M_CAL = 200 valid calibration blocks, both fixed (N = 400 by the owner's
+    decision of 2026-11-27, before any confirmatory data; section 5, item 3).
   - Collection stops at N valid blocks or at 1.2 N attempted blocks, whichever comes first. The calibration block
     stops at M_CAL valid or 1.2 M_CAL attempted blocks.
   - Stopping depends only on validity flags, computed blind to arm and outcome.
@@ -389,6 +399,9 @@ Outside the family:
 
 **M7, three controllers**: (a) ideal clocked, (b) drifting chip-timed, (c) (b) plus event-driven feedback (the next
 pulse conditioned on the previous window's photons).
+
+The analog readout and drive work (ADC and DAC) is a separate milestone, M8, by the owner's decision of 2026-11-27.
+It is not part of M7 and not covered by this plan; if it adds a decision or observer arm, it gets its own plan.
 
 - **Engineering family** (separate from the primaries; Holm at FWER 0.05 within it):
   - E-1: task error (b) - (a), the drift cost, direction > 0;
@@ -459,8 +472,9 @@ pulse conditioned on the previous window's photons).
 ## 12. Stage-S validation (pass criteria)
 
 The calibration script runs the whole procedure on simulated data, R replicates per condition. Each replicate is a
-complete experiment with its own keys, order tables and calibration block, analysed with the frozen model set of
-its condition (model runs per model and per true field).
+complete experiment with its own keys, order tables and calibration block (M_CAL = 200), and a confirmatory run of
+the plan's N = 400 blocks, analysed with the frozen model set of its condition (model runs per model and per true
+field). A change of N or M_CAL needs this validation again at the full size.
 
 Every criterion is a rule on the Clopper-Pearson 95 % interval of a rate, and the report prints PASS, FAIL or
 PENDING for each.

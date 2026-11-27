@@ -295,12 +295,13 @@ def test_concurrent_null_stops_claims_from_a_noisier_run():
     positive claim now needs a rejection against the run's own sealed controls as well."""
     cal = _cal()
     hits_cal, hits = 0, 0
-    for seed in range(12):
+    for seed in range(20):
         _, rep, _ = _analysed({}, seed=seed + 10, cal=cal, sd=0.15)
         r = rep.primary["H_observer"]
         hits_cal += r["holm_rejected"]
         hits += r["rejected"]
-    assert hits_cal >= 4  # three times the noise: the calibration null alone rejects far too often
+    # three times the noise: the calibration null alone rejects in about 40 % of runs (at Holm's first level)
+    assert hits_cal >= 4
     assert hits <= 1
 
 
@@ -344,7 +345,7 @@ def test_model_check_refuses_h_decision_when_the_drift_model_is_wrong():
     assert rep.primary["H_decision"]["conclusion"].startswith("inconclusive: the drift model")
     assert not rep.primary["H_decision"]["rejected"]
     assert not rep.primary["H_observer"]["conclusion"].startswith("inconclusive: the drift")  # model-free
-    covered = _cal(models=[_model("ar", ar=0.6)])
+    covered = _cal(models=[_model("ar", ar=0.6, n=40)])
     assert not covered.model_ok  # the calibration block (iid) is outside the AR model's envelope
     _, rep2, _ = _analysed({}, ar=0.6, cal=covered)
     assert rep2.model_check["confirmatory"]
@@ -356,7 +357,7 @@ def test_model_rule_drops_members_the_controls_refute():
     """Regression: the model check passed when the observed wcorr lay in ANY member's envelope, and the worst case
     was taken over every member. A member that the sealed controls refute is now dropped before the worst case;
     the worst case is over the members that reproduce both the calibration block and the confirmatory run."""
-    ar = _model("ar", ar=0.6, shift={"A1": 0.02})  # refuted by iid controls; its theta0 would hide everything
+    ar = _model("ar", ar=0.6, shift={"A1": 0.02}, n=40)  # refuted by iid controls; its theta0 would hide everything
     cal = _cal(models=[_model(), ar])
     assert cal.model_ok_members == {"nominal": True, "ar": False}
     cm = _cal()

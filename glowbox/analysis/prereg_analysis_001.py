@@ -92,9 +92,13 @@ LOCK_TAG = "prereg-001"
 ALPHA = 0.05
 #: TOST level per side for the two primaries (alpha / 2: Bonferroni over the two equivalence claims).
 ALPHA_EQ = 0.025
-#: Confirmatory valid blocks (fixed; the margin is derived for this N, :func:`control_margin`).
-N_CONF = 100
-#: Calibration valid blocks.
+#: Confirmatory valid blocks (fixed; the margin is derived for this N, :func:`control_margin`). 400 by the owner's
+#: decision of 2026-11-27 (was 100), before any confirmatory data: the margin falls as 1 / sqrt(N), from about 8.6 %
+#: to about 4.3 % of the spin signal C_ref (deviations log).
+N_CONF = 400
+#: Calibration valid blocks. Not scaled with N_CONF: the calibration estimates the spread of one control pair, and
+#: the precision of the critical values and of the margin (relative SE about 1 / sqrt(2 M_CAL)) does not depend on N;
+#: the null of the N-pair mean is the block bootstrap of the M_CAL series (validated at N = 400 in stage S).
 M_CAL = 200
 #: Warm-up blocks at the start of the calibration block and of the confirmatory run (excluded from every analysis).
 WARMUP_BLOCKS = 2
