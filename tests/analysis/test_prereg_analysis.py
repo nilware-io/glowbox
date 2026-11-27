@@ -25,7 +25,7 @@ def _table(arms_hash, n_blocks, rng, shift=None, codes=None, sd=0.05, invalid=No
             rows["r"].append(r)
             rows["rm"].append(np.full(T, 1.0))
             rows["off"].append(np.arange(T) % 2 == 0)
-            rows["task"].append(float(rng.normal(5.0, 1.0)) + (20.0 if arm in ("A5", "C4") else 0.0))
+            rows["task"].append(float(rng.normal(5.0, 1.0)) + (20.0 if arm in ("A5", "C5") else 0.0))
     return pa.EpisodeTable(
         np.array(rows["block"]),
         np.array(rows["pos"]),
@@ -39,12 +39,12 @@ def _table(arms_hash, n_blocks, rng, shift=None, codes=None, sd=0.05, invalid=No
     )
 
 
-CAL = {"C1": 0, "C2": 0, "C3": 1, "C4": 0}
+CAL = {"C1": 0, "C2": 1, "C3": 1, "C3b": 1, "C3L": 2, "C4": None, "C5": 1}
 CONF = {"A1": 0, "A2": 1, "A3": 1, "A3b": 1, "A3L": 2, "A4": None, "A5": 1}
 
 
-def _cal(seed=0, n=201):
-    t = _table(CAL, n, np.random.default_rng(seed), shift={"C4": 0.05}, invalid={0: "warm-up"})
+def _cal(seed=0, n=202):
+    t = _table(CAL, n, np.random.default_rng(seed), shift={"C5": 0.05}, invalid={0: "warm-up", 1: "warm-up"})
     return pa.derive_calibration(t)
 
 
@@ -197,7 +197,7 @@ def test_lag0_orientation_does_not_depend_on_codes():
 
 
 def test_theta0_centre_for_decision_cells():
-    t = _table(CAL, 201, np.random.default_rng(0), shift={"C4": 0.05}, invalid={0: "w"})
+    t = _table(CAL, 202, np.random.default_rng(0), shift={"C5": 0.05}, invalid={0: "w", 1: "w"})
     cal = pa.derive_calibration(t, theta0_d=0.004, theta0_d_se=0.0005)
     keys = pr.RunKeys.from_seed(0)
     codes = pr.arm_codes(keys.blind, pa.CONFIRMATORY_ARMS)

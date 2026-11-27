@@ -74,7 +74,7 @@ N_BOOT = 10_000
 STABILITY_ALPHA = ALPHA / 4
 
 CONFIRMATORY_ARMS = ("A1", "A2", "A3", "A3b", "A3L", "A4", "A5")
-CALIBRATION_ARMS = ("C1", "C2", "C3", "C4")
+CALIBRATION_ARMS = ("C1", "C2", "C3", "C3b", "C3L", "C4", "C5")
 #: Per-pair statistics: r (mean referenced fluorescence difference), r_off (the same on steps far from every line),
 #: resid (difference of mean model residuals), lvr (log ratio of residual variances), task (task-error difference).
 HASH_STATS = ("r", "r_off", "lvr", "task")
@@ -109,10 +109,14 @@ SECONDARY = {
     "S3_offline_observer": CellSpec("A2", "A3", 0, "r_off"),
     "S4_quantum_test": CellSpec("A5", "A2", 0, "task"),
 }
-#: Calibration pairs: the null of lag-0 cells (C1, C2: same block, same sequence) and lag-1 cells (C1 in block k,
-#: C3 in block k + 1 replaying the same sequence); C_ref from the detuned control C4 against C1.
-CAL_PAIRS = {0: ("C1", "C2"), 1: ("C1", "C3")}
-CAL_CREF = ("C4", "C1")
+#: The calibration block mirrors a confirmatory block slot for slot, every arm replaced by a sealed replay without
+#: an applied decision: C1 (offline sequence k, in A1's role), C2, C3, C3b (sequence k - 1), C3L (k - 2), C4 (sealed
+#: sham), C5 (sequence k - 1 detuned). Its pairs give the null of lag-0 cells (C2, C3: the geometry of H_observer),
+#: of lag-1 cells (C1 in block k, C2 in block k + 1: the geometry of H_decision) and of block cells (C4, C2: S1);
+#: C_ref comes from the detuned control C5 against C2.
+CAL_PAIRS = {0: ("C2", "C3"), 1: ("C1", "C2")}
+CAL_BLOCK_PAIR = ("C4", "C2")
+CAL_CREF = ("C5", "C2")
 
 
 # --- Data -----------------------------------------------------------------------------------------------------------
@@ -430,7 +434,7 @@ def derive_calibration(table: EpisodeTable, theta0_d: float = 0.0, theta0_d_se: 
     margin, sigma, vif = {}, {}, {}
     for lag, (x, y) in CAL_PAIRS.items():
         ix, iy = pair_rows(table, x, y, lag)
-        for st in (*HASH_STATS, *BLOCK_STATS):
+        for st in HASH_STATS:
             series[(lag, st)] = pair_stat(table, ix, iy, st)
         s = series[(lag, "r")]
         s = s[np.isfinite(s)]
@@ -438,6 +442,10 @@ def derive_calibration(table: EpisodeTable, theta0_d: float = 0.0, theta0_d_se: 
         sd = float(s.std(ddof=1)) if s.size > 1 else float("nan")
         sigma[lag] = sd
         vif[lag] = float((newey_west_se(s) * math.sqrt(s.size) / sd) ** 2) if s.size > 1 and sd > 0 else 1.0
+    bx, by = CAL_BLOCK_PAIR
+    ix, iy = pair_rows(table, bx, by, 0, "block")
+    for st in BLOCK_STATS:
+        series[(0, st)] = pair_stat(table, ix, iy, st)
     cx, cy = CAL_CREF
     ix, iy = pair_rows(table, cx, cy, 0)
     c_ref = float(np.nanmean(pair_stat(table, ix, iy, "r"))) if ix.size else float("nan")
@@ -669,7 +677,8 @@ def unblind(ba: BlindedAnalysis, code_to_arm: Mapping[str, str], cal: Calibratio
         not s.get("missing") and s["p"] > STABILITY_ALPHA and not (s["scale_p"] <= STABILITY_ALPHA)
         for s in stab.values()
     )
-    secondary = {k: _read(ba, inv, s, "theta0_d" if s.lag == 1 and s.x == "A1" else "0") for k, s in SECONDARY.items()}
+    # theta0_D is the model's prediction for the primary statistic only; secondary cells are centred at zero
+    secondary = {k: _read(ba, inv, s, "0") for k, s in SECONDARY.items()}
     srej = holm({k: v["p"] for k, v in secondary.items()}, ALPHA)
     for k, v in secondary.items():
         v["holm_rejected"] = srej[k]

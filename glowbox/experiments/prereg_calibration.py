@@ -82,9 +82,12 @@ DEVIATIONS = "docs/preregistration/deviations.md"
 
 CAL_DESIGN_ARMS = (
     ArmSpec("C1", "replay", observed=False, source="offline", lag=0),
-    ArmSpec("C2", "replay", observed=False, source="offline", lag=0),
+    ArmSpec("C2", "replay", observed=False, source="offline", lag=1),
     ArmSpec("C3", "replay", observed=False, source="offline", lag=1),
-    ArmSpec("C4", "replay", observed=False, source="offline", lag=0, variant="detuned"),
+    ArmSpec("C3b", "replay", observed=False, source="offline", lag=1),
+    ArmSpec("C3L", "replay", observed=False, source="offline", lag=2),
+    ArmSpec("C4", "sham", observed=False),
+    ArmSpec("C5", "replay", observed=False, source="offline", lag=1, variant="detuned"),
 )
 CONF_DESIGN_ARMS = (
     ArmSpec("A1", "decision", observed=True),
@@ -96,7 +99,7 @@ CONF_DESIGN_ARMS = (
     ArmSpec("A5", "replay", observed=True, lag=1, variant="detuned"),
 )
 OBSERVED_ARMS = tuple(a.name for a in CONF_DESIGN_ARMS if a.observed)
-CAL_WARMUP = 1
+CAL_WARMUP = 2
 CONF_WARMUP = 2
 
 
@@ -404,14 +407,16 @@ def simulate_batch(
         return TableMeasure(pool, fidx, shots, rng, laser, contrast, float(nu["laser_jitter_rel"]), plant_sizes)
 
     m_cal = pa.M_CAL
-    # 1. offline sequences: the decision process on a separate simulated device (no drift), before anything else
-    off_dev = TableMeasure(pool, fidx, shots, np.random.default_rng(rng.integers(1 << 62)), None, None, 0.0)
+    # 1. offline sequences: the decision process on a separate simulated device (the same nuisance model, its own
+    # draws), before anything else
+    n_off = m_cal + CAL_WARMUP
+    off_dev = device(n_off)
     offline = []
     sealer = Sealer(seal_key)
-    for k in range(m_cal + CAL_WARMUP):
-        ep = run_episode(ArmSpec("offline", "decision"), k, ctrl, off_dev, t_n, batch, sealer, np.zeros(batch, int))
+    for k in range(n_off):
+        ep = run_episode(ArmSpec("offline", "decision"), k, ctrl, off_dev, t_n, batch, sealer, np.full(batch, k))
         offline.append(ep.actions)
-    off_actions = np.stack(offline)  # (M + 1, T, B)
+    off_actions = np.stack(offline)  # (M + warm-up, T, B)
     decoy_rng = np.random.default_rng(rng.integers(1 << 62))
     sham_rng = np.random.default_rng(rng.integers(1 << 62))
 
@@ -438,7 +443,7 @@ def simulate_batch(
         n_cal,
         cal_sch,
         ctrl,
-        device(n_cal * 4),
+        device(n_cal * len(cal_design.names)),
         seal_key,
         decoy_rng,
         sham_rng,
@@ -575,7 +580,8 @@ def summary_markdown(
         "DRAFT (not signed off, not locked).",
         "",
         "Every replicate is a complete simulated experiment: offline sequences, a calibration block of "
-        f"{pa.M_CAL} valid blocks (four sealed control arms), the frozen calibration (empirical null, margins, N), "
+        f"{pa.M_CAL} valid blocks (seven sealed control arms, slot for slot like a confirmatory block), the frozen "
+        "calibration (empirical null, margins, N), "
         f"a confirmatory run of N blocks x 7 arms in a random order per block, sealing of every outcome, arm codes, "
         f"the frozen blinded analysis ({rc['n_boot']} null draws per test), unblinding, the pre-registered cells. "
         f"T = {cfg['protocol']['n_steps']} steps x S = {cfg['protocol']['shots']} shots per episode; "
@@ -653,12 +659,16 @@ def summary_markdown(
         "- Pass criteria of the plan: false-positive rate per hypothesis within the binomial interval of 0.05 "
         "(Holm makes it at most 0.05); TOST equivalence >= 0.90 under the null; power >= 0.90 and non-equivalence "
         ">= 0.90 at the margin; correct attribution. The margin / 2 rows are the power curve only.",
+        "- The calibration block mirrors the confirmatory block slot for slot. A first version of this validation used "
+        "a 4-arm calibration block: its paired controls were closer in time than the 7-arm confirmatory pairs, saw "
+        "less drift, and the test was liberal (H_decision p <= 0.05 in 0.070 [0.055, 0.088] of 1000 null replicates, "
+        "95 % coverage 0.930). The control runs must share the confirmatory schedule, not only its arms.",
         "- One sealing key per batch of replicates instead of one per replicate (speed); every outcome is still "
         "sealed and unsealed through the same code. Blinding keys and order seeds are per replicate.",
         "- The stand-in decision process is not the M5 policy, and theta0_D depends on the policy: the full-size run "
         "with the real policy is the command below (GPU machine), and its theta0_D is the one to freeze.",
         "",
-        "Full size (R = 2000 null replicates; about 15 min with 8 analysis workers here, or the GPU machine):",
+        "Full size (R = 2000 null replicates; the null phase takes about twice as long as here):",
         "",
         "    uv run python -m glowbox.experiments.prereg_calibration --replicates 2000",
         "",

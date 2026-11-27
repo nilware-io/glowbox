@@ -67,14 +67,17 @@ below differ. Every outcome of every arm is sealed by the acquisition code (sect
 | A4 | SHAM DECISION | iid draws from the frozen sham distribution | runs on the live outcomes, output discarded | decision process and monitors |
 | A5 | DETUNED | the A2 replay with every MW frequency + 400 MHz | as A2 | decision process and monitors |
 
-**Calibration arms** (the CALIBRATION block, section 5). Every one is a sealed replay: no decision process applied,
-no live reader.
+**Calibration arms** (the CALIBRATION block, section 5). The calibration block mirrors a confirmatory block slot
+for slot (the same number of arms and episodes, so the same drift between paired slots), with every arm replaced by
+a sealed replay: no decision process applied, no live reader.
 
-| Code | Applied actions |
-| --- | --- |
-| C1, C2 | offline sequence k (in block k) |
-| C3 | offline sequence k - 1 (one block after C1 and C2 replayed it) |
-| C4 | offline sequence k with every MW frequency + 400 MHz |
+| Code | In the role of | Applied actions |
+| --- | --- | --- |
+| C1 | A1 | offline sequence k (in block k) |
+| C2, C3, C3b | A2, A3, A3b | offline sequence k - 1 |
+| C3L | A3L | offline sequence k - 2 |
+| C4 | A4 | iid draws from the sham distribution (sealed) |
+| C5 | A5 | offline sequence k - 1 with every MW frequency + 400 MHz |
 
 **Definitions.**
 
@@ -87,8 +90,8 @@ no live reader.
 - **Sealed**: the outcomes go only to the sealed writer. The decision process and every monitor receive a decoy of
   the same shape from a separate generator. The episode's count of plaintext deliveries is logged and must be 0.
 - **Lag-one yoking** lets the order of the arms inside a block be fully random, because replays never depend on an
-  episode of the same block. The first two confirmatory blocks and the first calibration block are warm-up blocks
-  (their replays have no source yet) and are excluded from every analysis.
+  episode of the same block. The first two blocks of the confirmatory run and of the calibration block are warm-up
+  blocks (their lag-2 replays have no source yet) and are excluded from every analysis.
 - **Order inside a block**: a uniformly random permutation per block, drawn from the run's order seed (section 7).
   The whole order table exists before data; a resumed run continues at the next row and never redraws.
 
@@ -127,8 +130,9 @@ statistical significance relative to the control runs. The null is therefore **e
 blocks of the calibration arms (section 3) is run under its own random order table. Its control-vs-control pairs
 come in the same two geometries as the primaries:
 
-- lag 0: (C1, C2), same block, same sequence (the geometry of H_observer);
-- lag 1: (C1 in block k, C3 in block k + 1), same sequence (the geometry of H_decision).
+- lag 0: (C2, C3), same block, same sequence (the geometry of H_observer);
+- lag 1: (C1 in block k, C2 in block k + 1), same sequence (the geometry of H_decision);
+- block: (C4, C2), same block, different actions (the geometry of the secondary S1).
 
 The calibration data are hashed and frozen. The locked script then computes the following, and the lead records it
 in the calibration lock (README, "Freezing"):
@@ -150,7 +154,7 @@ in the calibration lock (README, "Freezing"):
    - Smaller effects are still detected by averaging over N pairs (the superiority test; the validation reports the
      power below the margin). The margin governs the equivalence claims and the power target.
    - Delta is also reported in units of the spin signal of the replayed sequences, C_ref = the mean over
-     calibration blocks of (r of C4 - r of C1). This is for reporting only.
+     calibration blocks of (r of C5 - r of C2). This is for reporting only.
 3. **N**, the number of valid confirmatory blocks: N = max(N_MIN = 100, ceil(max(N_sup, N_eq) / 0.95)), where
    - N_sup = VIF sigma^2 ((z_{1 - 0.05/4} + z_{0.90}) / Delta)^2 gives superiority power 0.90 at
      |theta - theta0| = Delta (two-sided, Bonferroni bound on Holm);
@@ -186,7 +190,8 @@ disagrees with the empirical-null test, both are reported and the empirical test
 ## 6. Secondary outcomes
 
 One family, Holm at FWER 0.05. No claims come from them if the primaries are null. Every secondary uses the empirical
-null of the same calibration geometry and statistic.
+null of the same calibration geometry and statistic, centred at zero (theta0_D is the model prediction for the
+primary statistic only).
 
 - **S1, sham vs yoked**: the mean model residual (r - r_model(action)) of A4 against A2 in the same block. The
   actions differ, hence residuals. r_model is the frozen model's prediction (stage S: the simulator's noiseless
