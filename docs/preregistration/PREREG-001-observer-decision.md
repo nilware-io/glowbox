@@ -520,34 +520,36 @@ PENDING for each.
 
 ## 13. Open for the owner before sign-off
 
-Stage-S numbers below are from docs/results/prereg-calibration.md, run at the documented full size (R = 4000 nominal
-null replicates, 1000 per stress condition; stand-in decision process).
+Stage-S numbers below are from docs/results/prereg-calibration.md, run at the documented full size with N = 400
+(R = 4000 nominal null replicates, 1000 per stress condition; stand-in decision process; 4.7 h on a shared CPU).
 
-- **The margin rule** (section 5): Delta = the effect detected against the controls with power 0.975 at N = 100.
-  Stage S: Delta is about 0.0027 in r, about 8.6 % of the spin signal C_ref, 4.2 x the control-vs-control SD of the
-  100-pair mean. A larger N gives a smaller margin (Delta falls as 1 / sqrt(N)); the hardware rates change it again
-  (PREREG-002).
-- **The sizes** M_CAL = 200, N = 100, the model runs per member (stage S: 500 over 4 true fields), ENG_N =
-  ENG_N_CONTROL = 20.
+- **The sample size** (owner's decision of 2026-11-27, section 5 item 3): N = 400 valid confirmatory blocks (was
+  100), M_CAL = 200, the model runs per member (500 over 4 true fields), ENG_N = ENG_N_CONTROL = 20.
+- **The margin rule** (section 5): Delta = the effect detected against the controls with power 0.975 at N = 400.
+  Stage S: Delta is about 0.00136 in r, **4.3 % of the spin signal C_ref** (8.6 % at N = 100), 4.19 x the
+  control-vs-control SD of the 400-pair mean. The hardware rates change it again (PREREG-002).
+- **Stage-S criteria at N = 400.** Every criterion passes at the full size (the report gives each with its interval):
+  - decisive: the primary family 0.039 [0.033, 0.046] (upper bound 0.046 <= 0.06);
+  - the calibration null alone, uncorrected: H_decision 0.054 [0.048, 0.062], H_observer 0.047 [0.041, 0.054];
+  - secondary family 0.033 [0.027, 0.038]; coverage 0.945 [0.937, 0.952] (H_decision, runs with an interval) and
+    0.952 [0.945, 0.958]; null claims 0.904 [0.895, 0.913] and 0.921 [0.912, 0.929]; null-stability flags 0.055
+    [0.048, 0.063];
+  - power of the complete rule at the margin 0.943 [0.915, 0.963] (decision) and 0.953 [0.927, 0.971] (observer),
+    attribution 0.912 and 0.917, non-equivalence 0.970 and 0.970;
+  - stress conditions (primary family): drift_covered 0.048 [0.036, 0.063], drift_unmodelled 0.014, nonstationary
+    0.042 [0.030, 0.056], drift_wrong_member 0.018; false null claims under nonstationarity 0.010 [0.002, 0.029]
+    for each primary (300 replicates per hypothesis);
+  - the engineering test (unchanged by N): 0.049, 0.051, 0.046 under the null, power 0.969 and 0.967 at its margin.
 - **The model set** for theta0_D and the model check's statistic (within-episode correlation at lags 1-3). The
-  member-by-member rule protects only if the set contains the true selection effect: with a wcorr-matched member
-  whose theta0_D is wrong as the only consistent one (stage S, drift_only_wrong_member, no criterion), the primary
-  family's rate is 0.046 [0.034, 0.061] and H_decision against the calibration null alone 0.095. The owner signs the
-  members and their parameters with the plan.
+  member-by-member rule protects only if the set contains the true selection effect. **A larger N makes this
+  matter more**: a wrong theta0_D is a bias that does not shrink with N, while the test's resolution does. With a
+  wcorr-matched member whose theta0_D is wrong as the only consistent one (stage S, drift_only_wrong_member, no
+  criterion) the primary family's rate is 0.125 [0.105, 0.147] at N = 400 (0.046 at N = 100), and H_decision
+  against the calibration null alone 0.191 (0.095 at N = 100). H_observer does not depend on the model set (0.022).
+  The owner signs the members and their parameters with the plan.
 - **The decision process** of the stage-S validation (a stand-in) versus the M5 policy for the full-size run of M7.
-- **Stage-S criteria (version 3).** Every criterion passes at the full size, the decisive one with an upper bound of
-  0.047 (primary family 0.040 [0.034, 0.047]); see the report for each. What changed after version 2 failed four
-  criteria:
-  - secondary family: S1 moved to exploratory, S2 and S3 under the complete rule, the decision cells centred at
-    their own theta0_D: 0.038 [0.032, 0.044] (was 0.075);
-  - null claims: MARGIN_POWER = 0.975 (section 5): H_decision 0.911 [0.901, 0.919], H_observer 0.922 (was 0.877 and
-    0.889);
-  - the calibration null alone at the uncorrected level: H_observer 0.057 [0.050, 0.064], H_decision 0.052. The
-    1000-replicate value 0.065 of version 2 was the same first 1000 replicates; the bootstrap block length rule
-    tied to the correlation time changes nothing here (the control pairs are uncorrelated, block length 4), and the
-    null's spread matches the spread of the confirmatory estimates. No decision uses this test alone (a positive
-    claim also needs the concurrent null), so it stays a descriptive criterion;
-  - coverage is counted over the runs that report an interval (H_decision without a consistent member reports
-    none, about 1 % of nominal runs).
-- **Not yet covered by a criterion**: false null claims under nonstationarity are checked with 300 replicates per
-  hypothesis only (decision 0.020, observer 0.030 [0.014, 0.056], against alpha_eq = 0.025, descriptive rule).
+- **What changed from version 2** (which failed four criteria) is unchanged in kind: S1 exploratory, S2 and S3 under
+  the complete rule with the decision cells at their own theta0_D; MARGIN_POWER = 0.975; coverage counted over the
+  runs that report an interval (H_decision without a consistent member reports none, 1.0 % of nominal runs).
+- **Recorded owner decisions of 2026-11-27**: N = 400 (above); the analog ADC and DAC work is milestone M8, outside
+  M7 and this plan (section 10).
