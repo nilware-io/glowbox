@@ -1,34 +1,45 @@
 """PREREG-001, stage S: null calibration and positive control of the whole pre-registered pipeline.
 
-    uv run python -m glowbox.experiments.prereg_calibration [--config PATH] [--quick] [--report-dir DIR]
+    uv run python -m glowbox.experiments.prereg_calibration [--config PATH] [--quick] [--replicates N]
+        [--report-dir DIR]
 
 The simulator has no decision or observer effect by construction, so nothing here tests the hypotheses. Each
 replicate is one complete simulated experiment, run exactly as the plan prescribes:
 
-1. Offline action sequences: the decision process run on a separate simulated device (not the measurement under
+1. Model runs (phase ``model``, before anything else): confirmatory-design runs of each model of the theta0_D set
+   (:func:`~glowbox.analysis.prereg_analysis_001.selection_model`): the predicted selection effect and the
+   within-episode correlation of the sealed controls.
+2. Offline action sequences: the decision process run on a separate simulated device (not the measurement under
    test); they are what the calibration controls replay, and their marginal is the sham distribution.
-2. CALIBRATION block (M_CAL valid blocks, arms C1-C4, every one a sealed replay with no decision applied and no live
-   reader): :func:`~glowbox.analysis.prereg_analysis_001.derive_calibration` freezes the empirical null, the
-   margins (smallest effect sizes of interest) and N.
-3. Confirmatory run (N valid blocks, arms A1-A5 with the sealed controls A3, A3b, A3L), randomised order inside every
-   block from the run's order seed, every outcome sealed, arms coded by the blinding key.
-4. The frozen blinded analysis, then unblinding with the released key, then the pre-registered cells.
+3. CALIBRATION block (M_CAL valid blocks, seven arms C1, C2, C3, C3b, C3L, C4, C5, slot for slot like a confirmatory
+   block, every one a sealed replay with no decision applied and no live reader):
+   :func:`~glowbox.analysis.prereg_analysis_001.derive_calibration` freezes the empirical null, the margins
+   (smallest effect sizes of interest), the theta0_D set and the model check.
+4. Confirmatory run (N_CONF valid blocks, arms A1-A5 with the sealed controls A3, A3b, A3L), randomised order inside
+   every block from the run's order seed, every outcome sealed, records labelled by codes or random tokens, the
+   arm-revealing fields sealed with the blinding key, decoys from the frozen model.
+5. The locked reduction (:func:`~glowbox.analysis.prereg_analysis_001.build_episode_table`), the frozen blinded
+   analysis, unblinding with the released key, the pre-registered cells and the complete decision rule.
 
-Phases: ``theta0`` (model runs that fix the selection effect theta0_D, before anything else), ``null`` (no effect:
-false-positive rates, TOST equivalence rate, interval coverage, null-stability flags), ``positive`` (an effect of
-exactly the replicate's frozen margin planted in the decision arm, or in every observed arm, for H_decision and
-H_observer separately: power, attribution, non-equivalence; and fractions of the margin: the power curve).
+Conditions (config ``conditions``): ``nominal`` (device = model: false-positive rates, power, power curve) and stress
+conditions with no effect: within-episode drift that the model set covers (theta0_D clearly non-zero), the same
+drift missing from the model set (the model check must refuse H_decision), and a confirmatory run whose drift is
+larger and faster than the calibration block's (the concurrent nulls must hold the error rate). Phase
+``engineering``: the M7 / E5 paired test at its fixed sizes.
 
 Observations come from the surrogate's emission tables (noiseless means per action for a pool of true fields,
 docs/physics.md readout windows) with Poisson shot noise and slow laser and contrast drift indexed by the run's
 time slots. The decision process is a stand-in with the M5 learners' feedback structure (a threshold rule on the
-previous step's referenced fluorescence that moves the MW frequency finely inside a dip and coarsely outside it);
-the real M5 policy and the full sizes are the GPU command in docs/results/prereg-calibration.md.
+previous step's referenced fluorescence that moves the MW frequency finely inside a dip and coarsely outside it).
+Everything runs on the CPU; the documented full size is the same command with more replicates
+(docs/results/prereg-calibration.md). The M5 policy as the decision process is M7's adapter (a Controller of
+glowbox.analysis.arms) and needs its own model runs and validation.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import math
 import multiprocessing as mp
@@ -43,6 +54,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import yaml
 from scipy import stats
 
 from glowbox.analysis import prereg_analysis_001 as pa
@@ -51,9 +63,8 @@ from glowbox.analysis.arms import (
     Episode,
     ProtocolDesign,
     StepContext,
-    action_hash,
     empirical_sham,
-    poisson_decoy,
+    model_decoy,
     run_episode,
     run_protocol,
     unseal_outcomes,
@@ -65,7 +76,6 @@ from glowbox.analysis.prereg import (
     Sealer,
     arm_codes,
     block_schedule,
-    module_files,
     prereg_record,
     unblind,
 )
@@ -77,8 +87,6 @@ from glowbox.sim.surrogate.model import ModelOptions
 
 DEFAULT_CONFIG = Path(__file__).with_name("configs") / "prereg_001.yaml"
 REPORT_NAME = "prereg-calibration"
-PREREG_DOC = "docs/preregistration/PREREG-001-observer-decision.md"
-DEVIATIONS = "docs/preregistration/deviations.md"
 
 CAL_DESIGN_ARMS = (
     ArmSpec("C1", "replay", observed=False, source="offline", lag=0),
@@ -99,8 +107,8 @@ CONF_DESIGN_ARMS = (
     ArmSpec("A5", "replay", observed=True, lag=1, variant="detuned"),
 )
 OBSERVED_ARMS = tuple(a.name for a in CONF_DESIGN_ARMS if a.observed)
-CAL_WARMUP = 2
-CONF_WARMUP = 2
+#: Arms a model run needs (the H_decision cell and the model-check cell).
+MODEL_ARMS = ("A1", "A2", "A3", "A3b")
 
 
 # --- The simulated device ---------------------------------------------------------------------------------------------
@@ -121,8 +129,10 @@ class Pool:
     freqs_hz: np.ndarray  # (A,)
     fields_t: np.ndarray  # (P, 3)
     baseline_r: float
-    sig: int
-    ref: int
+    line_width_hz: float
+    detuned_offset_hz: float
+    sig: int = pa.SIGNAL_WINDOW
+    ref: int = pa.REFERENCE_WINDOW
 
 
 def build_pool(cfg: dict[str, Any], seed: int) -> Pool:
@@ -143,11 +153,11 @@ def build_pool(cfg: dict[str, Any], seed: int) -> Pool:
     off = float(cfg["detuned_offset_hz"])
     nom = measurement_means(spec, env, fields, opt, "cpu").numpy()
     det = measurement_means(spec.detuned(off), env, fields, opt, "cpu").numpy()
-    s, r = int(cfg["signal_window"]), int(cfg["reference_window"])
+    s, r = pa.SIGNAL_WINDOW, pa.REFERENCE_WINDOW
     lines = np.stack([transition_lines_hz(f, env.d_hz, env.e_hz).ravel() for f in fields])
     freqs = np.tile(spec.freqs_hz(), spec.n_dur)
     width = env.rabi_full_scale_hz * spec.amplitude * MW_PERP_DEFAULT + 1.0 / (math.pi * env.t2_star_s)
-    lim = float(cfg["off_line_widths"]) * width
+    lim = pa.OFF_LINE_WIDTHS * width
 
     def far(f: np.ndarray) -> np.ndarray:
         out: np.ndarray = np.min(np.abs(f[None, :, None] - lines[:, None, :]), axis=2) > lim
@@ -164,9 +174,33 @@ def build_pool(cfg: dict[str, Any], seed: int) -> Pool:
         freqs,
         fields,
         float(np.median(det[..., s] / det[..., r])),
-        s,
-        r,
+        float(width),
+        off,
     )
+
+
+class PoolModel:
+    """The frozen model of one simulated run for :func:`~glowbox.analysis.prereg_analysis_001.build_episode_table`
+    (stage S: the pool's noiseless means of the run's field)."""
+
+    def __init__(self, pool: Pool, f: int) -> None:
+        self.pool, self.f = pool, f
+        self.lines_hz = pool.lines_hz[f]
+        self.line_width_hz = pool.line_width_hz
+
+    def mw_hz(self, actions: np.ndarray) -> np.ndarray:
+        out: np.ndarray = self.pool.freqs_hz[np.asarray(actions, dtype=np.int64)]
+        return out
+
+    def r_model(self, actions: np.ndarray, offset_hz: float) -> np.ndarray:
+        if offset_hz == 0.0:
+            tab = self.pool.r_model_nom[self.f]
+        elif offset_hz == self.pool.detuned_offset_hz:
+            tab = self.pool.r_model_det[self.f]
+        else:
+            raise ValueError(f"no model table for an MW offset of {offset_hz} Hz")
+        out: np.ndarray = tab[np.asarray(actions, dtype=np.int64)]
+        return out
 
 
 def ou(rng: np.random.Generator, batch: int, n: int, sigma: float, tau: float) -> np.ndarray:
@@ -182,8 +216,10 @@ def ou(rng: np.random.Generator, batch: int, n: int, sigma: float, tau: float) -
 
 class TableMeasure:
     """The simulated device: Poisson counts of S shots per step from the pool means of each element's field, with
-    the slow drifts of its time slot. ``plant`` (arm -> (B,) size) adds size x lambda_ref to the signal window of
-    that arm, i.e. shifts its expected referenced fluorescence by the size (positive controls only)."""
+    the slow drifts of its time slot and (``within_sigma`` > 0) a within-episode AR(1) drift of the spin contrast
+    (sd ``within_sigma``, lag-one correlation ``within_rho`` per step, a fresh draw at every episode start).
+    ``plant`` (arm -> (B,) size) adds size x lambda_ref to the signal window of that arm, i.e. shifts its expected
+    referenced fluorescence by the size (positive controls only)."""
 
     def __init__(
         self,
@@ -195,19 +231,34 @@ class TableMeasure:
         contrast: np.ndarray | None,
         jitter: float,
         plant: dict[str, np.ndarray] | None = None,
+        within_sigma: float = 0.0,
+        within_rho: float = 0.0,
     ) -> None:
         self.pool, self.fidx, self.shots, self.rng = pool, fidx, shots, rng
         self.laser, self.contrast, self.jitter = laser, contrast, jitter
         self.plant = plant or {}
+        self.within_sigma, self.within_rho = within_sigma, within_rho
+        self._w: np.ndarray | None = None
+
+    def _within(self, n: int, step: int) -> np.ndarray | float:
+        if self.within_sigma <= 0:
+            return 0.0
+        if step == 0 or self._w is None or self._w.size != n:
+            self._w = self.rng.normal(0.0, self.within_sigma, n)
+        else:
+            rho = self.within_rho
+            self._w = rho * self._w + math.sqrt(1 - rho * rho) * self.rng.normal(0.0, self.within_sigma, n)
+        return self._w
 
     def __call__(self, actions: np.ndarray, ctx: StepContext) -> np.ndarray:
         a = np.asarray(actions, dtype=np.int64)
         b = np.arange(a.size)
         det = self.pool.det[self.fidx, a]
+        w = self._within(a.size, ctx.step)
         if ctx.variant == "detuned":
             lam = det.copy()
         else:
-            c = 1.0 + (self.contrast[b, ctx.slot] if self.contrast is not None else 0.0)
+            c = 1.0 + (self.contrast[b, ctx.slot] if self.contrast is not None else 0.0) + w
             lam = det + np.asarray(c).reshape(-1, 1) * (self.pool.nom[self.fidx, a] - det)
         g = np.asarray(1.0 + (self.laser[b, ctx.slot] if self.laser is not None else 0.0), dtype=np.float64)
         if self.jitter:
@@ -215,7 +266,7 @@ class TableMeasure:
         lam = lam * np.asarray(g).reshape(-1, 1)
         if ctx.arm in self.plant:
             lam[:, self.pool.sig] += self.plant[ctx.arm] * lam[:, self.pool.ref]
-        return self.rng.poisson(lam * self.shots).astype(np.int32)
+        return self.rng.poisson(np.maximum(lam, 0.0) * self.shots).astype(np.int32)
 
 
 class ThresholdController:
@@ -246,8 +297,7 @@ class ThresholdController:
 @dataclass
 class ArmData:
     actions: np.ndarray  # (n_blocks, T, B) int16
-    r: np.ndarray  # (n_blocks, B, T) float32
-    fallback: np.ndarray  # (n_blocks,) bool
+    counts: np.ndarray  # (n_blocks, T, B, W) int32, unsealed after the run
 
 
 def run_design(
@@ -257,93 +307,84 @@ def run_design(
     ctrl: ThresholdController,
     measure: TableMeasure,
     seal_key: bytes,
+    blind_key: bytes,
     decoy_rng: np.random.Generator,
     sham_rng: np.random.Generator,
     sham_source: np.ndarray,
     pool: Pool,
     offline: np.ndarray | None = None,
+    arms: tuple[str, ...] | None = None,
 ) -> dict[str, ArmData]:
+    """Run a design for a batch of replicates and unseal the outcomes after the run. This harness is the acquisition
+    side (one process holds every key); the analysis side sees only :func:`replicate_table`'s coded tables."""
     batch = schedules.shape[0]
     t_n = design.n_steps
+    w = pool.nom.shape[-1]
+    keep_arms = arms or tuple(design.names)
     data = {
-        a: ArmData(
-            np.zeros((n_blocks, t_n, batch), np.int16),
-            np.zeros((n_blocks, batch, t_n), np.float32),
-            np.zeros(n_blocks, bool),
-        )
-        for a in design.names
+        a: ArmData(np.zeros((n_blocks, t_n, batch), np.int16), np.zeros((n_blocks, t_n, batch, w), np.int32))
+        for a in keep_arms
     }
 
     def keep(ep: Episode) -> None:
-        y = unseal_outcomes(ep, seal_key).astype(np.float64)  # (T, B, W)
-        d = data[ep.arm]
-        d.actions[ep.block] = ep.actions
-        d.r[ep.block] = (y[..., pool.sig] / np.maximum(y[..., pool.ref], 1.0)).T
-        d.fallback[ep.block] = ep.fallback
+        # the harness holds every key (simulation): each episode is unsealed as it is handed over
+        if ep.arm in data:
+            data[ep.arm].actions[ep.block] = ep.actions
+            data[ep.arm].counts[ep.block] = unseal_outcomes(ep, seal_key)
 
-    mean_counts = float(pool.nom[..., pool.sig].mean() * measure.shots)
+    def expected(actions: np.ndarray, ctx: StepContext) -> np.ndarray:
+        means = pool.det if ctx.variant == "detuned" else pool.nom
+        out: np.ndarray = means[measure.fidx, np.asarray(actions, dtype=np.int64)] * measure.shots
+        return out
+
     run_protocol(
         design,
         schedules,
         ctrl,
         measure,
         Sealer(seal_key),
-        poisson_decoy(decoy_rng, mean_counts),
+        model_decoy(decoy_rng, expected),
         empirical_sham(sham_rng, sham_source),
         offline,
         on_episode=keep,
+        blind_sealer=Sealer(blind_key),
     )
     return data
 
 
-def episode_table(
+def replicate_table(
     data: dict[str, ArmData],
-    design: ProtocolDesign,
-    b: int,
+    i: int,
     schedule: np.ndarray,
     codes: dict[str, str],
     pool: Pool,
     fidx: int,
-    warmup: int,
-    n_valid: int,
+    n_blocks: int,
+    variants: dict[str, str],
 ) -> pa.EpisodeTable:
-    """Replicate b's episodes (warm-up blocks and blocks beyond warm-up + n_valid left out / flagged)."""
-    rows: dict[str, list[Any]] = {k: [] for k in ("block", "pos", "code", "hash", "r", "rm", "off", "task")}
-    n_blocks = warmup + n_valid
-    lines = pool.lines_hz[fidx]
-    for arm in design.arms:
-        d = data[arm.name]
-        detuned = arm.variant == "detuned"
-        rm_tab = (pool.r_model_det if detuned else pool.r_model_nom)[fidx]
-        off_tab = (pool.off_det if detuned else pool.off_nom)[fidx]
-        for k in range(n_blocks):
-            a = d.actions[k, :, b].astype(np.int64)
-            r = d.r[k, b].astype(np.float64)
-            f_est = pool.freqs_hz[a[int(np.argmin(r))]]
-            rows["block"].append(k)
-            rows["pos"].append(int(np.argmax(schedule[k] == arm.name)))
-            rows["code"].append(codes[arm.name])
-            rows["hash"].append(action_hash(a))
-            rows["r"].append(r)
-            rows["rm"].append(rm_tab[a])
-            rows["off"].append(off_tab[a])
-            rows["task"].append(float(np.min(np.abs(lines - f_est))) / 1e6)
-    invalid = {k: "warm-up" for k in range(warmup)}
-    return pa.EpisodeTable(
-        np.array(rows["block"]),
-        np.array(rows["pos"]),
-        np.array(rows["code"], dtype=object),
-        np.array(rows["hash"], dtype=object),
-        np.stack(rows["r"]),
-        np.stack(rows["rm"]),
-        np.stack(rows["off"]),
-        np.array(rows["task"]),
-        invalid,
+    """Replicate i's episodes through the locked reduction (blocks beyond ``n_blocks`` were not collected)."""
+    code, block, pos, acts, offs, cnts = [], [], [], [], [], []
+    for arm, d in data.items():
+        code += [codes[arm]] * n_blocks
+        block.append(np.arange(n_blocks))
+        pos.append(np.argmax(schedule[:n_blocks] == arm, axis=1))
+        acts.append(d.actions[:n_blocks, :, i].astype(np.int64))
+        offs.append(np.full(n_blocks, pool.detuned_offset_hz if variants[arm] == "detuned" else 0.0))
+        cnts.append(d.counts[:n_blocks, :, i, :])
+    return pa.build_episode_table(
+        np.array(code, dtype=object),
+        np.concatenate(block),
+        np.concatenate(pos),
+        np.concatenate(acts),
+        np.concatenate(offs),
+        np.concatenate(cnts),
+        PoolModel(pool, fidx),
+        pa.WARMUP_BLOCKS,
     )
 
 
 def _analyse_rep(job: dict[str, Any]) -> dict[str, Any]:
-    """Worker: the frozen analysis of one replicate (calibration, blinded analysis, unblinding)."""
+    """Worker: the frozen analysis of one replicate (blinded analysis, unblinding, the complete decision rule)."""
     cal = job["cal"]
     ba = pa.analyse(job["table"], cal, n_boot=job["n_boot"])
     mapping = unblind(job["blind_key"], job["blind_commit"], pa.CONFIRMATORY_ARMS)
@@ -352,23 +393,36 @@ def _analyse_rep(job: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "names_hidden": not any(f"'{a}'" in blinded_text for a in pa.CONFIRMATORY_ARMS),
         "stable": rep.stability["stable"],
+        "model_ok_cal": rep.model_check["calibration"],
+        "model_ok_conf": rep.model_check["confirmatory"],
         "margin0": cal.margin[0],
         "margin1": cal.margin[1],
+        "sd_mean0": cal.sd_mean[0],
+        "sd_mean1": cal.sd_mean[1],
         "c_ref": cal.c_ref,
-        "n_blocks": cal.n_blocks,
     }
     for h, r in rep.primary.items():
         out[f"{h}_p"] = r["p"]
-        out[f"{h}_rej"] = bool(r["holm_rejected"])
+        out[f"{h}_p_conc"] = r.get("p_concurrent", float("nan"))
+        out[f"{h}_rej"] = bool(r.get("rejected", False))
+        out[f"{h}_rej_cal"] = bool(r.get("holm_rejected", False))
         out[f"{h}_raw_rej"] = bool(r["p"] <= pa.ALPHA)
-        out[f"{h}_eq"] = bool(r["equivalent"])
+        out[f"{h}_eq"] = bool(r.get("equivalent", False))
+        out[f"{h}_null_claim"] = str(r["conclusion"]).startswith("null")
         out[f"{h}_d"] = r.get("d", float("nan"))
         out[f"{h}_cover"] = bool(r["ci95"][0] <= 0.0 <= r["ci95"][1]) if not r.get("missing") else False
-        out[f"{h}_nw_rej"] = bool(r["nw_p"] <= pa.ALPHA)
+        out[f"{h}_nw_rej"] = bool(r.get("nw_p", 1.0) <= pa.ALPHA)
         out[f"{h}_conclusion"] = r["conclusion"]
     for s, r in rep.secondary.items():
         out[f"{s}_rej"] = bool(r["holm_rejected"])
     return out
+
+
+def nuisance(cfg: dict[str, Any], *overrides: dict[str, Any] | None) -> dict[str, float]:
+    nu = {"within_sigma": 0.0, "within_rho": 0.0, **{k: float(v) for k, v in cfg["nuisance"].items()}}
+    for o in overrides:
+        nu.update({k: float(v) for k, v in (o or {}).items()})
+    return nu
 
 
 def simulate_batch(
@@ -376,20 +430,32 @@ def simulate_batch(
     pool: Pool,
     rep_ids: np.ndarray,
     phase: str,
+    condition: str,
     plant: str | None,
     plant_frac: float,
-    theta0: tuple[float, float],
+    models: dict[int, list[pa.SelectionModel]] | None,
     workers: int,
 ) -> list[dict[str, Any]]:
-    """Run len(rep_ids) replicates in lock-step (vectorised simulation, one schedule and key set per replicate)."""
+    """Run len(rep_ids) replicates in lock-step (vectorised simulation, one schedule and key set per replicate).
+    ``phase`` "model" (``condition`` names the model): one model run per replicate, returns {"table", "field"};
+    otherwise a complete experiment under ``condition`` (config ``conditions``) with the frozen model set of each
+    replicate's field (``models[field]``: the model of a run is the model of its sample)."""
     batch = rep_ids.size
     seed = int(cfg["seed"])
-    tag = hashlib.sha256(f"{seed}:{phase}:{plant}:{plant_frac}:{int(rep_ids[0])}".encode()).digest()
+    label = f"{seed}:{phase}:{condition}:{plant}:{plant_frac}"
+    tag = hashlib.sha256(f"{label}:{int(rep_ids[0])}".encode()).digest()
     rng = np.random.default_rng(int.from_bytes(tag[:8], "big"))
-    keys = [RunKeys.from_seed(f"{seed}:{phase}:{plant}:{plant_frac}:{int(r)}") for r in rep_ids]
+    keys = [RunKeys.from_seed(f"{label}:{int(r)}") for r in rep_ids]
     seal_key = hashlib.sha256(b"batch-seal" + tag).digest()  # one sealing key per batch (see the report)
+    blind_key = hashlib.sha256(b"batch-blind" + tag).digest()  # seals the arm-revealing episode fields
     fidx = rep_ids % pool.nom.shape[0]
-    pr, nu, cc = cfg["protocol"], cfg["nuisance"], cfg["controller"]
+    pr, cc = cfg["protocol"], cfg["controller"]
+    if phase == "model":
+        cond: dict[str, Any] = {}
+        base = nuisance(cfg, cfg["models"][condition])
+    else:
+        cond = cfg["conditions"][condition]
+        base = nuisance(cfg, cond.get("device"))
     t_n, shots = int(pr["n_steps"]), int(pr["shots"])
     n_freq = pool.freqs_hz.size
     ctrl = ThresholdController(
@@ -401,91 +467,114 @@ def simulate_batch(
         pool.ref,
     )
 
-    def device(n_slots: int, plant_sizes: dict[str, np.ndarray] | None = None) -> TableMeasure:
-        laser = ou(rng, batch, n_slots, float(nu["laser_rel_sigma"]), float(nu["laser_tau_slots"]))
-        contrast = ou(rng, batch, n_slots, float(nu["contrast_rel_sigma"]), float(nu["contrast_tau_slots"]))
-        return TableMeasure(pool, fidx, shots, rng, laser, contrast, float(nu["laser_jitter_rel"]), plant_sizes)
+    def device(n_slots: int, nu: dict[str, float], plant_sizes: dict[str, np.ndarray] | None = None) -> TableMeasure:
+        laser = ou(rng, batch, n_slots, nu["laser_rel_sigma"], nu["laser_tau_slots"])
+        contrast = ou(rng, batch, n_slots, nu["contrast_rel_sigma"], nu["contrast_tau_slots"])
+        return TableMeasure(
+            pool,
+            fidx,
+            shots,
+            rng,
+            laser,
+            contrast,
+            nu["laser_jitter_rel"],
+            plant_sizes,
+            nu["within_sigma"],
+            nu["within_rho"],
+        )
 
     m_cal = pa.M_CAL
-    # 1. offline sequences: the decision process on a separate simulated device (the same nuisance model, its own
-    # draws), before anything else
-    n_off = m_cal + CAL_WARMUP
-    off_dev = device(n_off)
+    wu = pa.WARMUP_BLOCKS
+    # offline sequences: the decision process on a separate simulated device (the model's nuisance, its own draws)
+    n_off = m_cal + wu
+    off_dev = device(n_off, nuisance(cfg))
     offline = []
-    sealer = Sealer(seal_key)
+    sealer, meta = Sealer(seal_key), Sealer(blind_key)
     for k in range(n_off):
-        ep = run_episode(ArmSpec("offline", "decision"), k, ctrl, off_dev, t_n, batch, sealer, np.full(batch, k))
+        ep = run_episode(
+            ArmSpec("offline", "decision"), k, ctrl, off_dev, t_n, batch, sealer, np.full(batch, k), meta_sealer=meta
+        )
         offline.append(ep.actions)
     off_actions = np.stack(offline)  # (M + warm-up, T, B)
     decoy_rng = np.random.default_rng(rng.integers(1 << 62))
     sham_rng = np.random.default_rng(rng.integers(1 << 62))
-
     conf_design = ProtocolDesign(CONF_DESIGN_ARMS, t_n)
-    if phase == "theta0":
-        n_conf = pa.N_MIN
-        sch = np.stack([block_schedule(k.order, conf_design.names, n_conf + CONF_WARMUP) for k in keys])
-        dev = device(sch.shape[1] * sch.shape[2])
-        data = run_design(
-            conf_design, n_conf + CONF_WARMUP, sch, ctrl, dev, seal_key, decoy_rng, sham_rng, off_actions, pool
-        )
-        dd = data["A1"].r[CONF_WARMUP:-1].mean(axis=2) - data["A2"].r[CONF_WARMUP + 1 :].mean(axis=2)
-        do = data["A2"].r[CONF_WARMUP:].mean(axis=2) - data["A3"].r[CONF_WARMUP:].mean(axis=2)
-        return [{"theta_d": float(dd[:, i].mean()), "theta_o": float(do[:, i].mean())} for i in range(batch)]
+    conf_var = {a.name: a.variant for a in CONF_DESIGN_ARMS}
+    n_conf = pa.N_CONF + wu
 
-    # 2. calibration block
+    if phase == "model":
+        sch = np.stack([block_schedule(k.order, conf_design.names, n_conf) for k in keys])
+        dev = device(sch.shape[1] * sch.shape[2], base)
+        data = run_design(
+            conf_design, n_conf, sch, ctrl, dev, seal_key, blind_key, decoy_rng, sham_rng, off_actions, pool,
+            arms=MODEL_ARMS,
+        )  # fmt: skip
+        names = {a: a for a in MODEL_ARMS}
+        return [
+            {
+                "table": replicate_table(data, i, sch[i], names, pool, int(fidx[i]), n_conf, conf_var),
+                "field": int(fidx[i]),
+            }
+            for i in range(batch)
+        ]
+
+    assert models is not None
+    # calibration block
     cal_design = ProtocolDesign(CAL_DESIGN_ARMS, t_n)
-    n_cal = m_cal + CAL_WARMUP
+    n_cal = m_cal + wu
     cal_sch = np.stack(
         [block_schedule(hashlib.sha256(k.order + b"calibration").digest(), cal_design.names, n_cal) for k in keys]
     )
+    cal_nu = nuisance(cfg, cond.get("device"), cond.get("calibration"))
     cal_data = run_design(
         cal_design,
         n_cal,
         cal_sch,
         ctrl,
-        device(n_cal * len(cal_design.names)),
+        device(n_cal * len(cal_design.names), cal_nu),
         seal_key,
+        blind_key,
         decoy_rng,
         sham_rng,
         off_actions,
         pool,
         offline=off_actions,
     )
+    cal_var = {a.name: a.variant for a in CAL_DESIGN_ARMS}
     cal_tables = [
-        episode_table(
-            cal_data, cal_design, i, cal_sch[i], {a: a for a in cal_design.names}, pool, int(fidx[i]), CAL_WARMUP, m_cal
-        )
+        replicate_table(cal_data, i, cal_sch[i], {a: a for a in cal_design.names}, pool, int(fidx[i]), n_cal, cal_var)
         for i in range(batch)
     ]
+    del cal_data
+    n_boot = int(cfg["replicates"]["n_boot"])
     with mp.get_context("fork").Pool(workers) as wp:
-        cals = wp.starmap(pa.derive_calibration, [(t, *theta0) for t in cal_tables])
-    del cal_data, cal_tables
+        cals = wp.starmap(pa.derive_calibration, [(t, models[int(fidx[i])], n_boot) for i, t in enumerate(cal_tables)])
+    del cal_tables
 
-    # 3. confirmatory run with the frozen N (and the frozen margins for the planted size)
-    n_conf = max(c.n_blocks for c in cals)
-    sch = np.stack([block_schedule(k.order, conf_design.names, n_conf + CONF_WARMUP) for k in keys])
+    # confirmatory run: N_CONF valid blocks, the frozen margins for the planted size
+    sch = np.stack([block_schedule(k.order, conf_design.names, n_conf) for k in keys])
     sizes: dict[str, np.ndarray] | None = None
     if plant == "decision":
         sizes = {"A1": plant_frac * np.array([c.margin[1] for c in cals])}
     elif plant == "observer":
         sizes = {a: plant_frac * np.array([c.margin[0] for c in cals]) for a in OBSERVED_ARMS}
-    dev = device(sch.shape[1] * sch.shape[2], sizes)
-    data = run_design(
-        conf_design, n_conf + CONF_WARMUP, sch, ctrl, dev, seal_key, decoy_rng, sham_rng, off_actions, pool
-    )
+    conf_nu = nuisance(cfg, cond.get("device"), cond.get("confirmatory"))
+    dev = device(sch.shape[1] * sch.shape[2], conf_nu, sizes)
+    data = run_design(conf_design, n_conf, sch, ctrl, dev, seal_key, blind_key, decoy_rng, sham_rng, off_actions, pool)
     jobs = []
     for i, kk in enumerate(keys):
         codes = arm_codes(kk.blind, conf_design.names)
-        table = episode_table(data, conf_design, i, sch[i], codes, pool, int(fidx[i]), CONF_WARMUP, cals[i].n_blocks)
+        table = replicate_table(data, i, sch[i], codes, pool, int(fidx[i]), n_conf, conf_var)
         jobs.append(
             {
                 "cal": cals[i],
                 "table": table,
-                "n_boot": int(cfg["replicates"]["n_boot"]),
+                "n_boot": n_boot,
                 "blind_key": kk.blind,
                 "blind_commit": kk.commitments()["blind_sha256"],
             }
         )
+    del data
     with mp.get_context("fork").Pool(workers) as wp:
         res = wp.map(_analyse_rep, jobs)
     for r in res:
@@ -497,6 +586,38 @@ def simulate_batch(
             else False
         )
     return res
+
+
+# --- Engineering comparisons (M7, E5) ---------------------------------------------------------------------------------
+
+
+def engineering_validation(n_rep: int, seed: int, n_perm: int) -> dict[str, list[dict[str, Any]]]:
+    """:func:`~glowbox.analysis.prereg_analysis_001.paired_margin_test` at its fixed sizes: null (normal and
+    heavy-tailed t3 diffs, two-sided and one-sided), and an effect of the replicate's own control-derived margin."""
+    rng = np.random.default_rng(seed)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for name, dist, alt, shift in (
+        ("null, normal, two-sided", "normal", "two-sided", 0.0),
+        ("null, t3, two-sided", "t3", "two-sided", 0.0),
+        ("null, normal, one-sided", "normal", "greater", 0.0),
+        ("effect = margin, normal, two-sided", "normal", "two-sided", 1.0),
+        ("effect = margin, normal, one-sided", "normal", "greater", 1.0),
+    ):
+        res = []
+        for i in range(n_rep):
+
+            def draw(n: int, dist: str = dist) -> np.ndarray:
+                out_: np.ndarray = rng.standard_t(3, n) if dist == "t3" else rng.normal(0.0, 1.0, n)
+                return out_
+
+            c = draw(pa.ENG_N_CONTROL)
+            d0 = draw(pa.ENG_N)
+            probe = pa.paired_margin_test(d0, c, alt, n_perm=16, seed=i)  # margin from the controls only
+            d = d0 + shift * probe["margin"]
+            t = pa.paired_margin_test(d, c, alt, n_perm=n_perm, seed=i)
+            res.append({"rej": t["rejected"], "eq": t["tost"]["equivalent"], "margin": t["margin"]})
+        out[name] = res
+    return out
 
 
 # --- Driver -----------------------------------------------------------------------------------------------------------
@@ -518,15 +639,15 @@ def rate(res: list[dict[str, Any]], key: str) -> tuple[float, float, float, int]
     return (k / n if n else float("nan")), lo, hi, n
 
 
-def validation_lock(run_dir: Path) -> tuple[Lock, Path]:
-    """A lock over the plan, the analysis script and everything this script reads (stage S validation: the same
-    machinery as a confirmatory lock, written into the run directory)."""
-    files = [
-        REPO_ROOT / PREREG_DOC,
-        *module_files("glowbox.experiments.prereg_calibration"),
-        DEFAULT_CONFIG,
-    ]
-    lock = Lock.create(pa.PLAN, files, {"analysis": pa.frozen_constants()}, REPO_ROOT / DEVIATIONS)
+def validation_lock(run_dir: Path, config_path: Path, cfg: dict[str, Any]) -> tuple[Lock, Path]:
+    """A plan lock over everything this script runs (stage S validation: the same machinery as a confirmatory lock),
+    including the effective config (after --quick / --replicates), written into the run directory."""
+    eff = run_dir / "config.effective.yaml"
+    eff.write_text(yaml.safe_dump(cfg, sort_keys=True))
+    configs: list[Path] = [eff]
+    if config_path.resolve().is_relative_to(REPO_ROOT.resolve()):
+        configs.append(config_path)
+    lock = pa.create_plan_lock(["glowbox.experiments.prereg_calibration"], configs)
     path = lock.write(run_dir / "validation.lock.yaml")
     pa.verify_lock(lock)
     return lock, path
@@ -536,19 +657,20 @@ def run_phase(
     cfg: dict[str, Any],
     pool: Pool,
     phase: str,
+    condition: str,
     n: int,
     plant: str | None = None,
     frac: float = 0.0,
-    theta0: tuple[float, float] = (0.0, 0.0),
-    start: int = 0,
+    models: dict[int, list[pa.SelectionModel]] | None = None,
 ) -> list[dict[str, Any]]:
     rc = cfg["replicates"]
     out: list[dict[str, Any]] = []
     for s in range(0, n, int(rc["batch"])):
-        ids = np.arange(start + s, start + min(n, s + int(rc["batch"])))
+        ids = np.arange(s, min(n, s + int(rc["batch"])))
         t0 = time.perf_counter()
-        out += simulate_batch(cfg, pool, ids, phase, plant, frac, theta0, int(rc["workers"]))
-        print(f"  {phase} {plant or ''} {frac:g}: {len(out)}/{n} ({time.perf_counter() - t0:.0f} s)", flush=True)
+        out += simulate_batch(cfg, pool, ids, phase, condition, plant, frac, models, int(rc["workers"]))
+        what = f"{phase} {condition} {plant or ''} {frac:g}"
+        print(f"  {what}: {len(out)}/{n} ({time.perf_counter() - t0:.0f} s)", flush=True)
     return out
 
 
@@ -556,23 +678,101 @@ def fmt_rate(x: tuple[float, float, float, int]) -> str:
     return f"{x[0]:.3f} [{x[1]:.3f}, {x[2]:.3f}] (n = {x[3]})"
 
 
+@dataclass
+class Criterion:
+    """A pass criterion of the plan (section 12), stated on the Clopper-Pearson 95 % interval of a rate."""
+
+    what: str
+    value: tuple[float, float, float, int]
+    rule: str  # "lo<=x": the interval's lower bound is at most x (not above x); "hi>=x": upper bound at least x
+    x: float
+
+    @property
+    def passed(self) -> bool:
+        _, lo, hi, n = self.value
+        if n == 0:
+            return False
+        return lo <= self.x if self.rule == "lo<=x" else hi >= self.x
+
+    def line(self) -> str:
+        cmp = f"not above {self.x:g}" if self.rule == "lo<=x" else f"not below {self.x:g}"
+        return f"| {self.what} | {fmt_rate(self.value)} | {cmp} | {'PASS' if self.passed else 'FAIL'} |"
+
+
+def _any(res: list[dict[str, Any]], keys: list[str]) -> list[dict[str, Any]]:
+    return [{"x": any(r[k] for k in keys)} for r in res]
+
+
+def _not(res: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    return [{"x": not r[key]} for r in res]
+
+
+def criteria(
+    null: dict[str, list[dict[str, Any]]],
+    pos: dict[str, list[dict[str, Any]]],
+    eng: dict[str, list[dict[str, Any]]],
+) -> list[Criterion]:
+    a, pw = pa.ALPHA, pa.POWER
+    nom = null["nominal"]
+    sec = [f"{k}_rej" for k in pa.SECONDARY if k != "S4_quantum_test"]
+    both = ["H_decision_rej", "H_observer_rej"]
+
+    def err(what: str, res: list[dict[str, Any]], key: str) -> Criterion:
+        return Criterion(what, rate(res, key), "lo<=x", a)
+
+    def at_least(what: str, res: list[dict[str, Any]], key: str, x: float) -> Criterion:
+        return Criterion(what, rate(res, key), "hi>=x", x)
+
+    out = [
+        err("nominal: H_decision, p <= 0.05 against the calibration null", nom, "H_decision_raw_rej"),
+        err("nominal: H_observer, p <= 0.05 against the calibration null", nom, "H_observer_raw_rej"),
+        err("nominal: primary family, any positive claim (complete rule)", _any(nom, both), "x"),
+        err("nominal: secondary family S1-S3, any Holm rejection", _any(nom, sec), "x"),
+        at_least("nominal: H_decision 95 % interval covers 0", nom, "H_decision_cover", 0.95),
+        at_least("nominal: H_observer 95 % interval covers 0", nom, "H_observer_cover", 0.95),
+        at_least("nominal: H_decision null claim", nom, "H_decision_null_claim", pw),
+        at_least("nominal: H_observer null claim", nom, "H_observer_null_claim", pw),
+        err("nominal: null-stability check flags the run", _not(nom, "stable"), "x"),
+        at_least("nominal: arm names absent from every blinded output", nom, "names_hidden", 1.0),
+    ]
+    for plant, h in (("decision", "H_decision"), ("observer", "H_observer")):
+        res = pos.get(f"{plant}:1", [])
+        out += [
+            at_least(f"positive {plant}, 1 x margin: power of the complete rule", res, f"{h}_rej", pw),
+            at_least(f"positive {plant}, 1 x margin: attributed", res, "identified", pw),
+            at_least(f"positive {plant}, 1 x margin: not equivalent", _not(res, f"{h}_eq"), "x", pw),
+        ]
+    for cond in ("drift_covered", "drift_unmodelled", "nonstationary"):
+        if null.get(cond):
+            out.append(err(f"{cond}: primary family, any positive claim", _any(null[cond], both), "x"))
+    for name, res in eng.items():
+        if name.startswith("null"):
+            out.append(err(f"engineering test, {name}: rejection rate", res, "rej"))
+        else:
+            out.append(at_least(f"engineering test, {name}: power", res, "rej", pw))
+    return out
+
+
+def _median_iqr(v: np.ndarray, f: str = ".4g") -> str:
+    return f"{np.median(v):{f}} [IQR {np.quantile(v, 0.25):{f}}-{np.quantile(v, 0.75):{f}}]"
+
+
 def summary_markdown(
     cfg: dict[str, Any],
     pool: Pool,
-    theta0: tuple[float, float],
-    theta_o: tuple[float, float],
-    null: list[dict[str, Any]],
+    models: dict[str, dict[int, pa.SelectionModel]],
+    null: dict[str, list[dict[str, Any]]],
     pos: dict[str, list[dict[str, Any]]],
+    eng: dict[str, list[dict[str, Any]]],
     seconds: float,
 ) -> tuple[str, dict[str, float]]:
     rc = cfg["replicates"]
-    m0 = np.array([r["margin0"] for r in null])
-    m1 = np.array([r["margin1"] for r in null])
-    cref = np.array([r["c_ref"] for r in null])
-    nb = sorted({int(r["n_blocks"]) for r in null})
-    any_rej = [{"x": r["H_decision_rej"] or r["H_observer_rej"]} for r in null]
-    sec_names = [k for k in pa.SECONDARY if k != "S4_quantum_test"]
-    sec_any = [{"x": any(r[f"{s}_rej"] for s in sec_names)} for r in null]
+    nom = null["nominal"]
+    m0 = np.array([r["margin0"] for r in nom])
+    m1 = np.array([r["margin1"] for r in nom])
+    sd0 = np.array([r["sd_mean0"] for r in nom])
+    cref = np.array([r["c_ref"] for r in nom])
+    crit = criteria(null, pos, eng)
     lines = [
         "Stage-S validation of the PREREG-001 pipeline (docs/preregistration/PREREG-001-observer-decision.md). The "
         "simulator has no decision or observer effect by construction: these numbers say whether the frozen procedure "
@@ -581,102 +781,154 @@ def summary_markdown(
         "",
         "Every replicate is a complete simulated experiment: offline sequences, a calibration block of "
         f"{pa.M_CAL} valid blocks (seven sealed control arms, slot for slot like a confirmatory block), the frozen "
-        "calibration (empirical null, margins, N), "
-        f"a confirmatory run of N blocks x 7 arms in a random order per block, sealing of every outcome, arm codes, "
-        f"the frozen blinded analysis ({rc['n_boot']} null draws per test), unblinding, the pre-registered cells. "
+        f"calibration (empirical null, margins, theta0_D set, model check), a confirmatory run of N = {pa.N_CONF} "
+        "valid blocks x 7 arms in a random order per block, sealing of every outcome, decoys from the frozen model, "
+        "the arm-revealing fields sealed with the blinding key, the locked reduction to the episode table, the frozen "
+        f"blinded analysis ({rc['n_boot']} null draws per test), unblinding, the complete decision rule. "
         f"T = {cfg['protocol']['n_steps']} steps x S = {cfg['protocol']['shots']} shots per episode; "
         f"{pool.nom.shape[0]} true fields cycled over replicates; slow laser and contrast drift (OU over episode "
         "slots), per-step laser jitter. Decision process: the stand-in threshold rule (see the script).",
         "",
-        "## Frozen quantities (median over the null replicates, each replicate freezes its own)",
+        "## Frozen quantities (nominal condition; median over the null replicates, each replicate freezes its own)",
         "",
-        f"- Margin (smallest effect size of interest, 0.95 quantile of |control-vs-control pair statistic|): "
-        f"lag 0 (H_observer) {np.median(m0):.4g} [IQR {np.quantile(m0, 0.25):.4g}-{np.quantile(m0, 0.75):.4g}], "
-        f"lag 1 (H_decision) {np.median(m1):.4g} [{np.quantile(m1, 0.25):.4g}-{np.quantile(m1, 0.75):.4g}] in "
-        "units of the referenced fluorescence r = N_sig / N_ref.",
+        "- Margin rule (section 5): Delta = Q_{1-alpha/2}(|D|) + Q_{0.90}(|D|), D the control-vs-control null of "
+        f"the mean of N = {pa.N_CONF} pairs (the shift detected with power {pa.MARGIN_POWER} at Holm's first level).",
+        f"- Margin, lag 0 (H_observer): {_median_iqr(m0)}; lag 1 (H_decision): {_median_iqr(m1)}, in units of the "
+        "referenced fluorescence r = N_sig / N_ref.",
+        f"- Control-vs-control SD of the mean of N pairs (lag 0): {_median_iqr(sd0)}; margin / SD: "
+        f"{np.median(m0 / sd0):.2f}.",
         f"- Spin signal of the replayed sequences, C_ref = mean(r_detuned - r_resonant): {np.median(cref):.4g}; "
-        f"margins / C_ref: {np.median(m0 / cref):.3f} (lag 0), {np.median(m1 / cref):.3f} (lag 1).",
-        f"- N (valid confirmatory blocks): {nb} (the floor N_MIN = {pa.N_MIN}; the power rule asks for fewer).",
-        f"- theta0_D (selection effect of the decision arm under drift, from {rc['theta0']} model runs): "
-        f"{theta0[0]:.3g} +- {theta0[1]:.2g} (MC SE; the plan requires SE <= margin / 10 = "
-        f"{np.median(m1) / 10:.3g}). The observer contrast of the same runs: {theta_o[0]:.3g} +- {theta_o[1]:.2g} "
-        "(expected 0).",
+        f"margin / C_ref: {np.median(m0 / cref):.3f} (lag 0), {np.median(m1 / cref):.3f} (lag 1).",
+        "- theta0_D set (model runs, phase `model`, per model and per true field: the model of a run is the model "
+        f"of its sample; the plan requires every SE <= margin / 10 = {np.median(m1) / 10:.3g}):",
+    ]
+    for name, per_field in models.items():
+        th = ", ".join(f"{m.theta0:.3g} +- {m.theta0_se:.2g}" for m in per_field.values())
+        wc = ", ".join(f"{m.wcorr_mean:.3g}" for m in per_field.values())
+        n_r = sum(m.n_runs for m in per_field.values())
+        lines.append(f"  - {name} ({n_r} runs): theta0_D per field {th}; predicted wcorr per field {wc}.")
+    lines += [
         "",
-        "## Null calibration (no effect)",
+        "## Pass criteria (plan section 12)",
+        "",
+        "Each criterion is a rule on the Clopper-Pearson 95 % interval of a rate: an error rate passes when the "
+        "interval is not above alpha (its lower bound <= alpha), a coverage, power or claim rate when the interval "
+        "is not below its target (upper bound >= target).",
+        "",
+        "| criterion | rate [95 % interval] | rule | result |",
+        "| --- | --- | --- | --- |",
+        *[c.line() for c in crit],
+        "",
+        f"All criteria: {'PASS' if all(c.passed for c in crit) else 'FAIL'}.",
+        "",
+        "## Null calibration (no effect), nominal condition",
         "",
         "| quantity | H_decision | H_observer |",
         "| --- | --- | --- |",
-        f"| rejected after Holm (FWER 0.05) | {fmt_rate(rate(null, 'H_decision_rej'))} | "
-        f"{fmt_rate(rate(null, 'H_observer_rej'))} |",
-        f"| p <= 0.05 without correction | {fmt_rate(rate(null, 'H_decision_raw_rej'))} | "
-        f"{fmt_rate(rate(null, 'H_observer_raw_rej'))} |",
-        f"| TOST equivalent at the frozen margin | {fmt_rate(rate(null, 'H_decision_eq'))} | "
-        f"{fmt_rate(rate(null, 'H_observer_eq'))} |",
-        f"| 95 % interval covers 0 | {fmt_rate(rate(null, 'H_decision_cover'))} | "
-        f"{fmt_rate(rate(null, 'H_observer_cover'))} |",
-        f"| Newey-West check, p <= 0.05 | {fmt_rate(rate(null, 'H_decision_nw_rej'))} | "
-        f"{fmt_rate(rate(null, 'H_observer_nw_rej'))} |",
+    ]
+    for label, key in (
+        ("positive claim (complete rule)", "rej"),
+        ("Holm rejection against the calibration null alone", "rej_cal"),
+        ("p <= 0.05 against the calibration null (uncorrected)", "raw_rej"),
+        ("TOST equivalent at the frozen margin", "eq"),
+        ("null claim (equivalent, stable null; H_decision: model check)", "null_claim"),
+        ("95 % interval covers 0", "cover"),
+        ("Newey-West check, p <= 0.05", "nw_rej"),
+    ):
+        lines.append(
+            f"| {label} | {fmt_rate(rate(nom, f'H_decision_{key}'))} | {fmt_rate(rate(nom, f'H_observer_{key}'))} |"
+        )
+    lines += [
         "",
-        f"- Primary family, any Holm rejection: {fmt_rate(rate(any_rej, 'x'))}.",
-        f"- Secondary family without the quantum test (S1-S3), any Holm rejection: {fmt_rate(rate(sec_any, 'x'))}; "
-        "the quantum test S4 (detuned vs resonant task error) rejects in "
-        f"{fmt_rate(rate(null, 'S4_quantum_test_rej'))}.",
-        f"- Null-stability check flags the run (confirmatory controls differ from the calibration controls): "
-        f"{fmt_rate(rate([{'x': not r['stable']} for r in null], 'x'))} (designed rate <= 0.05).",
-        f"- Arm names absent from every blinded output: {all(r['names_hidden'] for r in null)}.",
+        f"- Model check passed: calibration block {fmt_rate(rate(nom, 'model_ok_cal'))}, confirmatory sealed controls "
+        f"{fmt_rate(rate(nom, 'model_ok_conf'))}.",
+        "- The quantum test S4 (detuned vs resonant task error) rejects in "
+        f"{fmt_rate(rate(nom, 'S4_quantum_test_rej'))}.",
+        "",
+        "## Stress conditions (no effect)",
+        "",
+        "| condition | what differs | positive claim, H_decision | positive claim, H_observer | H_decision p <= 0.05 "
+        "(calibration null alone) | H_observer p <= 0.05 (calibration null alone) | model check passed "
+        "(both) | null stable |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for cond, res in null.items():
+        if cond == "nominal" or not res:
+            continue
+        desc = cfg["conditions"][cond].get("description", "")
+        both = [{"x": r["model_ok_cal"] and r["model_ok_conf"]} for r in res]
+        lines.append(
+            f"| {cond} | {desc} | {fmt_rate(rate(res, 'H_decision_rej'))} | {fmt_rate(rate(res, 'H_observer_rej'))} | "
+            f"{fmt_rate(rate(res, 'H_decision_raw_rej'))} | {fmt_rate(rate(res, 'H_observer_raw_rej'))} | "
+            f"{fmt_rate(rate(both, 'x'))} | {fmt_rate(rate(res, 'stable'))} |"
+        )
+    lines += [
         "",
         "## Positive control (effect planted in the simulated device)",
         "",
         "Decision: E[r] of the decision arm A1 shifted by the size. Observer: E[r] of every observed arm "
         "(A1, A2, A4, A5) shifted, the sealed arms not. Size = the replicate's own frozen margin, or a fraction of it "
-        "(power curve).",
+        "(power curve: no pass criterion).",
         "",
-        "| planted | size | power (Holm rejection of the planted hypothesis) "
-        "| attributed (planted rejected, other not) | not equivalent |",
+        "| planted | size | power (complete rule) | attributed (planted rejected, other not) | not equivalent |",
         "| --- | --- | --- | --- | --- |",
     ]
     metrics: dict[str, float] = {
-        "fpr_decision": rate(null, "H_decision_rej")[0],
-        "fpr_observer": rate(null, "H_observer_rej")[0],
-        "fwer_primary": rate(any_rej, "x")[0],
+        "fwer_primary_nominal": rate(_any(nom, ["H_decision_rej", "H_observer_rej"]), "x")[0],
         "margin_lag0_median": float(np.median(m0)),
         "margin_lag1_median": float(np.median(m1)),
-        "theta0_d": theta0[0],
-        "theta0_d_se": theta0[1],
+        "margin_over_c_ref_lag0": float(np.median(m0 / cref)),
+        "criteria_passed": float(sum(c.passed for c in crit)),
+        "criteria_total": float(len(crit)),
     }
     for key, res in pos.items():
         plant, frac = key.split(":")
         h = "H_decision" if plant == "decision" else "H_observer"
-        not_eq = [{"x": not r[f"{h}_eq"]} for r in res]
         lines.append(
             f"| {plant} | {frac} x margin | {fmt_rate(rate(res, f'{h}_rej'))} | {fmt_rate(rate(res, 'identified'))} "
-            f"| {fmt_rate(rate(not_eq, 'x'))} |"
+            f"| {fmt_rate(rate(_not(res, f'{h}_eq'), 'x'))} |"
         )
         metrics[f"power_{plant}_{frac}"] = rate(res, f"{h}_rej")[0]
     lines += [
         "",
+        f"## Engineering comparisons (M7 E-1 / E-2, E5): `paired_margin_test` at its fixed sizes "
+        f"({pa.ENG_N} pairs, {pa.ENG_N_CONTROL} control repeats)",
+        "",
+        "| condition | rejection rate | TOST equivalent | median margin (units of the diff SD) |",
+        "| --- | --- | --- | --- |",
+    ]
+    for name, res in eng.items():
+        mm = np.median([r["margin"] for r in res])
+        lines.append(f"| {name} | {fmt_rate(rate(res, 'rej'))} | {fmt_rate(rate(res, 'eq'))} | {mm:.3g} |")
+    lines += [
+        "",
         "## Reading",
         "",
-        "- Pass criteria of the plan: false-positive rate per hypothesis within the binomial interval of 0.05 "
-        "(Holm makes it at most 0.05); TOST equivalence >= 0.90 under the null; power >= 0.90 and non-equivalence "
-        ">= 0.90 at the margin; correct attribution. The rows below 1 x margin are the power curve only (no pass "
-        "criterion): they show how far below the margin the plan still detects an effect (the margin governs "
-        "the equivalence claims and the power target).",
+        "- The margin is derived from the control runs by a fixed rule: the effect that the planned experiment "
+        "detects against the control-vs-control distribution with power 0.95 at Holm's first level. It replaces the "
+        "earlier rule (the 0.95 quantile of a single control pair), which made the margin about 40 % of the spin "
+        "signal and its equivalence claims trivially easy.",
+        "- A positive claim needs a Holm rejection against the frozen calibration controls and against the run's own "
+        "sealed controls; the nonstationary condition shows why (the calibration null alone is too narrow when the "
+        "confirmatory run drifts more).",
+        "- H_decision depends on a model of the selection effect. The drift_unmodelled condition (within-episode "
+        "drift missing from the model set) shows the calibration null alone rejecting too often, and the model check "
+        "refusing H_decision instead. In drift_covered the same drift is in the model set: theta0_D is non-zero and "
+        "the worst-case test keeps its level.",
         "- The Newey-West robustness check is liberal at N = 100 (above 0.05 in the null), one reason it is not the "
         "decisive test.",
-        "- The calibration block mirrors the confirmatory block slot for slot. A first version of this validation used "
-        "a 4-arm calibration block: its paired controls were closer in time than the 7-arm confirmatory pairs, saw "
-        "less drift, and the test was liberal (H_decision p <= 0.05 in 0.070 [0.055, 0.088] of 1000 null replicates, "
-        "95 % coverage 0.930). The control runs must share the confirmatory schedule, not only its arms.",
-        "- One sealing key per batch of replicates instead of one per replicate (speed); every outcome is still "
-        "sealed and unsealed through the same code. Blinding keys and order seeds are per replicate.",
-        "- The stand-in decision process is not the M5 policy, and theta0_D depends on the policy. The command below "
-        "is the full size with the stand-in (R = 2000 null replicates; the null phase takes about twice as long as "
-        "here). With the real policy the decision process is a Controller (glowbox.analysis.arms) wrapping the M5 "
-        "policy over its posterior, run on the GPU machine; that adapter belongs to M7, and its theta0_D is the one "
-        "to freeze.",
+        "- One sealing key and one meta-sealing key per batch of replicates instead of per replicate (speed); every "
+        "outcome is still sealed and unsealed through the same code. Blinding keys and order seeds are per replicate.",
+        "- The stand-in decision process is not the M5 policy, and theta0_D depends on the policy: the M5 policy as a "
+        "Controller (glowbox.analysis.arms) is M7's adapter, with its own model runs and this validation repeated.",
         "",
-        "    uv run python -m glowbox.experiments.prereg_calibration --replicates 2000",
+        "Run sizes here (CPU): "
+        + ", ".join(f"{k} {len(v)}" for k, v in null.items())
+        + f" null replicates; positive {rc['positive']} per hypothesis; curve {rc['curve']} per fraction; "
+        f"{rc['model_runs']} model runs per model; engineering {rc['engineering']} per condition. The documented full "
+        "size (several hours on this CPU; any machine, no GPU needed):",
+        "",
+        "    uv run python -m glowbox.experiments.prereg_calibration --replicates 4000 --stress-replicates 1000",
         "",
         f"Wall time here: {seconds / 60:.1f} min on a CPU.",
     ]
@@ -693,9 +945,8 @@ def figure(null: list[dict[str, Any]], pos: dict[str, list[dict[str, Any]]]) -> 
     axes[0].legend(frameon=False)
     for plant, c in (("decision", "C0"), ("observer", "C1")):
         h = "H_decision" if plant == "decision" else "H_observer"
-        xs, ys, lo, hi = [0.0], [rate(null, f"{h}_rej")[0]], [], []
-        lo.append(rate(null, f"{h}_rej")[1])
-        hi.append(rate(null, f"{h}_rej")[2])
+        r0 = rate(null, f"{h}_rej")
+        xs, ys, lo, hi = [0.0], [r0[0]], [r0[1]], [r0[2]]
         for key, res in sorted(pos.items()):
             if key.startswith(plant):
                 xs.append(float(key.split(":")[1]))
@@ -708,47 +959,59 @@ def figure(null: list[dict[str, Any]], pos: dict[str, list[dict[str, Any]]]) -> 
         axes[1].errorbar(xa, ya, yerr=[ya - la, ha - ya], marker="o", color=c, label=h, capsize=3)
     axes[1].axhline(0.9, color="0.5", lw=0.8, ls="--")
     axes[1].axhline(0.05, color="0.5", lw=0.8, ls=":")
-    axes[1].set(xlabel="planted effect / frozen margin", ylabel="Holm rejection rate", title="Power", ylim=(0, 1.02))
+    axes[1].set(xlabel="planted effect / frozen margin", ylabel="positive-claim rate", title="Power", ylim=(0, 1.02))
     axes[1].legend(frameon=False)
     fig.tight_layout()
     return fig
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--replicates", type=int, default=None, help="null replicates (default from the config)")
+    ap.add_argument("--replicates", type=int, default=None, help="nominal null replicates (default from the config)")
+    ap.add_argument("--stress-replicates", type=int, default=None, help="null replicates per stress condition")
     ap.add_argument("--report-dir", type=Path, default=None)
     args = ap.parse_args(argv)
     cfg = load_config(args.config, args.quick)
     if args.replicates:
         cfg["replicates"]["null_runs"] = args.replicates
+    if args.stress_replicates:
+        cfg["replicates"]["stress_runs"] = args.stress_replicates
     torch.set_num_threads(8)
     t_start = time.perf_counter()
     with RunLog(cfg["name"], config=cfg, seed=int(cfg["seed"])) as run:
-        lock, lock_path = validation_lock(run.dir)
+        lock, lock_path = validation_lock(run.dir, args.config, copy.deepcopy(cfg))
         keys = RunKeys.from_seed(f"{cfg['seed']}:run")
         run.annotate("prereg", prereg_record(lock, lock_path, keys, "simulation", {"positive_control": 1.0}))
         print("building the field pool ...", flush=True)
         pool = build_pool(cfg, int(cfg["seed"]))
         rc = cfg["replicates"]
-        th = run_phase(cfg, pool, "theta0", int(rc["theta0"]))
-        td = np.array([r["theta_d"] for r in th])
-        to = np.array([r["theta_o"] for r in th])
-        theta0 = (float(td.mean()), float(td.std(ddof=1) / math.sqrt(td.size)))
-        theta_o = (float(to.mean()), float(to.std(ddof=1) / math.sqrt(to.size)))
-        null = run_phase(cfg, pool, "null", int(rc["null_runs"]), theta0=theta0)
+        models: dict[str, dict[int, pa.SelectionModel]] = {}
+        needed = sorted({m for c in cfg["conditions"].values() for m in c["models"]})
+        for name in needed:
+            runs = run_phase(cfg, pool, "model", name, int(rc["model_runs"]))
+            fields = sorted({r["field"] for r in runs})
+            models[name] = {f: pa.selection_model(name, [r["table"] for r in runs if r["field"] == f]) for f in fields}
+            del runs
+        null: dict[str, list[dict[str, Any]]] = {}
         pos: dict[str, list[dict[str, Any]]] = {}
-        for plant in ("decision", "observer"):
-            pos[f"{plant}:1"] = run_phase(cfg, pool, "positive", int(rc["positive"]), plant, 1.0, theta0)
-            for frac in rc.get("curve_fractions", []) if int(rc["curve"]) else []:
-                n_c = int(rc["curve"])
-                pos[f"{plant}:{frac:g}"] = run_phase(cfg, pool, "positive", n_c, plant, float(frac), theta0)
+        for cond, cc in cfg["conditions"].items():
+            ms = {f: [models[m][f] for m in cc["models"]] for f in range(pool.nom.shape[0])}
+            n = int(rc["null_runs"]) if cond == "nominal" else int(rc["stress_runs"])
+            null[cond] = run_phase(cfg, pool, "null", cond, n, models=ms)
+            if cond != "nominal":
+                continue
+            for plant in ("decision", "observer"):
+                pos[f"{plant}:1"] = run_phase(cfg, pool, "positive", cond, int(rc["positive"]), plant, 1.0, ms)
+                for frac in rc.get("curve_fractions", []) if int(rc["curve"]) else []:
+                    n_c = int(rc["curve"])
+                    pos[f"{plant}:{frac:g}"] = run_phase(cfg, pool, "positive", cond, n_c, plant, float(frac), ms)
+        eng = engineering_validation(int(rc["engineering"]), int(cfg["seed"]), int(rc["n_boot"]))
         seconds = time.perf_counter() - t_start
-        md, metrics = summary_markdown(cfg, pool, theta0, theta_o, null, pos, seconds)
+        md, metrics = summary_markdown(cfg, pool, models, null, pos, eng, seconds)
         run.log_metrics(0, **metrics)
-        png = run.save_figure(figure(null, pos), "calibration")
+        png = run.save_figure(figure(null["nominal"], pos), "calibration")
         print(md)
     if args.report_dir is not None:
         path = write_report(
