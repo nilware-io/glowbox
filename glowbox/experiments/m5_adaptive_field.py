@@ -997,12 +997,11 @@ def report_body(task: AdaptiveTask, qt: QuantumTestResult, tv: dict[str, Any], r
                 for s in shifts:
                     fr = P[n][mode][s]["dur_fractions"]
                     top = P[n]["recal_top"][s]["top_dur_index"]
-                    d_ns = task.spec.durations_ns[top] + s
+                    sd = shifted(task.spec, s).durations_ns  # as run (floored at the pulse grid)
+                    d_ns = sd[top]
                     L.append(
                         f"- {LABELS[n]}, recalibrated {s:+d} ns: duration fractions "
-                        + ", ".join(
-                            f"{task.spec.durations_ns[j] + s} ns {_ci(fr[j], '{:.2f}')}" for j in range(task.spec.n_dur)
-                        )
+                        + ", ".join(f"{sd[j]} ns {_ci(fr[j], '{:.2f}')}" for j in range(task.spec.n_dur))
                         + f"; most chosen {d_ns} ns, preferred beyond uniform: "
                         f"{'yes' if P[n]['recal_top'][s]['prefers'] else 'no'}."
                     )

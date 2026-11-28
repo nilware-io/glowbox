@@ -36,22 +36,24 @@ detuned 400 MHz on the right.*
 
 - Task 1, 40000 shots, calibrated device: RL agent (PPO) 11.8 [10.9, 12.7] uT, information-greedy design 13.1
   [9.8, 16.4], fixed interleaved pi-pulse sweep 41.3 [37.7, 44.9], random measurements 82.2, milestone 2's CNN on
-  the fixed sweep 56.9; the agent ties the greedy design (RL - EIG -1.3 [-4.2, 1.6] uT). Both search with the pi
-  pulse and then spend 80-87 % of their blocks on a 400 ns (~4 pi) pulse; shifting every duration by 50 ns
-  multiplies their error 19-35 fold (Rabi-scale pulse areas). Detuned, all stay at the prior (~810 vs 829 uT);
-  gaps RL 794 [781, 807], EIG 796 [786, 805] uT.
+  the fixed sweep 56.6; the agent ties the greedy design (RL - EIG -1.3 [-4.2, 1.6] uT). Both search with the pi
+  pulse and then spend 80-87 % of their blocks on a 400 ns (~4 pi) pulse; with every duration shifted by up to
+  50 ns and the model recalibrated, the agent (not retrained) keeps the long pulse as the greedy design does, and
+  the information depends on the pulse area (fixed pi sweep 184 uT at +50 ns, adaptive learners ~13 uT). With the
+  model unaware of the shift every policy degrades to the same absolute error (a calibration test, not a strategy
+  test). Detuned, all stay near the prior (~810 vs 829 uT); gaps RL 794 [781, 807], EIG 796 [786, 805] uT.
 - Task 2, 4 bits at 10^4 shots: the PPO-learned write recalls 3.01 [2.72, 3.30] bits, the write trained by
   gradient through the surrogate 3.65 [3.44, 3.86], the fixed random encoder 0.86 [0.38, 1.33]; detuned every
   write < 0.01 bits. The learned write relies on its rotation angles (+-50 ns: -1.6 bits even with the readout
   recalibrated) and on coherent segment phases.
-- QuTiP reference through `Simulator.run()`: measurement means within 6.4e-4 (Task 1) and templates within 6.8e-4
-  (Task 2) of the signal spread.
+- QuTiP reference through `Simulator.run()`: measurement means within 8e-4 (Task 1, 8 fields) and templates within
+  6.8e-4 (Task 2) of the signal spread.
 - Code: `glowbox/learn/measurement.py` (measurements as actions, emulator table), `glowbox/learn/adaptive.py`
   (particle posterior, expected information gain), `glowbox/learn/rl.py` (PPO, gymnasium-style environments with
   a `Simulator.run()` backend for hardware later), `glowbox/learn/bit_write.py`. Notes:
   [docs/notes/adaptive-rl.md](docs/notes/adaptive-rl.md).
 
-Run (RTX 5070 Ti: Task 1 ~4.5 h, Task 2 ~1.6 h; `--quick` for a smoke run):
+Run (RTX 5070 Ti: Task 1 ~5.5 h, Task 2 ~1.6 h; `--quick` for a smoke run):
 
     uv run python -m glowbox.experiments.m5_adaptive_field --quick
     uv run python -m glowbox.experiments.m5_rl_bit_write --quick
