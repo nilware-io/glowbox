@@ -58,6 +58,16 @@ Run (RTX 5070 Ti: Task 1 ~5.5 h, Task 2 ~1.6 h; `--quick` for a smoke run):
     uv run python -m glowbox.experiments.m5_adaptive_field --quick
     uv run python -m glowbox.experiments.m5_rl_bit_write --quick
 
+**Pre-registration framework (PREREG-001, DRAFT).** Confirmatory comparisons of decision arms and observer arms
+(M7 controller (c), E5 with a closed loop, later the hardware) go through
+[docs/preregistration](docs/preregistration/README.md): a locked analysis, control runs without a decision process
+or an observer (an empirical null and the smallest effect sizes of interest come from a calibration block run
+before any decision or observer arm), sealed outcomes, coded arms, randomised interleaved blocks. Stage-S validation
+of the pipeline (false-positive rate and power on simulated data, which has no such effect by construction):
+[docs/results/prereg-calibration.md](docs/results/prereg-calibration.md). Code: `glowbox/analysis/prereg.py`,
+`glowbox/analysis/arms.py`, `glowbox/analysis/prereg_analysis_001.py`,
+`glowbox/experiments/prereg_calibration.py`.
+
 **Milestone 4 done** (a learned pulse encoder trained end to end through the differentiable surrogate; Task 4,
 compress-and-reconstruct; Task 1 re-run with a learned sensor protocol; the quantum test for both). Reports:
 [docs/results/m4-autoencoder.md](docs/results/m4-autoencoder.md),

@@ -1,0 +1,2 @@
+# PREREG-001 run registry: append-only (docs/preregistration/README.md, rule 3). One YAML list item per event,
+# appended by glowbox.analysis.prereg.Registry and committed and pushed at once. Never edit or delete an entry.

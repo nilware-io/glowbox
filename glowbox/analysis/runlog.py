@@ -170,6 +170,14 @@ class RunLog:
         with open(self.dir / "run.yaml", "w", encoding="utf-8") as f:
             yaml.safe_dump(self.info, f, sort_keys=False)
 
+    def annotate(self, key: str, value: Any) -> None:
+        """Add a top-level section to run.yaml (e.g. ``prereg``: the pre-registration lock record) and write it now.
+        The built-in keys (run id, seed, git, config, ...) cannot be overwritten."""
+        if key in {"run_id", "name", "seed", "git_commit", "git_dirty", "started_utc", "environment", "config"}:
+            raise ValueError(f"run.yaml key {key!r} is reserved")
+        self.info[key] = json.loads(_dumps(value))
+        self._write_yaml()
+
     def log_trace(self, trace: FluorescenceTrace, sequence: PulseSequence | None = None, **tags: Any) -> int:
         """Append a trace (all shots). Returns its ``trace_id``."""
         tid = self._n_traces
