@@ -112,6 +112,8 @@ Change in recalled bits at the largest shift (+-50 ns, mean of both signs) [t CI
 - Gradient: 1000 Adam steps (lr 0.003, cosine) on the same objective with reparametrised Gaussian shot noise (8 draws), encoder MLP [64, 64]; random: gain 1.5.
 - Evaluation: templates at 32 T2* nodes, 512 Poisson recalls per pattern, bitwise MAP. Wall time: RL 62.7 min, gradient 30.9 min, evaluation 0.1 min, probes 0.1 min.
 
+The figures were drawn before the learner was renamed: where a figure says "black box", read "gradient-free" (the same method).
+
 ![recall](figures/m5-rl-bit-write-recall.png)
 
 ![training](figures/m5-rl-bit-write-training.png)
