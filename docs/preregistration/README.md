@@ -11,7 +11,7 @@ that have no decision and no observer. Nobody can then say that a pattern was fo
 
 | Plan | Scope | Status |
 | --- | --- | --- |
-| [PREREG-001](PREREG-001-observer-decision.md) | decision and observer coupling; simulation stage of M7 and E5 | DRAFT (not signed off, not locked) |
+| [PREREG-001](PREREG-001-observer-decision.md) | decision and observer coupling; simulation stage of M7 and E5 | signed off by the owner, not yet locked |
 
 Deviations from any locked plan: [deviations.md](deviations.md) (append-only).
 

@@ -1,8 +1,8 @@
 # PREREG-001: decision and observer coupling, simulation stage of M7 and E5
 
-**Status: DRAFT.** Not signed off and not locked. Nothing in this plan is frozen until the owner signs the final
-text and the lock is committed (docs/preregistration/README.md, "Freezing"). Until then no run counts as
-confirmatory, whatever its result.
+**Status: SIGNED OFF by the owner (the merge of this change records the date), NOT YET LOCKED.** The text below is
+the plan the owner approved. Nothing is frozen until the lock is committed and tagged (docs/preregistration/README.md,
+"Freezing"); until then no run counts as confirmatory, whatever its result.
 
 - Plan: PREREG-001, version 3 (draft of 2026-11-27, revised after the second review: the analysed data bound to
   the registered sealed artifacts, one confirmatory run per series and two fixed series, the model set locked, the
